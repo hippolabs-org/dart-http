@@ -1,0 +1,44 @@
+name: Release Packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      package:
+        description: Package to publish
+        required: true
+        default: sse_helpers
+        type: choice
+        options:
+          - sse_helpers
+
+env:
+  DART_VERSION: 3.13.0
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Dart
+        uses: dart-lang/setup-dart@v1
+        with:
+          sdk: ${{ env.DART_VERSION }}
+
+      - name: Set up pub credentials
+        env:
+          PUB_TOKEN: ${{ secrets.PUB_CREDENTIALS }}
+        run: echo "$PUB_TOKEN" | dart pub token add https://pub.hippolabs.org
+
+      - name: Get dependencies
+        run: dart pub get
+
+      - name: Run checks
+        run: dart run melos run ci
+
+      - name: Publish package
+        working-directory: packages/${{ inputs.package }}
+        run: dart pub publish --force

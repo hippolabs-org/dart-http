@@ -1,0 +1,39 @@
+name: dart_http_workspace
+description: Workspace for protocol-neutral HTTP packages for Dart.
+publish_to: none
+
+environment:
+  sdk: ">=3.13.0 <4.0.0"
+
+dev_dependencies:
+  hippo_analysis:
+    hosted: https://pub.hippolabs.org
+    version: ^0.1.2
+  melos: ^8.2.2
+
+workspace:
+  - packages/*
+
+melos:
+  ide:
+    intellij:
+      enabled: false
+  scripts:
+    format:
+      run: dart format .
+      description: Format all Dart files in the workspace.
+    check-format:
+      run: dart format --set-exit-if-changed .
+      description: Verify Dart formatting.
+    analyze:
+      run: dart analyze
+      description: Analyze the complete workspace.
+    test:
+      run: dart run melos exec --concurrency=1 --dir-exists=test -- dart test
+      description: Run tests for every package with a test directory.
+    ci:
+      run: |
+        dart run melos run check-format
+        dart run melos run analyze
+        dart run melos run test
+      description: Run all continuous-integration checks.

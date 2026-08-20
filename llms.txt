@@ -1,0 +1,16 @@
+# dart-http
+
+Protocol-neutral HTTP packages for Dart maintained by Hippolabs.
+
+## Package map
+
+- `packages/sse_helpers`: bounded, incremental Server-Sent Events wire model, encoder, and decoder.
+
+## Dependency direction
+
+Packages in this repository must remain independent of application frameworks and HTTP runtimes.
+Dart Edge, Hippobase, and applications may depend on these packages, never the reverse.
+
+## Validation
+
+Run `dart pub get` followed by `dart run melos run ci` from the repository root.
