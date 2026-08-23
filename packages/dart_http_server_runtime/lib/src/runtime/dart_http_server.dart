@@ -902,14 +902,14 @@ class DartHttp<TServices> extends Router<TServices> {
   }
 
   void _streamNativeBinaryResponse(int requestId, NativeBinaryStreamResponse response) {
-    final lease = response.body.takeDescriptor();
+    final transfer = response.body.takeNative();
     DartHttpNative.startNativeBinaryStreamResponse(
       requestId,
       status: response.status,
       contentType: response.contentType,
       contentLength: response.contentLength,
       headers: response.headers,
-      body: lease,
+      body: transfer,
     );
   }
 

@@ -1,5 +1,5 @@
 import 'package:dart_http_core/dart_http_core.dart';
-import 'package:dart_http_server_runtime/src/native/http_native_bridge.dart';
+import 'package:native_exchange/native_exchange_ffi.dart';
 
 /// Binary HTTP response whose body remains native from producer to socket.
 final class NativeBinaryStreamResponse {

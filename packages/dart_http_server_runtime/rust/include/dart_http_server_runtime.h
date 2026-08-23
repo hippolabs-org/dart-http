@@ -174,7 +174,7 @@ bool dart_http_server_runtime_start_native_binary_stream_response(
     int64_t content_length,
     intptr_t header_count,
     const NativePair* headers,
-    const NativeByteStream* stream);
+    const void* stream);
 
 NativeMultipartForm* dart_http_server_runtime_parse_multipart(
     NativeTransportRequest* request,

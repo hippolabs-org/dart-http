@@ -149,7 +149,7 @@ external bool dart_http_server_runtime_start_binary_stream_response(
     ffi.Int64,
     ffi.IntPtr,
     ffi.Pointer<NativePair>,
-    ffi.Pointer<NativeByteStream>,
+    ffi.Pointer<ffi.Void>,
   )
 >()
 external bool dart_http_server_runtime_start_native_binary_stream_response(
@@ -159,7 +159,7 @@ external bool dart_http_server_runtime_start_native_binary_stream_response(
   int content_length,
   int header_count,
   ffi.Pointer<NativePair> headers,
-  ffi.Pointer<NativeByteStream> stream,
+  ffi.Pointer<ffi.Void> stream,
 );
 
 @ffi.Native<

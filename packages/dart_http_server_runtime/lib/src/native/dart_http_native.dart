@@ -5,6 +5,7 @@ import 'dart:typed_data';
 import 'package:dart_http_core/dart_http_core.dart';
 import 'package:dart_http_server_runtime/src/native/http_native_bridge.dart' as core_ffi;
 import 'package:ffi/ffi.dart';
+import 'package:native_exchange/native_exchange_ffi.dart';
 
 import '../runtime/native_request.dart';
 import '../runtime/transport_request.dart';
@@ -253,13 +254,14 @@ abstract final class DartHttpNative {
     int requestId, {
     required int status,
     required String contentType,
-    required core_ffi.NativeByteStreamLease body,
+    required NativeByteStreamTransfer body,
     int? contentLength,
     List<HttpHeader> headers = const <HttpHeader>[],
   }) {
     final contentTypePtr = contentType.toNativeUtf8();
+    var adopted = false;
     try {
-      return _withNativeHeaders(
+      final accepted = _withNativeHeaders(
         headers,
         (headerStorage, headerCount) =>
             gen.dart_http_server_runtime_start_native_binary_stream_response(
@@ -269,14 +271,17 @@ abstract final class DartHttpNative {
               contentLength ?? -1,
               headerCount,
               headerStorage,
-              body.descriptor,
+              body.descriptor.cast(),
             ),
       );
+      // The native runtime copies and owns the descriptor regardless of
+      // whether the pending HTTP request still exists.
+      body.markAdopted();
+      adopted = true;
+      return accepted;
     } finally {
       calloc.free(contentTypePtr);
-      // A valid descriptor is consumed by the runtime even when the pending
-      // HTTP request disappeared before adoption completed.
-      body.markTransferred();
+      if (!adopted) body.close();
     }
   }
 

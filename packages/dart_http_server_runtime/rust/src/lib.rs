@@ -9,7 +9,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString, c_char};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -25,16 +25,18 @@ use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
 use axum::routing::any;
 use dart_http_core::{
-    NATIVE_BYTE_STREAM_READ_CANCELED, NATIVE_BYTE_STREAM_READ_CHUNK, NATIVE_BYTE_STREAM_READ_DONE,
-    NATIVE_BYTE_STREAM_READ_ERROR, NativeByteStream, NativeByteStreamFreeRead,
-    NativeByteStreamRead, NativeBytes, NativePair, OwnedBytes, OwnedPair, boxed_pairs_ptr,
-    native_pairs_from_owned, owned_pairs_from_map, read_native_bytes, read_native_string,
-    read_pairs_vec,
+    NativeBytes, NativePair, OwnedBytes, OwnedPair, boxed_pairs_ptr, native_pairs_from_owned,
+    owned_pairs_from_map, read_native_bytes, read_native_string, read_pairs_vec,
 };
 use dart_http_server_core::{
     NativeHttpFreeResponse, NativeHttpHandler, NativeHttpMethod, NativeHttpRequest,
 };
 use futures_util::StreamExt;
+use native_exchange_abi::{
+    NEX_CAPABILITY_CONCURRENT_CANCEL, NEX_CAPABILITY_THREAD_SAFE, NEX_STREAM_READ_CANCELED,
+    NEX_STREAM_READ_CHUNK, NEX_STREAM_READ_DONE, NEX_STREAM_READ_ERROR, NexBuffer, NexByteStream,
+    NexUtf8View,
+};
 use once_cell::sync::Lazy;
 use serde::Deserialize;
 use serde_json::Value;
@@ -355,39 +357,68 @@ enum PendingResponseMessage {
 }
 
 struct OwnedNativeByteStream {
-    descriptor: NativeByteStream,
-    completed: bool,
+    inner: Arc<NativeByteStreamInner>,
 }
 
 impl OwnedNativeByteStream {
-    fn new(descriptor: NativeByteStream) -> Self {
+    fn new(descriptor: NexByteStream) -> Self {
         Self {
-            descriptor,
-            completed: false,
+            inner: Arc::new(NativeByteStreamInner {
+                descriptor,
+                completed: AtomicBool::new(false),
+                canceled: AtomicBool::new(false),
+            }),
         }
     }
 
-    fn mark_completed(&mut self) {
-        self.completed = true;
+    fn reader(&self) -> NativeByteStreamReader {
+        NativeByteStreamReader(Arc::clone(&self.inner))
+    }
+
+    fn mark_completed(&self) {
+        self.inner.completed.store(true, Ordering::Release);
     }
 }
 
 impl Drop for OwnedNativeByteStream {
     fn drop(&mut self) {
-        unsafe {
-            if !self.completed
-                && let Some(cancel) = self.descriptor.cancel
-            {
-                cancel(self.descriptor.context);
-            }
-            if let Some(release) = self.descriptor.release {
-                release(self.descriptor.context);
-            }
+        if !self.inner.completed.load(Ordering::Acquire)
+            && !self.inner.canceled.swap(true, Ordering::AcqRel)
+            && let Some(cancel) = self.inner.descriptor.cancel
+        {
+            unsafe { cancel(self.inner.descriptor.context) };
         }
     }
 }
 
 unsafe impl Send for OwnedNativeByteStream {}
+
+struct NativeByteStreamInner {
+    descriptor: NexByteStream,
+    completed: AtomicBool,
+    canceled: AtomicBool,
+}
+
+impl Drop for NativeByteStreamInner {
+    fn drop(&mut self) {
+        if let Some(release) = self.descriptor.release {
+            unsafe { release(self.descriptor.context) };
+        }
+    }
+}
+
+unsafe impl Send for NativeByteStreamInner {}
+unsafe impl Sync for NativeByteStreamInner {}
+
+struct NativeByteStreamReader(Arc<NativeByteStreamInner>);
+
+impl NativeByteStreamReader {
+    fn read(&self) -> Result<NativeByteStreamReadOutcome, String> {
+        read_native_byte_stream(&self.0.descriptor)
+    }
+}
+
+unsafe impl Send for NativeByteStreamReader {}
 
 enum NativeByteStreamReadOutcome {
     Chunk(Bytes),
@@ -395,27 +426,19 @@ enum NativeByteStreamReadOutcome {
 }
 
 struct NativeByteStreamChunkOwner {
-    read: *mut NativeByteStreamRead,
-    free_read: NativeByteStreamFreeRead,
+    descriptor: NexBuffer,
 }
 
 impl AsRef<[u8]> for NativeByteStreamChunkOwner {
     fn as_ref(&self) -> &[u8] {
-        let read = unsafe { &*self.read };
-        unsafe {
-            read_native_bytes(NativeBytes {
-                ptr: read.bytes.ptr,
-                len: read.bytes.len,
-            })
-            .unwrap_or_default()
-        }
+        unsafe { std::slice::from_raw_parts(self.descriptor.ptr, self.descriptor.len) }
     }
 }
 
 impl Drop for NativeByteStreamChunkOwner {
     fn drop(&mut self) {
-        unsafe {
-            (self.free_read)(self.read);
+        if let Some(release) = self.descriptor.release {
+            unsafe { release(self.descriptor.context) };
         }
     }
 }
@@ -424,59 +447,54 @@ unsafe impl Send for NativeByteStreamChunkOwner {}
 unsafe impl Sync for NativeByteStreamChunkOwner {}
 
 fn read_native_byte_stream(
-    descriptor: NativeByteStream,
+    descriptor: &NexByteStream,
 ) -> Result<NativeByteStreamReadOutcome, String> {
     let next = descriptor
         .next
         .ok_or_else(|| "Native byte stream has no next callback.".to_string())?;
-    let free_read = descriptor
-        .free_read
-        .ok_or_else(|| "Native byte stream has no result release callback.".to_string())?;
-    let read_ptr = unsafe { next(descriptor.context) };
-    if read_ptr.is_null() {
-        return Err("Native byte stream returned a null read result.".to_string());
-    }
-
-    unsafe {
-        let read = &*read_ptr;
-        match read.status {
-            NATIVE_BYTE_STREAM_READ_CHUNK => {
-                let bytes = NativeBytes {
-                    ptr: read.bytes.ptr,
-                    len: read.bytes.len,
-                };
-                if bytes.is_invalid() {
-                    free_read(read_ptr);
-                    return Err("Native byte stream returned invalid chunk bytes.".to_string());
+    let mut buffer = NexBuffer {
+        abi_version: 0,
+        struct_size: 0,
+        capabilities: 0,
+        ptr: std::ptr::null(),
+        len: 0,
+        context: std::ptr::null_mut(),
+        release: None,
+    };
+    let mut error = NexUtf8View::empty();
+    let status = unsafe { next(descriptor.context, &mut buffer, &mut error) };
+    match status {
+        NEX_STREAM_READ_CHUNK => {
+            if !buffer.is_valid() || buffer.capabilities & NEX_CAPABILITY_THREAD_SAFE == 0 {
+                if let Some(release) = buffer.release {
+                    unsafe { release(buffer.context) };
                 }
-                if bytes.is_empty() {
-                    free_read(read_ptr);
-                    return Ok(NativeByteStreamReadOutcome::Chunk(Bytes::new()));
+                return Err("Native Exchange producer returned an invalid buffer.".to_string());
+            }
+            if buffer.len == 0 {
+                if let Some(release) = buffer.release {
+                    unsafe { release(buffer.context) };
                 }
-                Ok(NativeByteStreamReadOutcome::Chunk(Bytes::from_owner(
-                    NativeByteStreamChunkOwner {
-                        read: read_ptr,
-                        free_read,
-                    },
-                )))
+                return Ok(NativeByteStreamReadOutcome::Chunk(Bytes::new()));
             }
-            NATIVE_BYTE_STREAM_READ_DONE | NATIVE_BYTE_STREAM_READ_CANCELED => {
-                free_read(read_ptr);
-                Ok(NativeByteStreamReadOutcome::Done)
-            }
-            NATIVE_BYTE_STREAM_READ_ERROR => {
-                let error = read_native_string(read.error)
-                    .unwrap_or_else(|| "Native byte stream read failed.".to_string());
-                free_read(read_ptr);
-                Err(error)
-            }
-            status => {
-                free_read(read_ptr);
-                Err(format!(
-                    "Native byte stream returned unknown status {status}."
-                ))
-            }
+            Ok(NativeByteStreamReadOutcome::Chunk(Bytes::from_owner(
+                NativeByteStreamChunkOwner { descriptor: buffer },
+            )))
         }
+        NEX_STREAM_READ_DONE | NEX_STREAM_READ_CANCELED => Ok(NativeByteStreamReadOutcome::Done),
+        NEX_STREAM_READ_ERROR => {
+            let message = if error.is_valid() && error.len > 0 {
+                std::str::from_utf8(unsafe { std::slice::from_raw_parts(error.ptr, error.len) })
+                    .unwrap_or("Native byte stream read failed.")
+                    .to_string()
+            } else {
+                "Native byte stream read failed.".to_string()
+            };
+            Err(message)
+        }
+        status => Err(format!(
+            "Native byte stream returned unknown status {status}."
+        )),
     }
 }
 
@@ -1222,15 +1240,20 @@ pub extern "C" fn dart_http_server_runtime_start_native_binary_stream_response(
     content_length: i64,
     header_count: isize,
     headers: *const NativePair,
-    stream: *const NativeByteStream,
+    stream: *const NexByteStream,
 ) -> bool {
     let Some(content_type) = (unsafe { read_c_string(content_type) }) else {
         return false;
     };
-    let Some(stream) = (unsafe { stream.as_ref() }).copied() else {
+    if stream.is_null() {
         return false;
-    };
-    if !stream.is_valid() {
+    }
+    let stream = unsafe { std::ptr::read(stream) };
+    let valid = stream.is_valid()
+        && stream.capabilities & NEX_CAPABILITY_THREAD_SAFE != 0
+        && stream.capabilities & NEX_CAPABILITY_CONCURRENT_CANCEL != 0
+        && stream.cancel.is_some();
+    if !valid {
         unsafe {
             if let Some(cancel) = stream.cancel {
                 cancel(stream.context);
@@ -2126,13 +2149,11 @@ async fn handle_http_request(
                 ));
             }
             let stream = async_stream::stream! {
-                let mut stream = stream;
+                let stream = stream;
                 let mut emitted_bytes = 0_u64;
                 loop {
-                    let descriptor = stream.descriptor;
-                    let read = tokio::task::spawn_blocking(move || {
-                        read_native_byte_stream(descriptor)
-                    }).await;
+                    let reader = stream.reader();
+                    let read = tokio::task::spawn_blocking(move || reader.read()).await;
                     match read {
                         Ok(Ok(NativeByteStreamReadOutcome::Chunk(bytes))) => {
                             emitted_bytes = emitted_bytes.saturating_add(bytes.len() as u64);
@@ -4635,7 +4656,99 @@ unsafe fn read_optional_c_string(value: *const c_char) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use native_exchange_abi::{NEX_ABI_VERSION, NEX_CAPABILITY_CONCURRENT_CANCEL};
     use serde_json::json;
+    use std::ffi::c_void;
+    use std::mem::size_of;
+    use std::sync::atomic::AtomicUsize;
+
+    struct TestStreamContext {
+        emitted: AtomicBool,
+        buffer_releases: Arc<AtomicUsize>,
+        stream_releases: Arc<AtomicUsize>,
+    }
+
+    struct TestBufferContext {
+        bytes: Vec<u8>,
+        releases: Arc<AtomicUsize>,
+    }
+
+    unsafe extern "C" fn test_stream_next(
+        context: *mut c_void,
+        out_buffer: *mut NexBuffer,
+        _out_error: *mut NexUtf8View,
+    ) -> i32 {
+        let context = unsafe { &*context.cast::<TestStreamContext>() };
+        if context.emitted.swap(true, Ordering::AcqRel) {
+            return NEX_STREAM_READ_DONE;
+        }
+        let mut buffer = Box::new(TestBufferContext {
+            bytes: vec![1, 2, 3, 4],
+            releases: Arc::clone(&context.buffer_releases),
+        });
+        let descriptor = NexBuffer {
+            abi_version: NEX_ABI_VERSION,
+            struct_size: size_of::<NexBuffer>(),
+            capabilities: NEX_CAPABILITY_THREAD_SAFE,
+            ptr: buffer.bytes.as_ptr(),
+            len: buffer.bytes.len(),
+            context: (&mut *buffer as *mut TestBufferContext).cast(),
+            release: Some(test_buffer_release),
+        };
+        let _ = Box::into_raw(buffer);
+        unsafe { out_buffer.write(descriptor) };
+        NEX_STREAM_READ_CHUNK
+    }
+
+    unsafe extern "C" fn test_buffer_release(context: *mut c_void) {
+        let context = unsafe { Box::from_raw(context.cast::<TestBufferContext>()) };
+        context.releases.fetch_add(1, Ordering::AcqRel);
+    }
+
+    unsafe extern "C" fn test_stream_cancel(_context: *mut c_void) {}
+
+    unsafe extern "C" fn test_stream_release(context: *mut c_void) {
+        let context = unsafe { Box::from_raw(context.cast::<TestStreamContext>()) };
+        context.stream_releases.fetch_add(1, Ordering::AcqRel);
+    }
+
+    #[test]
+    fn consumes_native_exchange_stream_without_copying_chunk_ownership() {
+        let buffer_releases = Arc::new(AtomicUsize::new(0));
+        let stream_releases = Arc::new(AtomicUsize::new(0));
+        let context = Box::new(TestStreamContext {
+            emitted: AtomicBool::new(false),
+            buffer_releases: Arc::clone(&buffer_releases),
+            stream_releases: Arc::clone(&stream_releases),
+        });
+        let descriptor = NexByteStream {
+            abi_version: NEX_ABI_VERSION,
+            struct_size: size_of::<NexByteStream>(),
+            capabilities: NEX_CAPABILITY_THREAD_SAFE | NEX_CAPABILITY_CONCURRENT_CANCEL,
+            context: Box::into_raw(context).cast(),
+            next: Some(test_stream_next),
+            cancel: Some(test_stream_cancel),
+            release: Some(test_stream_release),
+        };
+        let stream = OwnedNativeByteStream::new(descriptor);
+
+        let chunk = match stream.reader().read().expect("stream read succeeds") {
+            NativeByteStreamReadOutcome::Chunk(chunk) => chunk,
+            NativeByteStreamReadOutcome::Done => panic!("stream ended before its chunk"),
+        };
+        assert_eq!(&chunk[..], &[1, 2, 3, 4]);
+        assert_eq!(buffer_releases.load(Ordering::Acquire), 0);
+        drop(chunk);
+        assert_eq!(buffer_releases.load(Ordering::Acquire), 1);
+
+        assert!(matches!(
+            stream.reader().read().expect("terminal read succeeds"),
+            NativeByteStreamReadOutcome::Done,
+        ));
+        stream.mark_completed();
+        drop(stream);
+        assert_eq!(stream_releases.load(Ordering::Acquire), 1);
+    }
 
     #[test]
     fn compiles_installed_schemas_with_component_refs() {

@@ -1,5 +1,11 @@
 ## Unreleased
 
+## 0.3.39
+
+- Accept shared Native Exchange byte streams in `NativeBinaryStreamResponse`,
+  enabling direct native S3-to-HTTP transfer without adapter types or Dart
+  body copies.
+
 ## 0.3.38
 
 - **Breaking:** Adopt the new Dart HTTP package, native asset, and C ABI
