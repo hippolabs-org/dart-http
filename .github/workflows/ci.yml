@@ -28,16 +28,22 @@ jobs:
 
   rust:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        package:
+          - dart_http_native_client
+          - dart_http_server_runtime
     steps:
       - uses: actions/checkout@v5
       - run: rustup toolchain install 1.95.0 --profile minimal
       - run: >-
           cargo fmt --check
-          --manifest-path packages/dart_http_server_runtime/rust/Cargo.toml
+          --manifest-path packages/${{ matrix.package }}/rust/Cargo.toml
       - run: >-
           cargo clippy
-          --manifest-path packages/dart_http_server_runtime/rust/Cargo.toml
+          --manifest-path packages/${{ matrix.package }}/rust/Cargo.toml
           --all-targets -- -D warnings
       - run: >-
           cargo test
-          --manifest-path packages/dart_http_server_runtime/rust/Cargo.toml
+          --manifest-path packages/${{ matrix.package }}/rust/Cargo.toml

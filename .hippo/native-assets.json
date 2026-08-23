@@ -1,6 +1,21 @@
 {
   "version": 1,
   "packages": {
+    "dart_http_native_client": {
+      "crate": "packages/dart_http_native_client/rust/Cargo.toml",
+      "release_repository": "native-artifacts",
+      "native_inputs": [
+        "packages/dart_http_native_client/rust"
+      ],
+      "targets": [
+        "linux-x64",
+        "linux-arm64",
+        "macos-arm64"
+      ],
+      "linux_packages": [
+        "pkg-config"
+      ]
+    },
     "dart_http_server_runtime": {
       "crate": "packages/dart_http_server_runtime/rust/Cargo.toml",
       "release_repository": "native-artifacts",
