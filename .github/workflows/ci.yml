@@ -20,8 +20,31 @@ jobs:
         with:
           sdk: ${{ env.DART_VERSION }}
 
+      - name: Authenticate private package sources
+        env:
+          HIPPOLABS_REPO_TOKEN: ${{ secrets.HIPPOLABS_REPO_TOKEN }}
+        run: |
+          test -n "$HIPPOLABS_REPO_TOKEN"
+          git config --global url."https://x-access-token:${HIPPOLABS_REPO_TOKEN}@github.com/".insteadOf "https://github.com/"
+
       - name: Get dependencies
         run: dart pub get
 
       - name: Run checks
         run: dart run melos run ci
+
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.95.0 --profile minimal
+      - run: >-
+          cargo fmt --check
+          --manifest-path packages/dart_edge_http_server_runtime/rust/Cargo.toml
+      - run: >-
+          cargo clippy
+          --manifest-path packages/dart_edge_http_server_runtime/rust/Cargo.toml
+          --all-targets -- -D warnings
+      - run: >-
+          cargo test
+          --manifest-path packages/dart_edge_http_server_runtime/rust/Cargo.toml

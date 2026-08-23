@@ -14,6 +14,14 @@ dev_dependencies:
 workspace:
   - packages/*
 
+dependency_overrides:
+  cli_util: ^0.5.1
+  native_exchange:
+    git:
+      url: https://github.com/hippolabs-org/native-exchange.git
+      ref: 8678ee55be5c5181dd3d5337a8912c12a37a535d
+      path: packages/native_exchange
+
 melos:
   ide:
     intellij:

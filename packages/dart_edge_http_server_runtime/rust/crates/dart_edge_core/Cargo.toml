@@ -1,0 +1,13 @@
+[package]
+name = "dart_edge_core"
+version = "0.2.1"
+edition = "2024"
+description = "Shared FFI primitives for Dart Edge native crates."
+publish = false
+license = "MIT"
+repository = "https://github.com/hippolabs-org/dart-http"
+readme = "README.md"
+keywords = ["dart-edge", "ffi", "native-assets"]
+
+[lib]
+path = "src/lib.rs"
