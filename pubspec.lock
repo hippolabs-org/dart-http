@@ -289,6 +289,14 @@ packages:
       url: "https://pub.hippolabs.org"
     source: hosted
     version: "0.1.2"
+  hippolabs_native_assets:
+    dependency: transitive
+    description:
+      name: hippolabs_native_assets
+      sha256: "1dca12b9da23b2a6ce04543f7e04c5e49efbcfda301b69ed7d9c214016df254d"
+      url: "https://pub.hippolabs.org"
+    source: hosted
+    version: "0.1.1"
   hooks:
     dependency: transitive
     description:

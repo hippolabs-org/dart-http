@@ -10,16 +10,17 @@ environment:
 resolution: workspace
 
 dependencies:
-  code_assets: ^1.2.1
   dart_http_core:
     hosted: "https://pub.hippolabs.org"
     version: ^0.3.44
   ffi: ^2.2.0
+  hippolabs_native_assets:
+    hosted: "https://pub.hippolabs.org"
+    version: ^0.1.1
   hooks: ^2.0.2
   json_schema:
     hosted: https://pub.hippolabs.org
     version: ^0.1.2
-  native_toolchain_rust: ^1.0.4+0
   native_exchange:
     hosted: "https://pub.hippolabs.org"
     version: ^0.2.0
