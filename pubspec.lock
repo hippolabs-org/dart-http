@@ -418,13 +418,12 @@ packages:
     source: hosted
     version: "2.0.5"
   native_exchange:
-    dependency: "direct overridden"
+    dependency: transitive
     description:
-      path: "packages/native_exchange"
-      ref: "8678ee55be5c5181dd3d5337a8912c12a37a535d"
-      resolved-ref: "8678ee55be5c5181dd3d5337a8912c12a37a535d"
-      url: "https://github.com/hippolabs-org/native-exchange.git"
-    source: git
+      name: native_exchange
+      sha256: "4b7b02e08fd71552977369d38dbe8a34321b0b78426cdb96a8b2bbdd58c14b4b"
+      url: "https://pub.hippolabs.org"
+    source: hosted
     version: "0.2.0"
   native_toolchain_rust:
     dependency: transitive

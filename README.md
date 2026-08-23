@@ -10,9 +10,7 @@ Native Exchange is the first-class body ownership boundary. Native producers
 can transfer buffers and pull streams directly into the HTTP runtime while Dart
 remains the routing and control plane.
 
-CI resolves the private Native Exchange source pin with the organization-level
-`HIPPOLABS_REPO_TOKEN` Actions secret until `native_exchange` is published to
-`pub.hippolabs.org`.
+Native Exchange is resolved from `pub.hippolabs.org`.
 
 ## Packages
 

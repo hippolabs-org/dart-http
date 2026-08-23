@@ -20,13 +20,6 @@ jobs:
         with:
           sdk: ${{ env.DART_VERSION }}
 
-      - name: Authenticate private package sources
-        env:
-          HIPPOLABS_REPO_TOKEN: ${{ secrets.HIPPOLABS_REPO_TOKEN }}
-        run: |
-          test -n "$HIPPOLABS_REPO_TOKEN"
-          git config --global url."https://x-access-token:${HIPPOLABS_REPO_TOKEN}@github.com/".insteadOf "https://github.com/"
-
       - name: Get dependencies
         run: dart pub get
 

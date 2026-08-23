@@ -26,12 +26,6 @@ jobs:
       - uses: dart-lang/setup-dart@v1
         with:
           sdk: 3.13.0
-      - name: Authenticate private package sources
-        env:
-          HIPPOLABS_REPO_TOKEN: ${{ secrets.HIPPOLABS_REPO_TOKEN }}
-        run: |
-          test -n "$HIPPOLABS_REPO_TOKEN"
-          git config --global url."https://x-access-token:${HIPPOLABS_REPO_TOKEN}@github.com/".insteadOf "https://github.com/"
       - run: dart pub get
       - run: dart run melos run ci
       - name: Configure internal Pub token
