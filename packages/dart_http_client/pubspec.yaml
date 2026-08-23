@@ -1,6 +1,6 @@
 name: dart_http_client
 description: HTTP and WebSocket transports for generated Dart HTTP clients.
-version: 0.1.7
+version: 0.1.8
 publish_to: "https://pub.hippolabs.org"
 repository: https://github.com/hippolabs-org/dart-http/tree/main/packages/dart_http_client
 
@@ -12,7 +12,7 @@ resolution: workspace
 dependencies:
   dart_http_core:
     hosted: "https://pub.hippolabs.org"
-    version: ^0.3.23
+    version: ^0.3.46
   http: ^1.6.0
   web: ^1.1.1
   web_socket_client: ^0.2.1

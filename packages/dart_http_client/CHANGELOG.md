@@ -1,3 +1,8 @@
+## 0.1.8
+
+- Reject transport-specific native bodies explicitly in the pure-Dart client.
+- Require `dart_http_core` 0.3.46.
+
 ## 0.1.7
 
 - **Breaking:** Adopt the new Dart HTTP package and public API namespace.

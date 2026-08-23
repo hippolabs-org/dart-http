@@ -1,5 +1,9 @@
 ## Unreleased
 
+## 0.3.46
+
+- Add a web-safe native request-body marker to the client transport contract.
+
 ## 0.3.45
 
 - **Breaking:** Adopt the new Dart HTTP package and public API namespace.

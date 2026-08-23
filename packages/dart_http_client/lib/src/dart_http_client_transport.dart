@@ -79,6 +79,11 @@ final class DartHttpClientTransport implements HttpClientTransport {
   }
 
   http.BaseRequest _httpRequestFrom(DartHttpClientRequest request) {
+    if (request.nativeBody != null) {
+      throw UnsupportedError(
+        'DartHttpClientTransport cannot consume a transport-specific native body.',
+      );
+    }
     final http.BaseRequest httpRequest;
     if (request.bodyStream case final bodyStream?) {
       httpRequest = _DartHttpStreamedRequest(

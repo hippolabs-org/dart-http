@@ -19,6 +19,7 @@ Native Exchange is resolved from `pub.hippolabs.org`.
 | [`sse_helpers`](packages/sse_helpers) | Bounded, incremental Server-Sent Events encoding and decoding. |
 | `dart_http_core` | Transport-neutral HTTP, routing, WebSocket, and WebTransport contracts. |
 | `dart_http_client` | HTTP and WebSocket transports for generated clients. |
+| `dart_http_native_client` | Tokio/reqwest HTTP transport with cancellation and Native Exchange request/response streams. |
 | `dart_http_server` | App-facing HTTP server and helpers. |
 | `dart_http_server_codegen` | Route, schema, and client generation. |
 | `dart_http_server_runtime` | Rust-backed native HTTP runtime. |
@@ -32,4 +33,5 @@ migrate repository ownership without an immediate API rename.
 dart pub get
 dart run melos run ci
 cargo test --manifest-path packages/dart_http_server_runtime/rust/Cargo.toml
+cargo test --manifest-path packages/dart_http_native_client/rust/Cargo.toml
 ```

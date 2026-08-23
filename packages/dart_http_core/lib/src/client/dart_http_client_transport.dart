@@ -6,6 +6,16 @@ import '../http.dart';
 import '../web_socket.dart';
 import '../web_transport.dart';
 
+/// Marker implemented by transport-specific, ownership-transferring bodies.
+///
+/// The core contract deliberately does not import `dart:ffi`, so it remains
+/// usable on the web. Native transports may expose a concrete implementation
+/// backed by Native Exchange.
+abstract interface class DartHttpClientNativeBody {
+  /// Declared byte length, when known.
+  int? get contentLength;
+}
+
 /// One outbound request emitted by a generated client.
 final class DartHttpClientRequest {
   const DartHttpClientRequest({
@@ -16,10 +26,15 @@ final class DartHttpClientRequest {
     this.bodyBytes,
     this.bodyStream,
     this.bodyStreamLength,
+    this.nativeBody,
     this.abortTrigger,
   }) : assert(
          bodyStream == null || (body == null && bodyBytes == null),
          'bodyStream cannot be combined with body or bodyBytes.',
+       ),
+       assert(
+         nativeBody == null || (body == null && bodyBytes == null && bodyStream == null),
+         'nativeBody cannot be combined with another request body.',
        );
 
   final HttpMethod method;
@@ -29,6 +44,7 @@ final class DartHttpClientRequest {
   final List<int>? bodyBytes;
   final Stream<List<int>>? bodyStream;
   final int? bodyStreamLength;
+  final DartHttpClientNativeBody? nativeBody;
   final Future<void>? abortTrigger;
 
   DartHttpClientRequest copyWith({
@@ -39,6 +55,7 @@ final class DartHttpClientRequest {
     List<int>? bodyBytes,
     Stream<List<int>>? bodyStream,
     int? bodyStreamLength,
+    DartHttpClientNativeBody? nativeBody,
     Future<void>? abortTrigger,
   }) {
     return DartHttpClientRequest(
@@ -49,6 +66,7 @@ final class DartHttpClientRequest {
       bodyBytes: bodyBytes ?? this.bodyBytes,
       bodyStream: bodyStream ?? this.bodyStream,
       bodyStreamLength: bodyStreamLength ?? this.bodyStreamLength,
+      nativeBody: nativeBody ?? this.nativeBody,
       abortTrigger: abortTrigger ?? this.abortTrigger,
     );
   }

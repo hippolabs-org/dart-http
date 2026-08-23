@@ -425,6 +425,14 @@ packages:
       url: "https://pub.hippolabs.org"
     source: hosted
     version: "0.2.0"
+  native_exchange_runtime:
+    dependency: transitive
+    description:
+      name: native_exchange_runtime
+      sha256: "4942db980b61c9797fac84329d79f9c56821c6822db82183b1e58ed065b2266e"
+      url: "https://pub.hippolabs.org"
+    source: hosted
+    version: "0.1.0"
   native_toolchain_rust:
     dependency: transitive
     description:
