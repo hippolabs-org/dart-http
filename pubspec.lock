@@ -209,14 +209,6 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "1.0.2"
-  dart_edge_native_bridge:
-    dependency: transitive
-    description:
-      name: dart_edge_native_bridge
-      sha256: "2bf4631a1d7b021cb97c45f01597699ad0969f623f4b553154a44fb17e395271"
-      url: "https://registry.hippolabs.org/pub/internal-pub/"
-    source: hosted
-    version: "0.1.5"
   dart_style:
     dependency: transitive
     description:

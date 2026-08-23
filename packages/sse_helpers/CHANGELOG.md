@@ -1,3 +1,3 @@
 ## 0.1.0
 
-- Add bounded, incremental decoding of server-sent event byte streams into Dart Edge `SseEvent` values.
+- Add bounded, incremental decoding of server-sent event byte streams into Dart HTTP `SseEvent` values.

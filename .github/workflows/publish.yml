@@ -1,0 +1,43 @@
+name: Publish Packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      package_scope:
+        description: Optional Melos package name to publish.
+        required: false
+        default: ""
+      dry_run:
+        description: Validate without publishing.
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  PUB_REGISTRY_URL: https://pub.hippolabs.org
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: 3.13.0
+      - run: dart pub get
+      - run: dart run melos run ci
+      - name: Configure Pub token
+        env:
+          PUB_TOKEN: ${{ secrets.PUB_CREDENTIALS }}
+        run: echo "$PUB_TOKEN" | dart pub token add "$PUB_REGISTRY_URL"
+      - name: Publish
+        env:
+          PACKAGE_SCOPE: ${{ inputs.package_scope }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          args=(--no-private --yes)
+          if [[ "$DRY_RUN" == "true" ]]; then args+=(--dry-run); else args+=(--no-dry-run); fi
+          if [[ -n "$PACKAGE_SCOPE" ]]; then args+=(--scope "$PACKAGE_SCOPE"); fi
+          dart run melos publish "${args[@]}"

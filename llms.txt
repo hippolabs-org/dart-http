@@ -6,8 +6,8 @@ for Dart maintained by Hippolabs.
 ## Package map
 
 - `packages/sse_helpers`: bounded, incremental Server-Sent Events wire model, encoder, and decoder.
-- `packages/dart_edge_core`: transport-neutral HTTP and routing contracts.
-- `packages/dart_edge_http_server_runtime`: Rust-backed runtime with Native
+- `packages/dart_http_core`: transport-neutral HTTP and routing contracts.
+- `packages/dart_http_server_runtime`: Rust-backed runtime with Native
   Exchange body ownership.
 
 ## Dependency direction

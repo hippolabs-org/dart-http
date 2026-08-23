@@ -1,0 +1,53 @@
+name: DartHttpRuntimeNativeBindings
+description: Generated C ABI bindings for dart_http_server_runtime.
+output: ../lib/src/native/generated_bindings.dart
+headers:
+  entry-points:
+    - ../rust/include/dart_http_server_runtime.h
+compiler-opts:
+  - -Irust/crates/dart_http_core/include
+  - -Irust/crates/dart_http_server_core/include
+functions:
+  include:
+    - dart_http_server_runtime_.*
+  leaf:
+    include:
+      - dart_http_server_runtime_free_multipart_form
+      - dart_http_server_runtime_free_request
+      - dart_http_server_runtime_free_string
+      - dart_http_server_runtime_free_web_socket_connection
+      - dart_http_server_runtime_free_web_socket_message
+      - dart_http_server_runtime_native_abi_version
+structs:
+  include:
+    - NativeByteStream
+    - NativeByteStreamRead
+    - NativeBytes
+    - NativeOwnedBytes
+    - NativePair
+    - NativeMultipartField
+    - NativeMultipartFile
+    - NativeMultipartForm
+    - NativeHttpRequest
+    - NativeHttpResponse
+    - NativeTransportRequest
+    - NativeWebSocketConnection
+    - NativeWebSocketMessage
+    - NativeWebTransportConnection
+    - NativeWebTransportDatagram
+    - NativeWebTransportStream
+    - NativeWebTransportStreamInfo
+    - NativeWebTransportStreamChunk
+    - NativeWebTransportStreamTerminal
+    - NativeWebTransportOperation
+typedefs:
+  include:
+    - dart_http_server_runtime_transport_event_callback_t
+exclude-all-by-default: true
+sort: true
+use-supported-typedefs: true
+comments: false
+preamble: |
+  // ignore_for_file: camel_case_types, non_constant_identifier_names
+ffi-native:
+  asset-id: package:dart_http_server_runtime/dart_http_server_runtime.dart
