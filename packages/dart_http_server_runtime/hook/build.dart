@@ -8,7 +8,7 @@ Future<void> main(List<String> args) async {
     await HippolabsRustBuilder(
       assetName: '$packageName.dart',
       cratePath: 'rust',
-      prebuilt: const HippolabsRustPrebuilt.github(),
+      prebuilt: const HippolabsRustPrebuilt.github(repository: 'dart-http'),
     ).run(input: input, output: output);
   });
 }
