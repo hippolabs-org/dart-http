@@ -10,19 +10,19 @@ on:
       dry_run:
         description: Validate without publishing or creating native releases.
         type: boolean
-        default: true
+        default: false
 
 permissions:
   contents: write
 
 jobs:
   publish:
-    uses: hipposphere/devops/.github/workflows/publish-dart-packages.yml@156f2076137c51b20a3e9aa5836b03146e7438c0
+    uses: hipposphere/devops/.github/workflows/publish-dart-packages.yml@401ee77c97b5c284be7f1623beef069d72fe5d81
     with:
       package_scope: ${{ inputs.package_scope }}
       dry_run: ${{ inputs.dry_run }}
       dart_version: "3.13.0"
-      devops_ref: 156f2076137c51b20a3e9aa5836b03146e7438c0
+      devops_ref: 401ee77c97b5c284be7f1623beef069d72fe5d81
     secrets:
       pub_credentials: ${{ secrets.PUB_CREDENTIALS }}
       native_artifacts_token: ${{ secrets.NATIVE_ARTIFACTS_TOKEN }}
