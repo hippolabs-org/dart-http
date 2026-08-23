@@ -3,6 +3,7 @@
   "packages": {
     "dart_http_server_runtime": {
       "crate": "packages/dart_http_server_runtime/rust/Cargo.toml",
+      "release_repository": "native-artifacts",
       "native_inputs": [
         "packages/dart_http_server_runtime/rust"
       ],
