@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use bytes::Bytes;
+use futures_util::{SinkExt, StreamExt};
 use native_exchange_abi::{
     NEX_ABI_VERSION, NEX_CAPABILITY_CONCURRENT_CANCEL, NEX_CAPABILITY_THREAD_SAFE,
     NEX_STREAM_READ_CANCELED, NEX_STREAM_READ_CHUNK, NEX_STREAM_READ_DONE, NEX_STREAM_READ_ERROR,
@@ -18,10 +19,21 @@ use reqwest::{Body, Client, Method, Url};
 use tokio::runtime::{Builder, Runtime};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
+use tokio_tungstenite::tungstenite::protocol::{CloseFrame, frame::coding::CloseCode};
 use tokio_util::sync::CancellationToken;
 
-const ABI_VERSION: i32 = 1;
+const ABI_VERSION: i32 = 2;
 const REQUEST_CANCELED: &str = "Native HTTP request canceled.";
+const WEBSOCKET_EVENT_OPENED: i32 = 1;
+const WEBSOCKET_EVENT_TEXT: i32 = 2;
+const WEBSOCKET_EVENT_BINARY: i32 = 3;
+const WEBSOCKET_EVENT_CLOSED: i32 = 4;
+const WEBSOCKET_EVENT_ERROR: i32 = 5;
+const WEBSOCKET_EVENT_SENT: i32 = 6;
 
 static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
     Builder::new_multi_thread()
@@ -49,18 +61,60 @@ pub struct NativeHttpResult {
     error: *mut c_char,
 }
 
+#[repr(C)]
+pub struct NativeWebSocketEvent {
+    kind: i32,
+    socket_id: i64,
+    operation_id: i64,
+    close_code: i32,
+    text: *mut c_char,
+    binary_buffer: *mut c_void,
+}
+
 struct ClientState {
     client: Client,
+    connect_timeout: Duration,
     completion_port: NativeCompletionPort,
     next_request_id: AtomicI64,
+    next_socket_id: AtomicI64,
     tasks: Mutex<HashMap<i64, RequestTask>>,
     results: Mutex<HashMap<i64, Result<ResponseData, String>>>,
+    web_sockets: Mutex<HashMap<i64, Arc<WebSocketState>>>,
     closed: AtomicBool,
 }
 
 struct RequestTask {
     cancellation: CancellationToken,
     native_body_cancel: Option<RequestStreamCancel>,
+}
+
+struct WebSocketState {
+    commands: mpsc::Sender<WebSocketCommand>,
+    events: Mutex<mpsc::Receiver<WebSocketEventData>>,
+    control_events: Mutex<mpsc::UnboundedReceiver<WebSocketEventData>>,
+    cancellation: CancellationToken,
+    next_operation_id: AtomicI64,
+}
+
+enum WebSocketCommand {
+    Send {
+        operation_id: i64,
+        message: Message,
+    },
+    Close {
+        operation_id: i64,
+        code: Option<u16>,
+        reason: String,
+    },
+}
+
+enum WebSocketEventData {
+    Opened { protocol: Option<String> },
+    Text(String),
+    Binary(Bytes),
+    Closed { code: Option<u16>, reason: String },
+    Error(String),
+    Sent { operation_id: i64 },
 }
 
 struct AdoptedRequestStream {
@@ -296,10 +350,13 @@ pub extern "C" fn dart_http_native_client_create(
     let id = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
     let state = Arc::new(ClientState {
         client,
+        connect_timeout,
         completion_port: NativeCompletionPort::new(completion_port),
         next_request_id: AtomicI64::new(1),
+        next_socket_id: AtomicI64::new(1),
         tasks: Mutex::new(HashMap::new()),
         results: Mutex::new(HashMap::new()),
+        web_sockets: Mutex::new(HashMap::new()),
         closed: AtomicBool::new(false),
     });
     match CLIENTS.lock() {
@@ -331,6 +388,11 @@ pub extern "C" fn dart_http_native_client_close(client_id: i64) {
     }
     if let Ok(mut results) = state.results.lock() {
         results.clear();
+    }
+    if let Ok(mut sockets) = state.web_sockets.lock() {
+        for (_, socket) in sockets.drain() {
+            socket.cancellation.cancel();
+        }
     }
 }
 
@@ -476,6 +538,573 @@ pub unsafe extern "C" fn dart_http_native_client_free_result(result: *mut Native
         if !result.body_stream.is_null() {
             drop(Box::from_raw(result.body_stream.cast::<NexByteStream>()));
         }
+    }
+}
+
+#[unsafe(no_mangle)]
+/// Starts an asynchronous native WebSocket connection.
+///
+/// # Safety
+///
+/// String and header pointers must remain readable for this call. All values
+/// are copied before the function returns.
+pub unsafe extern "C" fn dart_http_native_client_websocket_connect(
+    client_id: i64,
+    url: *const c_char,
+    headers: *const NativeHttpHeader,
+    header_count: isize,
+    protocols: *const *const c_char,
+    protocol_count: isize,
+    incoming_capacity: isize,
+    outgoing_capacity: isize,
+) -> i64 {
+    let Some(state) = client_state(client_id) else {
+        return 0;
+    };
+    if state.closed.load(Ordering::Acquire) {
+        return 0;
+    }
+    let Some(incoming_capacity) = bounded_capacity(incoming_capacity) else {
+        return 0;
+    };
+    let Some(outgoing_capacity) = bounded_capacity(outgoing_capacity) else {
+        return 0;
+    };
+    let url = match unsafe { required_c_str(url, "WebSocket URL") } {
+        Ok(value) => value,
+        Err(_) => return 0,
+    };
+    let headers = match unsafe { read_headers(headers, header_count) } {
+        Ok(value) => value,
+        Err(_) => return 0,
+    };
+    let protocols = match unsafe { read_c_string_array(protocols, protocol_count) } {
+        Ok(value) => value,
+        Err(_) => return 0,
+    };
+    let socket_id = state.next_socket_id.fetch_add(1, Ordering::Relaxed);
+    let (command_tx, command_rx) = mpsc::channel(outgoing_capacity);
+    let (event_tx, event_rx) = mpsc::channel(incoming_capacity);
+    let (control_event_tx, control_event_rx) = mpsc::unbounded_channel();
+    let cancellation = CancellationToken::new();
+    let socket = Arc::new(WebSocketState {
+        commands: command_tx,
+        events: Mutex::new(event_rx),
+        control_events: Mutex::new(control_event_rx),
+        cancellation: cancellation.clone(),
+        next_operation_id: AtomicI64::new(1),
+    });
+    let inserted = match state.web_sockets.lock() {
+        Ok(mut sockets) => sockets.insert(socket_id, socket).is_none(),
+        Err(_) => false,
+    };
+    if !inserted {
+        return 0;
+    }
+    let task_state = Arc::clone(&state);
+    RUNTIME.spawn(async move {
+        run_web_socket(
+            task_state,
+            socket_id,
+            url,
+            headers,
+            protocols,
+            command_rx,
+            event_tx,
+            control_event_tx,
+            cancellation,
+        )
+        .await;
+    });
+    socket_id
+}
+
+#[unsafe(no_mangle)]
+/// Enqueues one UTF-8 WebSocket text frame.
+///
+/// # Safety
+///
+/// `value` must point to a valid null-terminated UTF-8 string for this call.
+pub unsafe extern "C" fn dart_http_native_client_websocket_send_text(
+    client_id: i64,
+    socket_id: i64,
+    value: *const c_char,
+) -> i64 {
+    let value = match unsafe { required_c_str(value, "WebSocket text") } {
+        Ok(value) => value,
+        Err(_) => return 0,
+    };
+    enqueue_web_socket_message(client_id, socket_id, Message::Text(value.into()))
+}
+
+#[unsafe(no_mangle)]
+/// Enqueues one WebSocket binary frame after copying its bytes.
+///
+/// # Safety
+///
+/// `value` must be null only when `length` is zero and otherwise point to
+/// `length` readable bytes for this call.
+pub unsafe extern "C" fn dart_http_native_client_websocket_send_binary(
+    client_id: i64,
+    socket_id: i64,
+    value: *const u8,
+    length: isize,
+) -> i64 {
+    let bytes = match unsafe { copy_optional_bytes(value, length) } {
+        Ok(value) => value,
+        Err(_) => return 0,
+    };
+    enqueue_web_socket_message(client_id, socket_id, Message::Binary(bytes.into()))
+}
+
+#[unsafe(no_mangle)]
+/// Enqueues a graceful WebSocket close frame.
+///
+/// # Safety
+///
+/// `reason` may be null or must point to a valid null-terminated UTF-8 string
+/// for this call.
+pub unsafe extern "C" fn dart_http_native_client_websocket_close(
+    client_id: i64,
+    socket_id: i64,
+    code: i32,
+    reason: *const c_char,
+) -> i64 {
+    let Some(socket) = web_socket_state(client_id, socket_id) else {
+        return 0;
+    };
+    let code = if code < 0 {
+        None
+    } else {
+        match u16::try_from(code) {
+            Ok(value) => Some(value),
+            Err(_) => return 0,
+        }
+    };
+    let reason = if reason.is_null() {
+        String::new()
+    } else {
+        match unsafe { required_c_str(reason, "WebSocket close reason") } {
+            Ok(value) => value,
+            Err(_) => return 0,
+        }
+    };
+    let operation_id = socket.next_operation_id.fetch_add(1, Ordering::Relaxed);
+    match socket.commands.try_send(WebSocketCommand::Close {
+        operation_id,
+        code,
+        reason,
+    }) {
+        Ok(()) => operation_id,
+        Err(_) => 0,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn dart_http_native_client_websocket_abort(client_id: i64, socket_id: i64) -> bool {
+    let Some(state) = client_state(client_id) else {
+        return false;
+    };
+    let socket = state
+        .web_sockets
+        .lock()
+        .ok()
+        .and_then(|mut sockets| sockets.remove(&socket_id));
+    let Some(socket) = socket else {
+        return false;
+    };
+    socket.cancellation.cancel();
+    true
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn dart_http_native_client_websocket_take_event(
+    client_id: i64,
+    socket_id: i64,
+    kind: i32,
+) -> *mut NativeWebSocketEvent {
+    let Some(socket) = web_socket_state(client_id, socket_id) else {
+        return ptr::null_mut();
+    };
+    let event = if matches!(kind, WEBSOCKET_EVENT_TEXT | WEBSOCKET_EVENT_BINARY) {
+        socket
+            .events
+            .lock()
+            .ok()
+            .and_then(|mut events| events.try_recv().ok())
+    } else {
+        socket
+            .control_events
+            .lock()
+            .ok()
+            .and_then(|mut events| events.try_recv().ok())
+    };
+    event
+        .map(|event| Box::into_raw(Box::new(web_socket_event_to_ffi(socket_id, event))))
+        .unwrap_or(ptr::null_mut())
+}
+
+#[unsafe(no_mangle)]
+/// Transfers the Native Exchange buffer owned by a binary event.
+///
+/// # Safety
+///
+/// `event` must point to a live event returned by
+/// `dart_http_native_client_websocket_take_event`.
+pub unsafe extern "C" fn dart_http_native_client_websocket_event_take_binary(
+    event: *mut NativeWebSocketEvent,
+    out_buffer: *mut c_void,
+) -> bool {
+    if event.is_null() || out_buffer.is_null() {
+        return false;
+    }
+    let event = unsafe { &mut *event };
+    let pointer = std::mem::replace(&mut event.binary_buffer, ptr::null_mut());
+    if pointer.is_null() {
+        return false;
+    }
+    let descriptor = unsafe { *Box::from_raw(pointer.cast::<NexBuffer>()) };
+    unsafe { out_buffer.cast::<NexBuffer>().write(descriptor) };
+    true
+}
+
+#[unsafe(no_mangle)]
+/// Releases a native WebSocket event and any payload it still owns.
+///
+/// # Safety
+///
+/// `event` must be null or a pointer returned by
+/// `dart_http_native_client_websocket_take_event` that has not been freed.
+pub unsafe extern "C" fn dart_http_native_client_websocket_free_event(
+    event: *mut NativeWebSocketEvent,
+) {
+    if event.is_null() {
+        return;
+    }
+    let event = unsafe { Box::from_raw(event) };
+    unsafe { free_c_string(event.text) };
+    if !event.binary_buffer.is_null() {
+        unsafe { release_buffer_pointer(event.binary_buffer.cast::<NexBuffer>()) };
+    }
+}
+
+fn enqueue_web_socket_message(client_id: i64, socket_id: i64, message: Message) -> i64 {
+    let Some(socket) = web_socket_state(client_id, socket_id) else {
+        return 0;
+    };
+    let operation_id = socket.next_operation_id.fetch_add(1, Ordering::Relaxed);
+    match socket.commands.try_send(WebSocketCommand::Send {
+        operation_id,
+        message,
+    }) {
+        Ok(()) => operation_id,
+        Err(_) => 0,
+    }
+}
+
+fn web_socket_state(client_id: i64, socket_id: i64) -> Option<Arc<WebSocketState>> {
+    client_state(client_id).and_then(|state| {
+        state
+            .web_sockets
+            .lock()
+            .ok()
+            .and_then(|sockets| sockets.get(&socket_id).cloned())
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_web_socket(
+    state: Arc<ClientState>,
+    socket_id: i64,
+    url: String,
+    headers: Vec<(String, String)>,
+    protocols: Vec<String>,
+    mut commands: mpsc::Receiver<WebSocketCommand>,
+    events: mpsc::Sender<WebSocketEventData>,
+    control_events: mpsc::UnboundedSender<WebSocketEventData>,
+    cancellation: CancellationToken,
+) {
+    let request = prepare_web_socket_request(&url, headers, protocols);
+    let request = match request {
+        Ok(request) => request,
+        Err(error) => {
+            let _ = send_web_socket_event(
+                &state,
+                socket_id,
+                &events,
+                &control_events,
+                WebSocketEventData::Error(error),
+                &cancellation,
+            )
+            .await;
+            return;
+        }
+    };
+    let connected = tokio::time::timeout(state.connect_timeout, connect_async(request)).await;
+    let (socket, response) = match connected {
+        Ok(Ok(value)) => value,
+        Ok(Err(error)) => {
+            let _ = send_web_socket_event(
+                &state,
+                socket_id,
+                &events,
+                &control_events,
+                WebSocketEventData::Error(format!("Native WebSocket connection failed: {error}")),
+                &cancellation,
+            )
+            .await;
+            return;
+        }
+        Err(_) => {
+            let _ = send_web_socket_event(
+                &state,
+                socket_id,
+                &events,
+                &control_events,
+                WebSocketEventData::Error("Native WebSocket connection timed out.".to_owned()),
+                &cancellation,
+            )
+            .await;
+            return;
+        }
+    };
+    let protocol = response
+        .headers()
+        .get("sec-websocket-protocol")
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned);
+    if !send_web_socket_event(
+        &state,
+        socket_id,
+        &events,
+        &control_events,
+        WebSocketEventData::Opened { protocol },
+        &cancellation,
+    )
+    .await
+    {
+        return;
+    }
+    let (mut writer, mut reader) = socket.split();
+    loop {
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => {
+                let _ = writer.close().await;
+                return;
+            }
+            command = commands.recv() => {
+                let Some(command) = command else {
+                    let _ = writer.close().await;
+                    return;
+                };
+                let (operation_id, message) = match command {
+                    WebSocketCommand::Send { operation_id, message } => (operation_id, message),
+                    WebSocketCommand::Close { operation_id, code, reason } => {
+                        let frame = match (code, reason.is_empty()) {
+                            (None, true) => None,
+                            (code, _) => Some(CloseFrame {
+                                code: CloseCode::from(code.unwrap_or(1000)),
+                                reason: reason.into(),
+                            }),
+                        };
+                        (operation_id, Message::Close(frame))
+                    }
+                };
+                if let Err(error) = writer.send(message).await {
+                    let _ = send_web_socket_event(
+                        &state,
+                        socket_id,
+                        &events,
+                        &control_events,
+                        WebSocketEventData::Error(format!("Native WebSocket send failed: {error}")),
+                        &cancellation,
+                    ).await;
+                    return;
+                }
+                if !send_web_socket_event(
+                    &state,
+                    socket_id,
+                    &events,
+                    &control_events,
+                    WebSocketEventData::Sent { operation_id },
+                    &cancellation,
+                ).await {
+                    return;
+                }
+            }
+            incoming = reader.next() => {
+                let event = match incoming {
+                    Some(Ok(Message::Text(value))) => WebSocketEventData::Text(value.to_string()),
+                    Some(Ok(Message::Binary(value))) => WebSocketEventData::Binary(value),
+                    Some(Ok(Message::Close(frame))) => {
+                        let (code, reason) = frame
+                            .map(|frame| (Some(u16::from(frame.code)), frame.reason.to_string()))
+                            .unwrap_or((None, String::new()));
+                        let _ = send_web_socket_event(
+                            &state,
+                            socket_id,
+                            &events,
+                            &control_events,
+                            WebSocketEventData::Closed { code, reason },
+                            &cancellation,
+                        ).await;
+                        return;
+                    }
+                    Some(Ok(Message::Ping(value))) => {
+                        if let Err(error) = writer.send(Message::Pong(value)).await {
+                            let _ = send_web_socket_event(
+                                &state,
+                                socket_id,
+                                &events,
+                                &control_events,
+                                WebSocketEventData::Error(format!(
+                                    "Native WebSocket pong failed: {error}"
+                                )),
+                                &cancellation,
+                            ).await;
+                            return;
+                        }
+                        continue;
+                    }
+                    Some(Ok(Message::Pong(_))) | Some(Ok(Message::Frame(_))) => continue,
+                    Some(Err(error)) => WebSocketEventData::Error(format!(
+                        "Native WebSocket receive failed: {error}"
+                    )),
+                    None => WebSocketEventData::Closed {
+                        code: None,
+                        reason: String::new(),
+                    },
+                };
+                let terminal = matches!(
+                    event,
+                    WebSocketEventData::Closed { .. } | WebSocketEventData::Error(_)
+                );
+                if !send_web_socket_event(
+                    &state,
+                    socket_id,
+                    &events,
+                    &control_events,
+                    event,
+                    &cancellation,
+                ).await || terminal {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn prepare_web_socket_request(
+    url: &str,
+    headers: Vec<(String, String)>,
+    protocols: Vec<String>,
+) -> Result<tokio_tungstenite::tungstenite::http::Request<()>, String> {
+    let mut request = url
+        .into_client_request()
+        .map_err(|error| format!("Invalid WebSocket URL: {error}"))?;
+    for (name, value) in headers {
+        let name = HeaderName::from_bytes(name.as_bytes())
+            .map_err(|error| format!("Invalid WebSocket header name: {error}"))?;
+        let value = HeaderValue::from_str(&value)
+            .map_err(|error| format!("Invalid WebSocket header value: {error}"))?;
+        request.headers_mut().insert(name, value);
+    }
+    if !protocols.is_empty() {
+        request.headers_mut().insert(
+            "sec-websocket-protocol",
+            HeaderValue::from_str(&protocols.join(", "))
+                .map_err(|error| format!("Invalid WebSocket protocols: {error}"))?,
+        );
+    }
+    Ok(request)
+}
+
+async fn send_web_socket_event(
+    state: &ClientState,
+    socket_id: i64,
+    events: &mpsc::Sender<WebSocketEventData>,
+    control_events: &mpsc::UnboundedSender<WebSocketEventData>,
+    event: WebSocketEventData,
+    cancellation: &CancellationToken,
+) -> bool {
+    let kind = web_socket_event_kind(&event);
+    let sent = if matches!(kind, WEBSOCKET_EVENT_TEXT | WEBSOCKET_EVENT_BINARY) {
+        tokio::select! {
+            () = cancellation.cancelled() => return false,
+            result = events.send(event) => result.is_ok(),
+        }
+    } else {
+        control_events.send(event).is_ok()
+    };
+    let notification = -((socket_id << 3) | i64::from(kind));
+    sent && state.completion_port.post(notification)
+}
+
+const fn web_socket_event_kind(event: &WebSocketEventData) -> i32 {
+    match event {
+        WebSocketEventData::Opened { .. } => WEBSOCKET_EVENT_OPENED,
+        WebSocketEventData::Text(_) => WEBSOCKET_EVENT_TEXT,
+        WebSocketEventData::Binary(_) => WEBSOCKET_EVENT_BINARY,
+        WebSocketEventData::Closed { .. } => WEBSOCKET_EVENT_CLOSED,
+        WebSocketEventData::Error(_) => WEBSOCKET_EVENT_ERROR,
+        WebSocketEventData::Sent { .. } => WEBSOCKET_EVENT_SENT,
+    }
+}
+
+fn web_socket_event_to_ffi(socket_id: i64, event: WebSocketEventData) -> NativeWebSocketEvent {
+    let mut value = NativeWebSocketEvent {
+        kind: 0,
+        socket_id,
+        operation_id: 0,
+        close_code: -1,
+        text: ptr::null_mut(),
+        binary_buffer: ptr::null_mut(),
+    };
+    match event {
+        WebSocketEventData::Opened { protocol } => {
+            value.kind = WEBSOCKET_EVENT_OPENED;
+            if let Some(protocol) = protocol {
+                value.text = c_string(protocol);
+            }
+        }
+        WebSocketEventData::Text(text) => {
+            value.kind = WEBSOCKET_EVENT_TEXT;
+            value.text = c_string(text);
+        }
+        WebSocketEventData::Binary(bytes) => {
+            value.kind = WEBSOCKET_EVENT_BINARY;
+            value.binary_buffer = Box::into_raw(Box::new(web_socket_buffer(bytes))).cast();
+        }
+        WebSocketEventData::Closed { code, reason } => {
+            value.kind = WEBSOCKET_EVENT_CLOSED;
+            value.close_code = code.map(i32::from).unwrap_or(-1);
+            if !reason.is_empty() {
+                value.text = c_string(reason);
+            }
+        }
+        WebSocketEventData::Error(error) => {
+            value.kind = WEBSOCKET_EVENT_ERROR;
+            value.text = c_string(error);
+        }
+        WebSocketEventData::Sent { operation_id } => {
+            value.kind = WEBSOCKET_EVENT_SENT;
+            value.operation_id = operation_id;
+        }
+    }
+    value
+}
+
+fn web_socket_buffer(bytes: Bytes) -> NexBuffer {
+    let context = Box::new(ResponseBufferContext { bytes });
+    NexBuffer {
+        abi_version: NEX_ABI_VERSION,
+        struct_size: size_of::<NexBuffer>(),
+        capabilities: NEX_CAPABILITY_THREAD_SAFE,
+        ptr: context.bytes.as_ptr(),
+        len: context.bytes.len(),
+        context: Box::into_raw(context).cast(),
+        release: Some(response_buffer_release),
     }
 }
 
@@ -758,6 +1387,22 @@ unsafe fn read_headers(
         .collect()
 }
 
+unsafe fn read_c_string_array(
+    values: *const *const c_char,
+    count: isize,
+) -> Result<Vec<String>, String> {
+    if count < 0 || (count > 0 && values.is_null()) {
+        return Err("Invalid WebSocket protocol entries.".to_owned());
+    }
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    unsafe { std::slice::from_raw_parts(values, count as usize) }
+        .iter()
+        .map(|value| unsafe { required_c_str(*value, "WebSocket protocol") })
+        .collect()
+}
+
 unsafe fn required_c_str(value: *const c_char, name: &str) -> Result<String, String> {
     if value.is_null() {
         return Err(format!("Missing HTTP {name}."));
@@ -785,6 +1430,12 @@ fn positive_duration(milliseconds: i64) -> Option<Duration> {
         .map(Duration::from_millis)
 }
 
+fn bounded_capacity(value: isize) -> Option<usize> {
+    usize::try_from(value)
+        .ok()
+        .filter(|value| (1..=1024).contains(value))
+}
+
 fn c_string(value: impl Into<String>) -> *mut c_char {
     CString::new(value.into())
         .unwrap_or_else(|_| CString::new("Native HTTP diagnostic contained a null byte.").unwrap())
@@ -808,6 +1459,14 @@ unsafe fn release_stream_pointer(pointer: *mut NexByteStream) {
     if let Some(release) = descriptor.release {
         unsafe { release(descriptor.context) };
     }
+}
+
+unsafe fn release_buffer_pointer(pointer: *mut NexBuffer) {
+    if pointer.is_null() {
+        return;
+    }
+    let descriptor = unsafe { *Box::from_raw(pointer) };
+    release_buffer(descriptor);
 }
 
 #[derive(Clone, Copy)]

@@ -12,6 +12,7 @@ structs:
   include:
     - NativeHttpHeader
     - NativeHttpResult
+    - NativeWebSocketEvent
 ffi-native:
   asset-id: package:dart_http_native_client/dart_http_native_client.dart
 preamble: |

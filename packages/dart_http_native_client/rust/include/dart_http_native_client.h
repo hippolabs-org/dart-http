@@ -18,6 +18,15 @@ typedef struct NativeHttpResult {
   char* error;
 } NativeHttpResult;
 
+typedef struct NativeWebSocketEvent {
+  int32_t kind;
+  int64_t socket_id;
+  int64_t operation_id;
+  int32_t close_code;
+  char* text;
+  void* binary_buffer;
+} NativeWebSocketEvent;
+
 int32_t dart_http_native_client_initialize_api_dl(void* data);
 int32_t dart_http_native_client_abi_version(void);
 int64_t dart_http_native_client_create(
@@ -44,5 +53,41 @@ NativeHttpResult* dart_http_native_client_take_result(
     int64_t client_id,
     int64_t request_id);
 void dart_http_native_client_free_result(NativeHttpResult* result);
+
+int64_t dart_http_native_client_websocket_connect(
+    int64_t client_id,
+    const char* url,
+    const NativeHttpHeader* headers,
+    intptr_t header_count,
+    const char* const* protocols,
+    intptr_t protocol_count,
+    intptr_t incoming_capacity,
+    intptr_t outgoing_capacity);
+int64_t dart_http_native_client_websocket_send_text(
+    int64_t client_id,
+    int64_t socket_id,
+    const char* value);
+int64_t dart_http_native_client_websocket_send_binary(
+    int64_t client_id,
+    int64_t socket_id,
+    const uint8_t* value,
+    intptr_t length);
+int64_t dart_http_native_client_websocket_close(
+    int64_t client_id,
+    int64_t socket_id,
+    int32_t code,
+    const char* reason);
+bool dart_http_native_client_websocket_abort(
+    int64_t client_id,
+    int64_t socket_id);
+NativeWebSocketEvent* dart_http_native_client_websocket_take_event(
+    int64_t client_id,
+    int64_t socket_id,
+    int32_t kind);
+bool dart_http_native_client_websocket_event_take_binary(
+    NativeWebSocketEvent* event,
+    void* out_buffer);
+void dart_http_native_client_websocket_free_event(
+    NativeWebSocketEvent* event);
 
 #endif

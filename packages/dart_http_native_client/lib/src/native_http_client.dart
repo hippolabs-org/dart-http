@@ -13,7 +13,9 @@ import 'generated_bindings.dart' as native;
 import 'native_http_request_body.dart';
 import 'native_http_response.dart';
 
-const _nativeAbiVersion = 1;
+part 'native_http_web_socket.dart';
+
+const _nativeAbiVersion = 2;
 
 /// Failure reported by the asynchronous native HTTP engine.
 final class NativeHttpClientException implements Exception {
@@ -26,8 +28,14 @@ final class NativeHttpClientException implements Exception {
 }
 
 /// Persistent Tokio/reqwest client implementing the Dart HTTP transport API.
-final class NativeHttpClientTransport implements HttpClientTransport {
-  NativeHttpClientTransport._(this._clientId, this._completionPort) {
+final class NativeHttpClientTransport
+    implements HttpClientTransport, DartHttpClientWebSocketTransport {
+  NativeHttpClientTransport._(
+    this._clientId,
+    this._completionPort,
+    this._webSocketIncomingCapacity,
+    this._webSocketOutgoingCapacity,
+  ) {
     _subscription = _completionPort.listen(_handleCompletion);
   }
 
@@ -35,10 +43,18 @@ final class NativeHttpClientTransport implements HttpClientTransport {
   static Future<NativeHttpClientTransport> open({
     Duration connectTimeout = const Duration(seconds: 15),
     Duration requestTimeout = const Duration(minutes: 2),
+    int webSocketIncomingCapacity = 16,
+    int webSocketOutgoingCapacity = 8,
   }) async {
     _ensureNativeRuntime();
     if (connectTimeout <= Duration.zero || requestTimeout <= Duration.zero) {
       throw ArgumentError('Native HTTP timeouts must be positive.');
+    }
+    if (webSocketIncomingCapacity < 1 ||
+        webSocketIncomingCapacity > 1024 ||
+        webSocketOutgoingCapacity < 1 ||
+        webSocketOutgoingCapacity > 1024) {
+      throw RangeError('Native WebSocket queue capacities must be between 1 and 1024.');
     }
     final completionPort = ReceivePort();
     final clientId = native.dart_http_native_client_create(
@@ -50,13 +66,21 @@ final class NativeHttpClientTransport implements HttpClientTransport {
       completionPort.close();
       throw const NativeHttpClientException('Could not create the native HTTP client.');
     }
-    return NativeHttpClientTransport._(clientId, completionPort);
+    return NativeHttpClientTransport._(
+      clientId,
+      completionPort,
+      webSocketIncomingCapacity,
+      webSocketOutgoingCapacity,
+    );
   }
 
   final int _clientId;
   final ReceivePort _completionPort;
+  final int _webSocketIncomingCapacity;
+  final int _webSocketOutgoingCapacity;
   late final StreamSubscription<Object?> _subscription;
   final Map<int, Completer<NativeHttpResponse>> _pending = {};
+  final Map<int, NativeHttpWebSocket> _webSockets = {};
   var _closed = false;
 
   /// Sends a request while preserving the response body as Native Exchange.
@@ -191,6 +215,10 @@ final class NativeHttpClientTransport implements HttpClientTransport {
     );
   }
 
+  @override
+  Future<DartHttpClientWebSocket> connect(DartHttpClientWebSocketRequest request) =>
+      _connectWebSocket(request);
+
   /// Cancels in-flight work and closes the native connection pool.
   void close() {
     if (_closed) return;
@@ -201,6 +229,10 @@ final class NativeHttpClientTransport implements HttpClientTransport {
       }
     }
     _pending.clear();
+    for (final socket in _webSockets.values.toList()) {
+      socket._transportClosed();
+    }
+    _webSockets.clear();
     native.dart_http_native_client_close(_clientId);
     unawaited(_subscription.cancel());
     _completionPort.close();
@@ -233,6 +265,13 @@ final class NativeHttpClientTransport implements HttpClientTransport {
 
   void _handleCompletion(Object? message) {
     if (message is! int) return;
+    if (message < 0) {
+      final notification = -message;
+      final kind = notification & 7;
+      final socketId = notification >> 3;
+      _webSockets[socketId]?._handleNotification(kind);
+      return;
+    }
     final completer = _pending.remove(message);
     if (completer == null) return;
     final result = native.dart_http_native_client_take_result(_clientId, message);

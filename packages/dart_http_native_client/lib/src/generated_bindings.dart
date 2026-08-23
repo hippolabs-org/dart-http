@@ -70,6 +70,71 @@ external ffi.Pointer<NativeHttpResult> dart_http_native_client_take_result(
 @ffi.Native<ffi.Void Function(ffi.Pointer<NativeHttpResult>)>()
 external void dart_http_native_client_free_result(ffi.Pointer<NativeHttpResult> result);
 
+@ffi.Native<
+  ffi.Int64 Function(
+    ffi.Int64,
+    ffi.Pointer<ffi.Char>,
+    ffi.Pointer<NativeHttpHeader>,
+    ffi.IntPtr,
+    ffi.Pointer<ffi.Pointer<ffi.Char>>,
+    ffi.IntPtr,
+    ffi.IntPtr,
+    ffi.IntPtr,
+  )
+>()
+external int dart_http_native_client_websocket_connect(
+  int client_id,
+  ffi.Pointer<ffi.Char> url,
+  ffi.Pointer<NativeHttpHeader> headers,
+  int header_count,
+  ffi.Pointer<ffi.Pointer<ffi.Char>> protocols,
+  int protocol_count,
+  int incoming_capacity,
+  int outgoing_capacity,
+);
+
+@ffi.Native<ffi.Int64 Function(ffi.Int64, ffi.Int64, ffi.Pointer<ffi.Char>)>()
+external int dart_http_native_client_websocket_send_text(
+  int client_id,
+  int socket_id,
+  ffi.Pointer<ffi.Char> value,
+);
+
+@ffi.Native<ffi.Int64 Function(ffi.Int64, ffi.Int64, ffi.Pointer<ffi.Uint8>, ffi.IntPtr)>()
+external int dart_http_native_client_websocket_send_binary(
+  int client_id,
+  int socket_id,
+  ffi.Pointer<ffi.Uint8> value,
+  int length,
+);
+
+@ffi.Native<ffi.Int64 Function(ffi.Int64, ffi.Int64, ffi.Int32, ffi.Pointer<ffi.Char>)>()
+external int dart_http_native_client_websocket_close(
+  int client_id,
+  int socket_id,
+  int code,
+  ffi.Pointer<ffi.Char> reason,
+);
+
+@ffi.Native<ffi.Bool Function(ffi.Int64, ffi.Int64)>()
+external bool dart_http_native_client_websocket_abort(int client_id, int socket_id);
+
+@ffi.Native<ffi.Pointer<NativeWebSocketEvent> Function(ffi.Int64, ffi.Int64, ffi.Int32)>()
+external ffi.Pointer<NativeWebSocketEvent> dart_http_native_client_websocket_take_event(
+  int client_id,
+  int socket_id,
+  int kind,
+);
+
+@ffi.Native<ffi.Bool Function(ffi.Pointer<NativeWebSocketEvent>, ffi.Pointer<ffi.Void>)>()
+external bool dart_http_native_client_websocket_event_take_binary(
+  ffi.Pointer<NativeWebSocketEvent> event,
+  ffi.Pointer<ffi.Void> out_buffer,
+);
+
+@ffi.Native<ffi.Void Function(ffi.Pointer<NativeWebSocketEvent>)>()
+external void dart_http_native_client_websocket_free_event(ffi.Pointer<NativeWebSocketEvent> event);
+
 final class NativeHttpHeader extends ffi.Struct {
   external ffi.Pointer<ffi.Char> name;
 
@@ -88,4 +153,22 @@ final class NativeHttpResult extends ffi.Struct {
   external ffi.Pointer<ffi.Void> body_stream;
 
   external ffi.Pointer<ffi.Char> error;
+}
+
+final class NativeWebSocketEvent extends ffi.Struct {
+  @ffi.Int32()
+  external int kind;
+
+  @ffi.Int64()
+  external int socket_id;
+
+  @ffi.Int64()
+  external int operation_id;
+
+  @ffi.Int32()
+  external int close_code;
+
+  external ffi.Pointer<ffi.Char> text;
+
+  external ffi.Pointer<ffi.Void> binary_buffer;
 }
