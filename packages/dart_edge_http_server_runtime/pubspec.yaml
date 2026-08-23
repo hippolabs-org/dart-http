@@ -24,7 +24,7 @@ dependencies:
     version: ^0.1.2
   native_toolchain_rust: ^1.0.4+0
   native_exchange:
-    hosted: "https://registry.hippolabs.org/pub/internal-pub/"
+    hosted: "https://pub.hippolabs.org"
     version: ^0.2.0
 
 dev_dependencies:

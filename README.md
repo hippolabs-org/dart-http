@@ -12,7 +12,7 @@ remains the routing and control plane.
 
 CI resolves the private Native Exchange source pin with the organization-level
 `HIPPOLABS_REPO_TOKEN` Actions secret until `native_exchange` is published to
-the internal Pub registry.
+`pub.hippolabs.org`.
 
 ## Packages
 
