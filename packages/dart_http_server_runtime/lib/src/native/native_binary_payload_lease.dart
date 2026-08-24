@@ -2,13 +2,14 @@ import 'dart:ffi';
 import 'dart:typed_data';
 
 import 'package:dart_http_core/dart_http_core.dart';
+import 'package:native_exchange/native_exchange_ffi.dart';
 
 /// Single-owner view over a contiguous payload retained by native code.
 ///
-/// [bytesPtr] and [bytesView] remain valid only until [close]. Native consumers
+/// [bytesPointer] and [bytesView] remain valid only until [close]. Native consumers
 /// can synchronously borrow the pointer without allocating Dart-managed input.
-final class NativeBinaryPayloadLease implements BinaryPayloadLease {
-  NativeBinaryPayloadLease.fromPointer({
+final class RuntimeNativeBinaryPayloadLease implements BinaryPayloadLease, NativeByteLease {
+  RuntimeNativeBinaryPayloadLease.fromPointer({
     required Pointer<Uint8> bytesPtr,
     required int length,
     required this._release,
@@ -31,7 +32,8 @@ final class NativeBinaryPayloadLease implements BinaryPayloadLease {
   /// Borrowed pointer to the payload.
   ///
   /// The pointer becomes invalid when this lease is closed.
-  Pointer<Uint8> get bytesPtr {
+  @override
+  Pointer<Uint8> get bytesPointer {
     _ensureOpen();
     return _bytesPtr;
   }
@@ -63,6 +65,9 @@ final class NativeBinaryPayloadLease implements BinaryPayloadLease {
       close();
     }
   }
+
+  @override
+  Uint8List takeDartBytes() => takeBytes();
 
   @override
   void close() {

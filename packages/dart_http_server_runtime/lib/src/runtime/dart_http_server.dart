@@ -4,8 +4,7 @@ import 'dart:ffi';
 import 'dart:io';
 
 import 'package:dart_http_core/dart_http_core.dart';
-import 'package:dart_http_server_runtime/src/native/http_native_bridge.dart'
-    show NativeBinaryPayloadLease;
+import 'package:native_exchange/native_exchange_ffi.dart' show NativeByteLease;
 import 'package:json_schema/json_schema.dart';
 
 import '../native/dart_http_native.dart';
@@ -827,11 +826,12 @@ class DartHttp<TServices> extends Router<TServices> {
       writeLease: (lease) => stream.enqueueSend(() async {
         try {
           final operationId = switch (lease) {
-            NativeBinaryPayloadLease() => DartHttpNative.webTransportStreamWriteNative(
-              info.streamId,
-              bodyPtr: lease.bytesPtr,
-              bodyLength: lease.length,
-            ),
+            NativeByteLease(:final bytesPointer, :final length) =>
+              DartHttpNative.webTransportStreamWriteNative(
+                info.streamId,
+                bodyPtr: bytesPointer,
+                bodyLength: length,
+              ),
             _ => DartHttpNative.webTransportStreamWrite(info.streamId, lease.bytesView),
           };
           await _waitForWebTransportOperation(operationId, 'stream write');
@@ -1056,10 +1056,10 @@ Future<void> _sendWebSocketBinary(int sessionId, List<int> value) async {
 
 Future<void> _sendWebSocketBinaryLease(int sessionId, BinaryPayloadLease lease) async {
   final sent = switch (lease) {
-    NativeBinaryPayloadLease() => DartHttpNative.webSocketSendNativeBinary(
+    NativeByteLease(:final bytesPointer, :final length) => DartHttpNative.webSocketSendNativeBinary(
       sessionId,
-      bodyPtr: lease.bytesPtr,
-      bodyLength: lease.length,
+      bodyPtr: bytesPointer,
+      bodyLength: length,
     ),
     _ => DartHttpNative.webSocketSendBinary(sessionId, lease.bytesView),
   };
@@ -1083,11 +1083,12 @@ Future<void> _sendWebTransportDatagram(int sessionId, List<int> value) async {
 
 Future<void> _sendWebTransportDatagramLease(int sessionId, BinaryPayloadLease lease) async {
   final sent = switch (lease) {
-    NativeBinaryPayloadLease() => DartHttpNative.webTransportSendNativeDatagram(
-      sessionId,
-      bodyPtr: lease.bytesPtr,
-      bodyLength: lease.length,
-    ),
+    NativeByteLease(:final bytesPointer, :final length) =>
+      DartHttpNative.webTransportSendNativeDatagram(
+        sessionId,
+        bodyPtr: bytesPointer,
+        bodyLength: length,
+      ),
     _ => DartHttpNative.webTransportSendDatagram(sessionId, lease.bytesView),
   };
   if (!sent) {
@@ -1103,11 +1104,12 @@ Future<void> _sendWebTransportStream(int sessionId, List<int> value) async {
 
 Future<void> _sendWebTransportStreamLease(int sessionId, BinaryPayloadLease lease) async {
   final sent = switch (lease) {
-    NativeBinaryPayloadLease() => DartHttpNative.webTransportSendNativeStream(
-      sessionId,
-      bodyPtr: lease.bytesPtr,
-      bodyLength: lease.length,
-    ),
+    NativeByteLease(:final bytesPointer, :final length) =>
+      DartHttpNative.webTransportSendNativeStream(
+        sessionId,
+        bodyPtr: bytesPointer,
+        bodyLength: length,
+      ),
     _ => DartHttpNative.webTransportSendStream(sessionId, lease.bytesView),
   };
   if (!sent) {

@@ -1,6 +1,6 @@
 name: dart_http_server_runtime
 description: Rust-backed HTTP server runtime for Dart HTTP.
-version: 0.3.40
+version: 0.3.41
 publish_to: "https://pub.hippolabs.org"
 repository: https://github.com/hippolabs-org/dart-http/tree/main/packages/dart_http_server_runtime
 
@@ -23,7 +23,7 @@ dependencies:
     version: ^0.1.2
   native_exchange:
     hosted: "https://pub.hippolabs.org"
-    version: ^0.2.0
+    version: ^0.2.1
 
 dev_dependencies:
   ffigen: ^20.1.1

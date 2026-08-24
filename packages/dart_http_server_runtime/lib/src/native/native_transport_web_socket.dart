@@ -34,7 +34,7 @@ final class NativeWebSocketMessage {
   final int sessionId;
   final NativeWebSocketMessageKind kind;
   final Uint8List? body;
-  final core_ffi.NativeBinaryPayloadLease? bodyLease;
+  final core_ffi.RuntimeNativeBinaryPayloadLease? bodyLease;
 }
 
 enum NativeWebSocketMessageKind { text, binary }
@@ -67,7 +67,7 @@ NativeWebSocketMessage decodeNativeWebSocketMessage(
     2 => NativeWebSocketMessage(
       sessionId: message.session_id,
       kind: NativeWebSocketMessageKind.binary,
-      bodyLease: core_ffi.NativeBinaryPayloadLease.fromPointer(
+      bodyLease: core_ffi.RuntimeNativeBinaryPayloadLease.fromPointer(
         bytesPtr: message.body.ptr,
         length: message.body.len,
         release: release,

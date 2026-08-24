@@ -6,6 +6,7 @@
 library;
 
 export 'package:dart_http_core/dart_http_core.dart';
+export 'package:native_exchange/native_exchange_ffi.dart' show NativeByteLease;
 
 export 'src/native/dart_http_native.dart';
 export 'src/runtime/dart_http_codec.dart';

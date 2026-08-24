@@ -26,14 +26,14 @@ final class NativeWebTransportDatagram {
   const NativeWebTransportDatagram({required this.sessionId, required this.bodyLease});
 
   final int sessionId;
-  final core_ffi.NativeBinaryPayloadLease bodyLease;
+  final core_ffi.RuntimeNativeBinaryPayloadLease bodyLease;
 }
 
 final class NativeWebTransportStream {
   const NativeWebTransportStream({required this.sessionId, required this.bodyLease});
 
   final int sessionId;
-  final core_ffi.NativeBinaryPayloadLease bodyLease;
+  final core_ffi.RuntimeNativeBinaryPayloadLease bodyLease;
 }
 
 final class NativeWebTransportStreamInfo {
@@ -54,7 +54,7 @@ final class NativeWebTransportStreamChunk {
   const NativeWebTransportStreamChunk({required this.streamId, required this.bodyLease});
 
   final int streamId;
-  final core_ffi.NativeBinaryPayloadLease bodyLease;
+  final core_ffi.RuntimeNativeBinaryPayloadLease bodyLease;
 }
 
 final class NativeWebTransportStreamTerminal {
@@ -110,7 +110,7 @@ NativeWebTransportDatagram decodeNativeWebTransportDatagram(
   final datagram = datagramPtr.ref;
   return NativeWebTransportDatagram(
     sessionId: datagram.session_id,
-    bodyLease: core_ffi.NativeBinaryPayloadLease.fromPointer(
+    bodyLease: core_ffi.RuntimeNativeBinaryPayloadLease.fromPointer(
       bytesPtr: datagram.body.ptr,
       length: datagram.body.len,
       release: release,
@@ -125,7 +125,7 @@ NativeWebTransportStream decodeNativeWebTransportStream(
   final stream = streamPtr.ref;
   return NativeWebTransportStream(
     sessionId: stream.session_id,
-    bodyLease: core_ffi.NativeBinaryPayloadLease.fromPointer(
+    bodyLease: core_ffi.RuntimeNativeBinaryPayloadLease.fromPointer(
       bytesPtr: stream.body.ptr,
       length: stream.body.len,
       release: release,
@@ -152,7 +152,7 @@ NativeWebTransportStreamChunk decodeNativeWebTransportStreamChunk(
   final chunk = chunkPtr.ref;
   return NativeWebTransportStreamChunk(
     streamId: chunk.stream_id,
-    bodyLease: core_ffi.NativeBinaryPayloadLease.fromPointer(
+    bodyLease: core_ffi.RuntimeNativeBinaryPayloadLease.fromPointer(
       bytesPtr: chunk.body.ptr,
       length: chunk.body.len,
       release: release,

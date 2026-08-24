@@ -1,11 +1,10 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:ffi';
 import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:dart_http_server_runtime/dart_http_server_runtime.dart';
-import 'package:dart_http_server_runtime/src/native/http_native_bridge.dart'
-    show NativeBinaryPayloadLease;
 import 'package:test/test.dart';
 
 void main() {
@@ -667,7 +666,10 @@ void main() {
       '/native-audio',
       onConnect: (socket) async {
         await for (final lease in socket.messages.leasedBinary()) {
-          receivedNativeLease.complete(lease is NativeBinaryPayloadLease);
+          receivedNativeLease.complete(switch (lease) {
+            NativeByteLease(:final bytesPointer) when bytesPointer != nullptr => true,
+            _ => false,
+          });
           await socket.sendBinaryLease(lease);
           await socket.close();
         }

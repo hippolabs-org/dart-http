@@ -26,7 +26,7 @@ void main() {
     );
 
     expect(datagram.sessionId, 42);
-    expect(datagram.bodyLease.bytesPtr, bytes);
+    expect(datagram.bodyLease.bytesPointer, bytes);
     expect(datagram.bodyLease.bytesView, [4, 5, 6]);
     expect(releaseCount, 0);
     datagram.bodyLease.close();
@@ -53,7 +53,7 @@ void main() {
     );
 
     expect(stream.sessionId, 43);
-    expect(stream.bodyLease.bytesPtr, bytes);
+    expect(stream.bodyLease.bytesPointer, bytes);
     expect(stream.bodyLease.bytesView, [7, 8]);
     expect(releaseCount, 0);
     stream.bodyLease.close();
@@ -80,7 +80,7 @@ void main() {
     );
 
     expect(chunk.streamId, 44);
-    expect(chunk.bodyLease.bytesPtr, bytes);
+    expect(chunk.bodyLease.bytesPointer, bytes);
     expect(chunk.bodyLease.bytesView, [9, 10, 11]);
     expect(releaseCount, 0);
     chunk.bodyLease.close();

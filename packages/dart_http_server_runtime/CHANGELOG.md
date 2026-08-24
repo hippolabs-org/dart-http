@@ -1,3 +1,8 @@
+## 0.3.41
+
+- Implement and re-export Native Exchange's generic `NativeByteLease`
+  capability for zero-copy WebSocket and WebTransport payload consumers.
+
 ## 0.3.40
 
 - Centralize Native Exchange response-stream adoption, cancellation, and buffer

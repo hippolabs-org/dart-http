@@ -144,9 +144,9 @@ and close it after all synchronous native consumers have borrowed its pointer:
 ```dart
 await for (final payload in socket.messages.leasedBinary()) {
   try {
-    final native = payload as NativeBinaryPayloadLease;
+    final native = payload as NativeByteLease;
     waveform.addNativePcm16(
-      pcm16LeBytesPtr: native.bytesPtr,
+      pcm16LeBytesPtr: native.bytesPointer,
       byteLength: native.length,
     );
   } finally {
@@ -175,9 +175,9 @@ a native lease instead of waiting for FIN and allocating one Dart `Uint8List`:
 await for (final audio in transport.incomingStreams.unidirectional) {
   await for (final chunk in audio.leases()) {
     try {
-      final native = chunk as NativeBinaryPayloadLease;
+      final native = chunk as NativeByteLease;
       waveform.addNativePcm16(
-        pcm16LeBytesPtr: native.bytesPtr,
+        pcm16LeBytesPtr: native.bytesPointer,
         byteLength: native.length,
       );
     } finally {
