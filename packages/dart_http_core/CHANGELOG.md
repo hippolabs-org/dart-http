@@ -1,5 +1,10 @@
 ## Unreleased
 
+## 0.3.47
+
+- Allow request observers to install a concrete `RequestTelemetry`
+  implementation before invoking route handlers.
+
 ## 0.3.46
 
 - Add a web-safe native request-body marker to the client transport contract.

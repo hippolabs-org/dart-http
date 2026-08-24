@@ -2,7 +2,7 @@
 ///
 /// Route handlers can use this object to record domain events without taking a
 /// direct dependency on the transport middleware implementation.
-final class RequestTelemetry {
+class RequestTelemetry {
   const RequestTelemetry();
 
   /// Records an event for the current request.

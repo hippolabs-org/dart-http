@@ -1,20 +1,16 @@
 import 'dart:async';
 
+import 'package:dart_http_observability/dart_http_observability.dart';
 import 'package:dart_http_server/dart_http_server.dart';
 import 'package:json_schema/json_schema.dart';
 
 Future<void> main() async {
+  final observability = DartHttpObservability(config: ObservabilityConfig.fromEnvironment());
   final app = DartHttp<AppServices>(
     services: AppServices.new,
     openApiDocument: OpenApiDocument(title: 'Dart HTTP Example API', version: '0.1.0'),
+    requestObservers: [observability.httpObserver<AppServices>()],
     middlewares: [
-      RustMiddleware.requestId(),
-      RustMiddleware.tracing(
-        openTelemetry: const OpenTelemetryConfig.otlpGrpc(
-          serviceName: 'dart-http-simple-example',
-          endpoint: 'http://localhost:4317',
-        ),
-      ),
       RustMiddleware.compression(),
       RustMiddleware.bodyLimit(maxBytes: 1024 * 1024),
     ],
@@ -67,6 +63,7 @@ Future<void> main() async {
 
   OpenApiHelpers.mountJson(app, path: '/openapi.json');
   OpenApiHelpers.mountSwaggerUi(app, path: '/docs', specPath: '/openapi.json');
+  app.mountMetricsEndpoint(observability: observability);
 
   await app.listen(port: 8080, workers: 1);
 }

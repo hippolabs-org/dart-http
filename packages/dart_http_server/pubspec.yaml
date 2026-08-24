@@ -18,4 +18,7 @@ dependencies:
     version: ^0.1.2
 
 dev_dependencies:
+  dart_http_observability:
+    hosted: "https://pub.hippolabs.org"
+    version: ^0.1.0
   test: ^1.30.0

@@ -10,8 +10,8 @@ final class RequestContext<TServices> {
   RequestContext({
     required this.services,
     this.req = RequestInput.empty,
-    this.telemetry = const RequestTelemetry(),
-  });
+    RequestTelemetry? telemetry,
+  }) : _telemetry = telemetry ?? const RequestTelemetry();
 
   /// Fresh services instance for the current request.
   final TServices services;
@@ -23,7 +23,19 @@ final class RequestContext<TServices> {
   final ResponseBuilder res = ResponseBuilder();
 
   /// Telemetry hook associated with this request.
-  final RequestTelemetry telemetry;
+  RequestTelemetry _telemetry;
+
+  /// Telemetry hook associated with this request.
+  RequestTelemetry get telemetry => _telemetry;
+
+  /// Installs the request telemetry implementation used by route handlers.
+  ///
+  /// Request observers can call this before invoking their inner handler to
+  /// connect transport-neutral handler events to an observability backend.
+  void installTelemetry(RequestTelemetry telemetry) {
+    _telemetry = telemetry;
+  }
+
   final Map<Type, Object?> _extensions = <Type, Object?>{};
 
   /// Reads a required request-scoped extension of type [T].
