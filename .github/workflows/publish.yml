@@ -1,5 +1,6 @@
 name: Publish Packages
 
+# GitHub Actions minutes are limited. Run this workflow manually and use it carefully.
 on:
   workflow_dispatch:
     inputs:

@@ -1,9 +1,8 @@
 name: CI
 
+# GitHub Actions minutes are limited. Run this workflow manually and use it carefully.
 on:
-  push:
-    branches: [main]
-  pull_request:
+  workflow_dispatch:
 
 env:
   DART_VERSION: 3.13.0
