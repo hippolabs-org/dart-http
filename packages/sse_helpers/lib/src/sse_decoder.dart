@@ -2,9 +2,10 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 
+import 'package:dart_http_core/dart_http_core.dart';
+
 import 'sse_decode_exception.dart';
 import 'sse_decode_limits.dart';
-import 'sse_event.dart';
 
 /// Decodes one byte stream into Server-Sent Events frames.
 Stream<SseEvent> decodeSseEvents(

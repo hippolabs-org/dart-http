@@ -1,5 +1,6 @@
 import 'dart:convert';
 
+import 'package:dart_http_core/dart_http_core.dart' as core;
 import 'package:sse_helpers/sse_helpers.dart';
 import 'package:test/test.dart';
 
@@ -63,7 +64,8 @@ void main() {
           .transform(const SseDecoder())
           .toList();
 
-      expect(events.single, isA<SseEvent>());
+      final core.SseEvent event = events.single;
+      expect(event, isA<SseEvent>());
       expect(events.single.data, 'transformed');
     });
 

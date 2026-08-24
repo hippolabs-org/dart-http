@@ -1,8 +1,8 @@
 # sse_helpers
 
 Bounded, incremental Server-Sent Events encoding and decoding for ordinary Dart byte streams. The
-package provides the protocol-level `SseEvent` wire model without depending on an HTTP transport or
-application framework.
+package uses the protocol-level `SseEvent` from `dart_http_core`, without depending on an HTTP
+transport or application framework.
 
 ```dart
 final response = await client.sendStream(request);
