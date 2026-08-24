@@ -10,7 +10,6 @@
 
 #![deny(missing_docs)]
 
-mod byte_stream;
 mod bytes;
 mod dart_api;
 mod job_pool;
@@ -20,12 +19,6 @@ mod slice;
 mod status;
 mod string;
 
-pub use byte_stream::{
-    NATIVE_BYTE_STREAM_ABI_VERSION, NATIVE_BYTE_STREAM_READ_CANCELED,
-    NATIVE_BYTE_STREAM_READ_CHUNK, NATIVE_BYTE_STREAM_READ_DONE, NATIVE_BYTE_STREAM_READ_ERROR,
-    NativeByteStream, NativeByteStreamCancel, NativeByteStreamFreeRead, NativeByteStreamNext,
-    NativeByteStreamRead, NativeByteStreamRelease,
-};
 pub use bytes::{
     NativeBytes, NativeOwnedBytes, read_native_bytes, read_native_str, read_native_string,
 };

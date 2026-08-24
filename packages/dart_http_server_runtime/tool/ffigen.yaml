@@ -20,8 +20,6 @@ functions:
       - dart_http_server_runtime_native_abi_version
 structs:
   include:
-    - NativeByteStream
-    - NativeByteStreamRead
     - NativeBytes
     - NativeOwnedBytes
     - NativePair

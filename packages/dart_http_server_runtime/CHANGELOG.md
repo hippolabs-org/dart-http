@@ -1,4 +1,11 @@
-## Unreleased
+## 0.3.40
+
+- Centralize Native Exchange response-stream adoption, cancellation, and buffer
+  ownership in `native-exchange-rust`.
+- Replace per-chunk blocking-worker scheduling with one bounded reader worker per
+  response, preserving backpressure while reducing scheduling overhead.
+- Remove the obsolete private HTTP byte-stream ABI.
+- Bump the native artifact version to 0.1.24.
 
 ## 0.3.39
 

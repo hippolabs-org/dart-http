@@ -290,40 +290,6 @@ external int dart_http_server_runtime_web_transport_stream_stop(int stream_id, i
 @ffi.Native<ffi.Int64 Function(ffi.Int64, NativeBytes)>()
 external int dart_http_server_runtime_web_transport_stream_write(int stream_id, NativeBytes body);
 
-final class NativeByteStream extends ffi.Struct {
-  @ffi.Uint32()
-  external int abi_version;
-
-  @ffi.Size()
-  external int struct_size;
-
-  external ffi.Pointer<ffi.Void> context;
-
-  external ffi.Pointer<
-    ffi.NativeFunction<ffi.Pointer<NativeByteStreamRead> Function(ffi.Pointer<ffi.Void> context)>
-  >
-  next;
-
-  external ffi.Pointer<ffi.NativeFunction<ffi.Void Function(ffi.Pointer<ffi.Void> context)>> cancel;
-
-  external ffi.Pointer<
-    ffi.NativeFunction<ffi.Void Function(ffi.Pointer<NativeByteStreamRead> value)>
-  >
-  free_read;
-
-  external ffi.Pointer<ffi.NativeFunction<ffi.Void Function(ffi.Pointer<ffi.Void> context)>>
-  release;
-}
-
-final class NativeByteStreamRead extends ffi.Struct {
-  @ffi.Int32()
-  external int status;
-
-  external NativeOwnedBytes bytes;
-
-  external NativeBytes error;
-}
-
 final class NativeBytes extends ffi.Struct {
   external ffi.Pointer<ffi.Uint8> ptr;
 
