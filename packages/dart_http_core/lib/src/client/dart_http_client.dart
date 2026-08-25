@@ -89,7 +89,10 @@ abstract base class DartHttpClientBase {
   Future<DartHttpClientStreamedResponseObject> invokeStream<TParams, TQuery, THeaders, TBody>(
     DartHttpClientInvocation<Object?, TParams, TQuery, THeaders, TBody> invocation,
   ) async {
-    final request = await _buildClientRequest(invocation);
+    final request = await _buildClientRequest(
+      invocation,
+      responseMode: invocation.success.responseMode,
+    );
     final response = await transport.sendStream(request);
     if (response.status == invocation.success.status) {
       return DartHttpClientStreamedResponseObject(
@@ -182,8 +185,9 @@ abstract base class DartHttpClientBase {
   }
 
   Future<DartHttpClientRequest> _buildClientRequest<TResponse, TParams, TQuery, THeaders, TBody>(
-    DartHttpClientInvocation<TResponse, TParams, TQuery, THeaders, TBody> invocation,
-  ) async {
+    DartHttpClientInvocation<TResponse, TParams, TQuery, THeaders, TBody> invocation, {
+    DartHttpClientResponseMode responseMode = DartHttpClientResponseMode.buffered,
+  }) async {
     final abortTrigger = _combinedAbortTrigger(
       abortTrigger: invocation.abortTrigger,
       timeout: invocation.timeout,
@@ -204,6 +208,7 @@ abstract base class DartHttpClientBase {
       bodyStream: encodedBody?.bodyStream,
       bodyStreamLength: encodedBody?.bodyStreamLength,
       abortTrigger: abortTrigger,
+      responseMode: responseMode,
     );
   }
 
@@ -774,6 +779,7 @@ final class DartHttpClientResponseSpec<T> {
   const DartHttpClientResponseSpec({
     required this.status,
     required this.contentType,
+    this.responseMode = DartHttpClientResponseMode.stream,
     this.schemaId,
     this.decoder,
   });
@@ -783,6 +789,9 @@ final class DartHttpClientResponseSpec<T> {
 
   /// Expected response content type.
   final String contentType;
+
+  /// Expected response delivery semantics.
+  final DartHttpClientResponseMode responseMode;
 
   /// Schema id used to decode the response body, when one exists.
   final String? schemaId;

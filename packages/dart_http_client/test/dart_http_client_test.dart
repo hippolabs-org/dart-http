@@ -178,6 +178,25 @@ void main() {
       expect(listened, isTrue);
     });
 
+    test('uses SSE-safe request headers for server-sent event streams', () async {
+      final transport = DartHttpClientTransport(
+        client: MockClient.streaming((request, _) async {
+          expect(request.headers['accept'], 'text/event-stream');
+          expect(request.headers['accept-encoding'], 'identity');
+          return http.StreamedResponse(const Stream<List<int>>.empty(), 200);
+        }),
+      );
+
+      await transport.sendStream(
+        DartHttpClientRequest(
+          method: HttpMethod.get,
+          uri: Uri.parse('https://api.example.test/events'),
+          headers: const {'Accept': 'application/json', 'Accept-Encoding': 'gzip'},
+          responseMode: DartHttpClientResponseMode.serverSentEvents,
+        ),
+      );
+    });
+
     test('applies streamed interceptors to streamed responses', () async {
       final bearer = DartHttpBearerTokenInterceptor(() async => 'test-token');
       final transport = DartHttpClientTransport(

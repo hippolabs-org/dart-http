@@ -84,6 +84,7 @@ final class DartHttpClientTransport implements HttpClientTransport {
         'DartHttpClientTransport cannot consume a transport-specific native body.',
       );
     }
+    final headers = _headersFor(request);
     final http.BaseRequest httpRequest;
     if (request.bodyStream case final bodyStream?) {
       httpRequest = _DartHttpStreamedRequest(
@@ -92,13 +93,13 @@ final class DartHttpClientTransport implements HttpClientTransport {
         bodyStream: bodyStream,
         contentLength: request.bodyStreamLength,
         abortTrigger: request.abortTrigger,
-      )..headers.addAll(request.headers);
+      )..headers.addAll(headers);
     } else {
       final bufferedRequest = http.AbortableRequest(
         request.method.wireName,
         request.uri,
         abortTrigger: request.abortTrigger,
-      )..headers.addAll(request.headers);
+      )..headers.addAll(headers);
 
       if (request.bodyBytes case final bodyBytes?) {
         bufferedRequest.bodyBytes = bodyBytes;
@@ -110,12 +111,27 @@ final class DartHttpClientTransport implements HttpClientTransport {
     return httpRequest;
   }
 
+  Map<String, String> _headersFor(DartHttpClientRequest request) {
+    if (request.responseMode != DartHttpClientResponseMode.serverSentEvents) {
+      return request.headers;
+    }
+
+    return <String, String>{
+      for (final entry in request.headers.entries)
+        if (!_sseHeaderNames.contains(entry.key.toLowerCase())) entry.key: entry.value,
+      'accept': 'text/event-stream',
+      'accept-encoding': 'identity',
+    };
+  }
+
   void close() {
     if (_ownsClient) {
       _client.close();
     }
   }
 }
+
+const _sseHeaderNames = <String>{'accept', 'accept-encoding'};
 
 final class _DartHttpStreamedRequest extends http.BaseRequest with http.Abortable {
   _DartHttpStreamedRequest(

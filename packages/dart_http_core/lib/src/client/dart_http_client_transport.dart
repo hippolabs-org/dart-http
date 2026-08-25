@@ -16,6 +16,22 @@ abstract interface class DartHttpClientNativeBody {
   int? get contentLength;
 }
 
+/// Describes how a generated client consumes the response body.
+///
+/// Transports use [serverSentEvents] to apply the HTTP semantics required for
+/// incremental event delivery, rather than treating the request as a generic
+/// byte stream.
+enum DartHttpClientResponseMode {
+  /// Collects the response body before decoding it.
+  buffered,
+
+  /// Delivers a generic response body incrementally.
+  stream,
+
+  /// Delivers a `text/event-stream` response incrementally.
+  serverSentEvents,
+}
+
 /// One outbound request emitted by a generated client.
 final class DartHttpClientRequest {
   const DartHttpClientRequest({
@@ -28,6 +44,7 @@ final class DartHttpClientRequest {
     this.bodyStreamLength,
     this.nativeBody,
     this.abortTrigger,
+    this.responseMode = DartHttpClientResponseMode.buffered,
   }) : assert(
          bodyStream == null || (body == null && bodyBytes == null),
          'bodyStream cannot be combined with body or bodyBytes.',
@@ -47,6 +64,9 @@ final class DartHttpClientRequest {
   final DartHttpClientNativeBody? nativeBody;
   final Future<void>? abortTrigger;
 
+  /// Expected response delivery semantics.
+  final DartHttpClientResponseMode responseMode;
+
   DartHttpClientRequest copyWith({
     HttpMethod? method,
     Uri? uri,
@@ -57,6 +77,7 @@ final class DartHttpClientRequest {
     int? bodyStreamLength,
     DartHttpClientNativeBody? nativeBody,
     Future<void>? abortTrigger,
+    DartHttpClientResponseMode? responseMode,
   }) {
     return DartHttpClientRequest(
       method: method ?? this.method,
@@ -68,6 +89,7 @@ final class DartHttpClientRequest {
       bodyStreamLength: bodyStreamLength ?? this.bodyStreamLength,
       nativeBody: nativeBody ?? this.nativeBody,
       abortTrigger: abortTrigger ?? this.abortTrigger,
+      responseMode: responseMode ?? this.responseMode,
     );
   }
 }

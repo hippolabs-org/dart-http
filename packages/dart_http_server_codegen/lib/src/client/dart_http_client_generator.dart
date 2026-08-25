@@ -1117,6 +1117,8 @@ $forwarded,
         <String, Expression>{
           'status': literalNum(options.responses.success.status),
           'contentType': literalString(options.responses.success.contentType),
+          if (options.responses.success.streamingMode == ResponseStreamingMode.serverSentEvents)
+            'responseMode': refer('DartHttpClientResponseMode').property('serverSentEvents'),
           if (successSchemaId case final schemaId?) 'schemaId': literalString(schemaId),
           if (!_isRawTransportType(operation.successType))
             'decoder': refer(operation.successType).property('decode'),

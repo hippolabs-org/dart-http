@@ -1,3 +1,9 @@
+## 0.1.9
+
+- Apply `Accept: text/event-stream` and `Accept-Encoding: identity` for
+  contract-declared server-sent event requests.
+- Require `dart_http_core` 0.3.48.
+
 ## 0.1.8
 
 - Reject transport-specific native bodies explicitly in the pure-Dart client.

@@ -1,3 +1,9 @@
+## 0.4.1
+
+- Generate explicit server-sent event delivery semantics from
+  `ResponseSpec.sse()` contracts.
+- Require `dart_http_core` 0.3.48.
+
 ## 0.4.0
 
 - **Breaking:** Adopt the new Dart HTTP package, builder, and generated API

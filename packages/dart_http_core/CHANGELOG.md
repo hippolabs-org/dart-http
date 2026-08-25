@@ -1,4 +1,8 @@
-## Unreleased
+## 0.3.48
+
+- Add explicit response streaming metadata to API contracts. `ResponseSpec.sse()`
+  now declares `ResponseStreamingMode.serverSentEvents`.
+- Carry generated-client response delivery semantics into the HTTP transport.
 
 ## 0.3.47
 

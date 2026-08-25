@@ -153,6 +153,7 @@ void main() {
       expect(source, contains('Future<DartHttpClientStreamedResponseObject> call({'));
       expect(source, contains('invokeStream<Never, Never, Never, Never>'));
       expect(source, contains("contentType: 'text/event-stream; charset=utf-8'"));
+      expect(source, contains('responseMode: DartHttpClientResponseMode.serverSentEvents'));
       expect(source, contains('Duration? timeout'));
       expect(source, contains('abortTrigger: abortTrigger'));
     });

@@ -1,8 +1,22 @@
 import 'package:json_schema/json_schema.dart';
 
+/// Declares whether a successful response has special streaming semantics.
+enum ResponseStreamingMode {
+  /// The response has no protocol-specific streaming semantics.
+  none,
+
+  /// The response uses the server-sent events protocol.
+  serverSentEvents,
+}
+
 /// Declares the default response encoding for a successful route result.
 final class ResponseSpec {
-  const ResponseSpec._({required this.status, required this.contentType, this.schema});
+  const ResponseSpec._({
+    required this.status,
+    required this.contentType,
+    this.schema,
+    this.streamingMode = ResponseStreamingMode.none,
+  });
 
   /// HTTP status code emitted for the response.
   final int status;
@@ -12,6 +26,9 @@ final class ResponseSpec {
 
   /// Optional schema used for documentation or validation.
   final JsonSchema? schema;
+
+  /// Protocol-specific streaming semantics for this response.
+  final ResponseStreamingMode streamingMode;
 
   /// Creates a JSON response specification.
   const ResponseSpec.json({int status = 200, JsonSchema? schema})
@@ -35,5 +52,9 @@ final class ResponseSpec {
 
   /// Creates a server-sent events response specification.
   const ResponseSpec.sse({int status = 200})
-    : this._(status: status, contentType: 'text/event-stream; charset=utf-8');
+    : this._(
+        status: status,
+        contentType: 'text/event-stream; charset=utf-8',
+        streamingMode: ResponseStreamingMode.serverSentEvents,
+      );
 }
