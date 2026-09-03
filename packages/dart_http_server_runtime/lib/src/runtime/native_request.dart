@@ -5,6 +5,37 @@ import 'dart:typed_data';
 import 'package:dart_http_core/dart_http_core.dart';
 import 'package:dart_http_server_runtime/src/native/http_native_bridge.dart' as core_ffi;
 import 'package:ffi/ffi.dart';
+import 'package:native_exchange/native_exchange_ffi.dart';
+
+/// Single-owner native stream for an incoming HTTP request body.
+final class NativeRequestBodyStream implements DartHttpServerNativeBodyStream {
+  NativeRequestBodyStream(this._stream, {required this.contentLength});
+
+  NativeByteStreamHandle? _stream;
+
+  @override
+  final int? contentLength;
+
+  /// Whether ownership has been transferred to a native consumer.
+  bool get isTransferred => _stream == null;
+
+  /// Transfers the incoming stream to a native consumer.
+  NativeByteStreamHandle takeNative() {
+    final stream = _stream;
+    if (stream == null) {
+      throw StateError('Native request body stream has already been transferred.');
+    }
+    _stream = null;
+    return stream;
+  }
+
+  /// Cancels and releases the incoming stream unless it was transferred.
+  Future<void> close() async {
+    final stream = _stream;
+    _stream = null;
+    await stream?.close();
+  }
+}
 
 /// Borrowed native request body view for the current request lifecycle.
 ///
@@ -178,6 +209,7 @@ final class NativeRequest {
     required Map<String, String> query,
     required Map<String, String> headers,
     this.body,
+    this.bodyStream,
     this._multipartLoader,
   }) : pathParams = Map.unmodifiable(pathParams),
        query = Map.unmodifiable(query),
@@ -197,6 +229,9 @@ final class NativeRequest {
 
   /// Borrowed native request body, if present.
   final NativeRequestBody? body;
+
+  /// Ownership stream for a body declared with `RequestBody.binaryStream`.
+  final NativeRequestBodyStream? bodyStream;
 
   final MultipartLoader? _multipartLoader;
   Future<NativeMultipartForm>? _multipartFuture;

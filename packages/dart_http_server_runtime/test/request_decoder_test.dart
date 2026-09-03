@@ -125,6 +125,26 @@ void main() {
     expect(input.body<CreateUserInput>().name, 'Ada');
   });
 
+  test('preserves binary request bodies without UTF-8 decoding', () async {
+    final bytes = Uint8List.fromList(<int>[0, 255, 1, 128]);
+    final input = await decodeRequestInput(
+      TransportRequest(
+        routeId: 'route_0',
+        pathParams: const <String, String>{},
+        query: const <String, String>{},
+        headers: const <String, String>{},
+        bodyBytes: bytes,
+      ),
+      codecs: DartHttpCodecRegistry.empty,
+      paramsSchemaId: null,
+      querySchemaId: null,
+      headersSchemaId: null,
+      body: const RequestBody.binary(contentType: 'application/partial-upload'),
+    );
+
+    expect(input.body<Uint8List>(), bytes);
+  });
+
   test('decodes multipart request bodies with route-local decoder', () async {
     final nativeBytes = calloc<Uint8>(3);
     nativeBytes.asTypedList(3).setAll(0, [1, 2, 3]);

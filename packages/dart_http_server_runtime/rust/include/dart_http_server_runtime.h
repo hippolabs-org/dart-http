@@ -130,6 +130,10 @@ NativeTransportRequest* dart_http_server_runtime_take_request(int64_t request_id
 
 void dart_http_server_runtime_free_request(NativeTransportRequest* value);
 
+bool dart_http_server_runtime_take_request_body_stream(
+    NativeTransportRequest* request,
+    void* out_stream);
+
 bool dart_http_server_runtime_accept_web_socket(
     int64_t request_id,
     intptr_t header_count,

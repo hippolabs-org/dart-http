@@ -7,6 +7,8 @@ for Dart maintained by Hippolabs.
 
 - `packages/sse_helpers`: bounded, incremental Server-Sent Events wire model, encoder, and decoder.
 - `packages/dart_http_core`: transport-neutral HTTP and routing contracts.
+- `packages/dart_http_resumable_upload`: resumable upload protocol, client,
+  routes, and storage contracts.
 - `packages/dart_http_server_runtime`: Rust-backed runtime with Native
   Exchange body ownership.
 

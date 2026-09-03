@@ -78,7 +78,11 @@ final class CompiledRoute<TServices> implements CompiledOpenApiRoute {
     'headersSchemaId': jsonSchemaRouteId(options.headers),
     'requestBody': switch (options.body) {
       null => null,
-      final body => {'contentType': body.contentType, 'schemaId': jsonSchemaRouteId(body.schema)},
+      final body => {
+        'contentType': body.contentType,
+        'schemaId': jsonSchemaRouteId(body.schema),
+        'streaming': body.delivery == RequestBodyDelivery.nativeStream,
+      },
     },
   };
 }

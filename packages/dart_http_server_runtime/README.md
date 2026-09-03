@@ -113,6 +113,28 @@ app.post('/upload', handler: (ctx) async {
 `nativeBody` is a borrowed view and is only valid while the current request is
 being handled. Copy bytes if data needs to outlive the handler.
 
+For large request bodies consumed by another native component, declare a
+native stream instead:
+
+```dart
+app.patch(
+  '/upload',
+  options: const RouteOptions(
+    body: RequestBody.binaryStream(contentType: 'application/partial-upload'),
+  ),
+  handler: (ctx) async {
+    final incoming = ctx.req.nativeBodyStream!;
+    await nativeStorage.write(incoming.takeNative());
+    return RawResponse.text(status: 204);
+  },
+);
+```
+
+The runtime forwards Axum body frames through a capacity-one Native Exchange
+stream. The payload remains native-owned; Dart only transfers the stream
+handle. Returning without transferring it cancels and releases the request
+stream automatically.
+
 ## WebSocket Frames
 
 WebSocket routes can decode typed handshake query parameters and handle JSON

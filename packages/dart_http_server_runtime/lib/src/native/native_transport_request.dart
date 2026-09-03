@@ -1,7 +1,9 @@
+import 'dart:async';
 import 'dart:ffi';
 
 import 'package:dart_http_server_runtime/src/native/http_native_bridge.dart' as core_ffi;
 import 'package:ffi/ffi.dart';
+import 'package:native_exchange/native_exchange_ffi.dart' as nex;
 
 import '../runtime/native_request.dart';
 import '../runtime/transport_request.dart';
@@ -12,11 +14,13 @@ final class DecodedNativeTransportRequest {
     required this.request,
     required this.nativeRequest,
     this.releaseNativeBody,
+    this.releaseNativeBodyStream,
   });
 
   final TransportRequest request;
   final NativeRequest nativeRequest;
   final void Function()? releaseNativeBody;
+  final void Function()? releaseNativeBodyStream;
 }
 
 DecodedNativeTransportRequest decodeNativeTransportRequest(
@@ -29,6 +33,7 @@ DecodedNativeTransportRequest decodeNativeTransportRequest(
   final headers = _decodePairs(request.headers, request.header_count);
   final nativeBodyData = _nativeBodyData(request.body);
   final nativeBody = nativeBodyData?.body;
+  final nativeBodyStream = _takeNativeBodyStream(requestPtr, headers: headers);
 
   return DecodedNativeTransportRequest(
     request: TransportRequest(
@@ -55,11 +60,35 @@ DecodedNativeTransportRequest decodeNativeTransportRequest(
       query: query,
       headers: headers,
       body: nativeBody,
+      bodyStream: nativeBodyStream,
       multipartLoader: nativeBody == null
           ? null
           : () => _decodeNativeMultipartForm(requestPtr, headers: headers, requestBody: nativeBody),
     ),
     releaseNativeBody: nativeBodyData?.release,
+    releaseNativeBodyStream: nativeBodyStream == null
+        ? null
+        : () => unawaited(nativeBodyStream.close()),
+  );
+}
+
+NativeRequestBodyStream? _takeNativeBodyStream(
+  Pointer<gen.NativeTransportRequest> requestPtr, {
+  required Map<String, String> headers,
+}) {
+  final descriptor = calloc<nex.NexByteStream>();
+  final taken = gen.dart_http_server_runtime_take_request_body_stream(
+    requestPtr,
+    descriptor.cast(),
+  );
+  if (!taken) {
+    calloc.free(descriptor);
+    return null;
+  }
+  final contentLength = int.tryParse(headers['content-length'] ?? '');
+  return NativeRequestBodyStream(
+    nex.NativeByteStreamHandle.fromPointer(descriptor),
+    contentLength: contentLength,
   );
 }
 

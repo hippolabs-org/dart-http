@@ -14,7 +14,12 @@ export 'src/runtime/dart_http_server.dart';
 export 'src/runtime/dart_http_server_instance.dart';
 export 'src/runtime/native_binary_stream_response.dart';
 export 'src/runtime/native_request.dart'
-    show NativeMultipartField, NativeMultipartFile, NativeMultipartForm, NativeRequestBody;
+    show
+        NativeMultipartField,
+        NativeMultipartFile,
+        NativeMultipartForm,
+        NativeRequestBody,
+        NativeRequestBodyStream;
 export 'src/runtime/open_api_document.dart';
 export 'src/runtime/open_telemetry_config.dart';
 export 'src/runtime/request_input_multipart.dart' show MultipartRequestInput;

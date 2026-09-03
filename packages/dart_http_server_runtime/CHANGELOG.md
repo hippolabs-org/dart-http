@@ -1,3 +1,11 @@
+## 0.3.42
+
+- Preserve bodies declared with `RequestBody.binary` as raw bytes during
+  request decoding.
+- Deliver bodies declared with `RequestBody.binaryStream` as bounded Native
+  Exchange streams without copying payload bytes into the Dart heap.
+- Bump the native artifact version to 0.1.25 for the request-stream ABI.
+
 ## 0.3.41
 
 - Implement and re-export Native Exchange's generic `NativeByteLease`

@@ -29,11 +29,13 @@ final class NativeTransportRequestLease {
     required this.nativeRequest,
     required this._requestPtr,
     this.releaseNativeBody,
+    this.releaseNativeBodyStream,
   });
 
   final TransportRequest request;
   final NativeRequest nativeRequest;
   final void Function()? releaseNativeBody;
+  final void Function()? releaseNativeBodyStream;
   final Pointer<gen.NativeTransportRequest> _requestPtr;
   var _disposed = false;
 
@@ -43,6 +45,7 @@ final class NativeTransportRequestLease {
     }
     _disposed = true;
     releaseNativeBody?.call();
+    releaseNativeBodyStream?.call();
     gen.dart_http_server_runtime_free_request(_requestPtr);
   }
 }
@@ -110,6 +113,7 @@ abstract final class DartHttpNative {
       nativeRequest: decoded.nativeRequest,
       requestPtr: requestPtr,
       releaseNativeBody: decoded.releaseNativeBody,
+      releaseNativeBodyStream: decoded.releaseNativeBodyStream,
     );
   }
 

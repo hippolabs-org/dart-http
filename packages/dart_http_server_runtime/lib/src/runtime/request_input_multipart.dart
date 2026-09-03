@@ -9,6 +9,10 @@ extension MultipartRequestInput on RequestInput {
   /// by the runtime.
   NativeRequestBody? get nativeBody => maybeNativeBody<NativeRequestBody>();
 
+  /// Single-owner native stream for a body declared with
+  /// `RequestBody.binaryStream`.
+  NativeRequestBodyStream? get nativeBodyStream => maybeNativeBody<NativeRequestBodyStream>();
+
   /// Parses the request body as `multipart/form-data`.
   ///
   /// This is the ergonomic Dart request surface on top of the runtime-native

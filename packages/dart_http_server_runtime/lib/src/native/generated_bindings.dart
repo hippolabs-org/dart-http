@@ -201,6 +201,12 @@ external ffi.Pointer<ffi.Char> dart_http_server_runtime_take_last_error();
 @ffi.Native<ffi.Pointer<NativeTransportRequest> Function(ffi.Int64)>()
 external ffi.Pointer<NativeTransportRequest> dart_http_server_runtime_take_request(int request_id);
 
+@ffi.Native<ffi.Bool Function(ffi.Pointer<NativeTransportRequest>, ffi.Pointer<ffi.Void>)>()
+external bool dart_http_server_runtime_take_request_body_stream(
+  ffi.Pointer<NativeTransportRequest> request,
+  ffi.Pointer<ffi.Void> out_stream,
+);
+
 @ffi.Native<ffi.Pointer<NativeWebSocketConnection> Function(ffi.Int64)>()
 external ffi.Pointer<NativeWebSocketConnection> dart_http_server_runtime_take_web_socket_connection(
   int session_id,

@@ -33,7 +33,9 @@ use dart_http_server_core::{
 };
 use futures_util::StreamExt;
 use native_exchange_rust::abi::{
-    NEX_CAPABILITY_CONCURRENT_CANCEL, NEX_CAPABILITY_THREAD_SAFE, NexByteStream,
+    NEX_ABI_VERSION, NEX_CAPABILITY_CONCURRENT_CANCEL, NEX_CAPABILITY_THREAD_SAFE,
+    NEX_STREAM_READ_CHUNK, NEX_STREAM_READ_DONE, NEX_STREAM_READ_ERROR, NexBuffer, NexByteStream,
+    NexUtf8View,
 };
 use native_exchange_rust::{AdoptedByteStream, StreamCancelHandle, StreamRead};
 use once_cell::sync::Lazy;
@@ -47,7 +49,7 @@ use wtransport::{
     ServerConfig as WebTransportServerConfig, VarInt,
 };
 
-const DART_HTTP_SERVER_RUNTIME_NATIVE_ABI_VERSION: i32 = 17;
+const DART_HTTP_SERVER_RUNTIME_NATIVE_ABI_VERSION: i32 = 18;
 const SCHEMA_REGISTRY_URI: &str = "urn:dart-http:schema-registry";
 const DEFAULT_REALTIME_MAX_PENDING_MESSAGES: usize = 256;
 const DEFAULT_REALTIME_MAX_PENDING_BYTES: usize = 8 * 1024 * 1024;
@@ -220,6 +222,7 @@ struct NativeTransportRequestHandle {
     headers: Vec<OwnedPair>,
     header_pairs: Box<[NativePair]>,
     body: Option<OwnedBytes>,
+    body_stream: Option<ProducedIncomingBodyStream>,
 }
 
 #[repr(C)]
@@ -314,6 +317,7 @@ struct TransportRequest {
     query: HashMap<String, String>,
     headers: HashMap<String, String>,
     body: Option<Vec<u8>>,
+    body_stream: Option<ProducedIncomingBodyStream>,
     request_kind: NativeRequestKind,
     body_kind: NativeBodyKind,
 }
@@ -420,6 +424,166 @@ fn release_rejected_native_stream(stream: NexByteStream) {
     }
     if let Some(release) = stream.release {
         unsafe { release(stream.context) };
+    }
+}
+
+enum IncomingBodyMessage {
+    Chunk(Bytes),
+    Done,
+    Error(Vec<u8>),
+}
+
+struct IncomingBodyStreamContext {
+    receiver: Mutex<mpsc::Receiver<IncomingBodyMessage>>,
+    cancel_tx: watch::Sender<bool>,
+    last_error: Mutex<Vec<u8>>,
+}
+
+struct IncomingBodyBuffer {
+    bytes: Bytes,
+}
+
+struct ProducedIncomingBodyStream {
+    descriptor: Option<NexByteStream>,
+}
+
+// The descriptor advertises thread-safe callbacks, and every mutable field in
+// its context is synchronized. Ownership may therefore cross the request map.
+unsafe impl Send for ProducedIncomingBodyStream {}
+unsafe impl Sync for ProducedIncomingBodyStream {}
+
+impl ProducedIncomingBodyStream {
+    fn from_body(body: Body) -> Self {
+        let (sender, receiver) = mpsc::channel(1);
+        let (cancel_tx, mut cancel_rx) = watch::channel(false);
+        tokio::spawn(async move {
+            let mut stream = body.into_data_stream();
+            loop {
+                tokio::select! {
+                    changed = cancel_rx.changed() => {
+                        if changed.is_err() || *cancel_rx.borrow() {
+                            return;
+                        }
+                    }
+                    next = stream.next() => {
+                        let message = match next {
+                            Some(Ok(bytes)) => IncomingBodyMessage::Chunk(bytes),
+                            Some(Err(error)) => IncomingBodyMessage::Error(error.to_string().into_bytes()),
+                            None => IncomingBodyMessage::Done,
+                        };
+                        let terminal = matches!(message, IncomingBodyMessage::Done | IncomingBodyMessage::Error(_));
+                        if sender.send(message).await.is_err() || terminal {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+
+        let context = Box::new(IncomingBodyStreamContext {
+            receiver: Mutex::new(receiver),
+            cancel_tx,
+            last_error: Mutex::new(Vec::new()),
+        });
+        Self {
+            descriptor: Some(NexByteStream {
+                abi_version: NEX_ABI_VERSION,
+                struct_size: std::mem::size_of::<NexByteStream>(),
+                capabilities: NEX_CAPABILITY_THREAD_SAFE | NEX_CAPABILITY_CONCURRENT_CANCEL,
+                context: Box::into_raw(context).cast(),
+                next: Some(incoming_body_stream_next),
+                cancel: Some(incoming_body_stream_cancel),
+                release: Some(incoming_body_stream_release),
+            }),
+        }
+    }
+
+    fn into_descriptor(mut self) -> NexByteStream {
+        self.descriptor
+            .take()
+            .expect("incoming body stream has already been transferred")
+    }
+}
+
+impl Drop for ProducedIncomingBodyStream {
+    fn drop(&mut self) {
+        if let Some(descriptor) = self.descriptor.take() {
+            release_rejected_native_stream(descriptor);
+        }
+    }
+}
+
+unsafe extern "C" fn incoming_body_stream_next(
+    context: *mut std::ffi::c_void,
+    out_buffer: *mut NexBuffer,
+    out_error: *mut NexUtf8View,
+) -> i32 {
+    if context.is_null() || out_buffer.is_null() || out_error.is_null() {
+        return NEX_STREAM_READ_ERROR;
+    }
+    let context = unsafe { &*context.cast::<IncomingBodyStreamContext>() };
+    let message = context
+        .receiver
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .blocking_recv();
+    match message {
+        Some(IncomingBodyMessage::Chunk(bytes)) => {
+            let buffer = Box::new(IncomingBodyBuffer { bytes });
+            let ptr = if buffer.bytes.is_empty() {
+                std::ptr::null()
+            } else {
+                buffer.bytes.as_ptr()
+            };
+            let len = buffer.bytes.len();
+            unsafe {
+                out_buffer.write(NexBuffer {
+                    abi_version: NEX_ABI_VERSION,
+                    struct_size: std::mem::size_of::<NexBuffer>(),
+                    capabilities: NEX_CAPABILITY_THREAD_SAFE,
+                    ptr,
+                    len,
+                    context: Box::into_raw(buffer).cast(),
+                    release: Some(incoming_body_buffer_release),
+                });
+            }
+            NEX_STREAM_READ_CHUNK
+        }
+        Some(IncomingBodyMessage::Done) | None => NEX_STREAM_READ_DONE,
+        Some(IncomingBodyMessage::Error(message)) => {
+            let mut error = context
+                .last_error
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            *error = message;
+            unsafe {
+                out_error.write(NexUtf8View {
+                    ptr: error.as_ptr(),
+                    len: error.len(),
+                });
+            }
+            NEX_STREAM_READ_ERROR
+        }
+    }
+}
+
+unsafe extern "C" fn incoming_body_stream_cancel(context: *mut std::ffi::c_void) {
+    if context.is_null() {
+        return;
+    }
+    let context = unsafe { &*context.cast::<IncomingBodyStreamContext>() };
+    let _ = context.cancel_tx.send(true);
+}
+
+unsafe extern "C" fn incoming_body_stream_release(context: *mut std::ffi::c_void) {
+    if !context.is_null() {
+        unsafe { drop(Box::from_raw(context.cast::<IncomingBodyStreamContext>())) };
+    }
+}
+
+unsafe extern "C" fn incoming_body_buffer_release(context: *mut std::ffi::c_void) {
+    if !context.is_null() {
+        unsafe { drop(Box::from_raw(context.cast::<IncomingBodyBuffer>())) };
     }
 }
 
@@ -623,6 +787,8 @@ struct RouteSegmentManifest {
 struct RequestBodyManifest {
     content_type: String,
     schema_id: Option<String>,
+    #[serde(default)]
+    streaming: bool,
 }
 
 #[derive(Clone)]
@@ -660,6 +826,7 @@ struct RequestBodyValidation {
     content_type: String,
     kind: RequestBodyKind,
     schema_id: Option<String>,
+    streaming: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1040,6 +1207,26 @@ pub extern "C" fn dart_http_server_runtime_free_request(value: *mut NativeTransp
     unsafe {
         let _ = Box::from_raw(value.cast::<NativeTransportRequestHandle>());
     }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn dart_http_server_runtime_take_request_body_stream(
+    request: *mut NativeTransportRequest,
+    out_stream: *mut std::ffi::c_void,
+) -> bool {
+    if request.is_null() || out_stream.is_null() {
+        return false;
+    }
+    let handle = unsafe { &mut *request.cast::<NativeTransportRequestHandle>() };
+    let Some(stream) = handle.body_stream.take() else {
+        return false;
+    };
+    unsafe {
+        out_stream
+            .cast::<NexByteStream>()
+            .write(stream.into_descriptor());
+    }
+    true
 }
 
 #[unsafe(no_mangle)]
@@ -1868,6 +2055,39 @@ async fn validate_request_middleware(
 
     match route_match.kind {
         RouteTransportKind::Http | RouteTransportKind::NativeHttp => {
+            let streams_body = route_match.kind == RouteTransportKind::Http
+                && route_match
+                    .request_body
+                    .as_ref()
+                    .is_some_and(|request_body| request_body.streaming);
+            if streams_body {
+                let request_body = route_match
+                    .request_body
+                    .as_ref()
+                    .expect("streaming route has a request body");
+                let actual_content_type = parts
+                    .headers
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok());
+                if !content_type_matches(actual_content_type, &request_body.content_type) {
+                    return response(
+                        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                        "text/plain; charset=utf-8",
+                        format!("Expected {}", request_body.content_type),
+                    );
+                }
+                let mut request = Request::from_parts(parts, body);
+                request.extensions_mut().insert(ValidatedRouteRequest {
+                    route_match,
+                    method,
+                    path,
+                    query,
+                    headers,
+                    body: None,
+                    runtime_state,
+                });
+                return next.run(request).await;
+            }
             let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
                 Ok(bytes) => bytes,
                 Err(_) => {
@@ -1943,11 +2163,18 @@ async fn handle_validated_request(mut request: Request<Body>) -> Response<Body> 
             .await
         }
         RouteTransportKind::Http => {
+            let streams_body = validated
+                .route_match
+                .request_body
+                .as_ref()
+                .is_some_and(|request_body| request_body.streaming);
+            let body_stream = streams_body.then(|| request.into_body());
             handle_http_request(
                 validated.route_match,
                 validated.query,
                 validated.headers,
                 validated.body.unwrap_or_else(ValidatedBody::none),
+                body_stream,
                 &validated.runtime_state,
             )
             .await
@@ -1976,6 +2203,7 @@ async fn handle_http_request(
     query: HashMap<String, String>,
     headers: HashMap<String, String>,
     body: ValidatedBody,
+    body_stream: Option<Body>,
     runtime_state: &ServerRuntimeState,
 ) -> Response<Body> {
     let transport_request = TransportRequest {
@@ -1984,6 +2212,7 @@ async fn handle_http_request(
         query,
         headers,
         body: body.bytes,
+        body_stream: body_stream.map(ProducedIncomingBodyStream::from_body),
         request_kind: NativeRequestKind::Http,
         body_kind: body.kind,
     };
@@ -2276,6 +2505,7 @@ async fn handle_web_socket_request(
         query: query.clone(),
         headers: headers.clone(),
         body: None,
+        body_stream: None,
         request_kind: NativeRequestKind::WebSocket,
         body_kind: NativeBodyKind::None,
     };
@@ -2539,6 +2769,7 @@ async fn handle_web_transport_incoming_session(
         query: query.clone(),
         headers: headers.clone(),
         body: None,
+        body_stream: None,
         request_kind: NativeRequestKind::WebTransport,
         body_kind: NativeBodyKind::None,
     };
@@ -3584,6 +3815,7 @@ fn compile_route(
                     kind: body_kind(&request_body.content_type),
                     content_type: request_body.content_type,
                     schema_id: request_body.schema_id,
+                    streaming: request_body.streaming,
                 })
         }
         RouteTransportKind::WebSocket | RouteTransportKind::WebTransport => None,
@@ -3700,6 +3932,7 @@ impl NativeTransportRequestHandle {
         let headers = owned_pairs_from_map(request.headers);
         let header_pairs = native_pairs_from_owned(&headers);
         let body = request.body.map(OwnedBytes::from_vec);
+        let body_stream = request.body_stream;
 
         let native_request = NativeTransportRequest {
             route_id: route_id.as_native(),
@@ -3727,6 +3960,7 @@ impl NativeTransportRequestHandle {
             headers,
             header_pairs,
             body,
+            body_stream,
         }
     }
 }

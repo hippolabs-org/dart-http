@@ -1,3 +1,8 @@
+## 0.3.49
+
+- Add `RequestBody.binary` and `RequestBody.binaryStream` so routes can declare
+  buffered or native-streamed raw byte bodies explicitly.
+
 ## 0.3.48
 
 - Add explicit response streaming metadata to API contracts. `ResponseSpec.sse()`

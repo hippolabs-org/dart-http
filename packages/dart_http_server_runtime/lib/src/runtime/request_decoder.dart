@@ -42,7 +42,7 @@ Future<RequestInput> decodeRequestInput(
     queryMap: request.query,
     headersMap: request.headers,
     multipartLoader: nativeRequest?.multipart,
-    nativeBody: nativeRequest?.body,
+    nativeBody: nativeRequest?.bodyStream ?? nativeRequest?.body,
   );
 }
 
@@ -74,6 +74,13 @@ Future<Object?> _decodeBody(
     return null;
   }
 
+  if (body.delivery == RequestBodyDelivery.nativeStream) {
+    if (nativeRequest?.bodyStream == null) {
+      throw StateError('The native runtime did not provide the declared request body stream.');
+    }
+    return null;
+  }
+
   if (request.bodyKind == TransportRequestBodyKind.multipart) {
     final decoder = body.multipartDecoder;
     if (decoder == null) {
@@ -94,6 +101,7 @@ Future<Object?> _decodeBody(
   final decoded = switch (request.bodyKind) {
     TransportRequestBodyKind.json => jsonDecode(utf8.decode(payload)),
     _ when body.contentType.startsWith('application/json') => jsonDecode(utf8.decode(payload)),
+    _ when body.isBinary => payload,
     _ => utf8.decode(payload),
   };
 

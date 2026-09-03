@@ -20,6 +20,7 @@ Native Exchange is resolved from `pub.hippolabs.org`.
 | `dart_http_core` | Transport-neutral HTTP, routing, WebSocket, and WebTransport contracts. |
 | `dart_http_client` | HTTP and WebSocket transports for generated clients. |
 | `dart_http_native_client` | Tokio/reqwest HTTP transport with cancellation and Native Exchange request/response streams. |
+| [`dart_http_resumable_upload`](packages/dart_http_resumable_upload) | Client and server primitives for interoperable, resumable HTTP uploads. |
 | `dart_http_server` | App-facing HTTP server and helpers. |
 | `dart_http_server_codegen` | Route, schema, and client generation. |
 | `dart_http_server_runtime` | Rust-backed native HTTP runtime. |

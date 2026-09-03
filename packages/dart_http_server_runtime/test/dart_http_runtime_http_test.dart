@@ -480,6 +480,53 @@ void main() {
     expect(body, {'hasNativeBody': true, 'length': 17, 'text': 'hello native body'});
   });
 
+  test('transfers streaming request bodies through Native Exchange', () async {
+    final app = DartHttp<void>(services: () {});
+    var exposedBufferedBody = false;
+    app.patch(
+      '/native-body-stream',
+      options: const RouteOptions(
+        body: RequestBody.binaryStream(contentType: 'application/partial-upload'),
+        success: ResponseSpec.binary(contentType: 'application/octet-stream'),
+      ),
+      handler: (ctx) {
+        exposedBufferedBody = ctx.req.bodyOrNull != null;
+        final stream = ctx.req.nativeBodyStream!;
+        return NativeBinaryStreamResponse(
+          body: stream.takeNative(),
+          contentType: 'application/octet-stream',
+          contentLength: stream.contentLength,
+        );
+      },
+    );
+
+    final server = await app.listen(port: 0);
+    final client = HttpClient();
+
+    addTearDown(() async {
+      client.close(force: true);
+      await server.close();
+    });
+
+    final payload = Uint8List.fromList(List<int>.generate(256 * 1024, (index) => index % 251));
+    final request = await client.patchUrl(
+      Uri.http('127.0.0.1:${server.port}', '/native-body-stream'),
+    );
+    request.headers.contentType = ContentType('application', 'partial-upload');
+    request.contentLength = payload.length;
+    for (var offset = 0; offset < payload.length; offset += 4096) {
+      request.add(Uint8List.sublistView(payload, offset, (offset + 4096).clamp(0, payload.length)));
+    }
+    final response = await request.close();
+
+    expect(response.statusCode, HttpStatus.ok);
+    expect(exposedBufferedBody, isFalse);
+    expect(
+      await response.fold<List<int>>(<int>[], (bytes, chunk) => bytes..addAll(chunk)),
+      payload,
+    );
+  });
+
   test('parses multipart form-data with borrowed native file bodies', () async {
     final app = DartHttp<void>(services: () {});
     app.post(
