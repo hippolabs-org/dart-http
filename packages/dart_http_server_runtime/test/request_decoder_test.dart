@@ -200,6 +200,12 @@ void main() {
       expect(body.persist, isTrue);
       expect(body.file.length, 3);
       expect(await body.file.bytes, [1, 2, 3]);
+      final nativeFile = body.file as NativeMultipartFile;
+      final nativeLease = nativeFile.copyNativeLease();
+      expect(nativeLease.bytesView, [1, 2, 3]);
+      borrowed.release();
+      expect(nativeLease.bytesView, [1, 2, 3]);
+      nativeLease.close();
     } finally {
       borrowed.release();
       calloc.free(nativeBytes);

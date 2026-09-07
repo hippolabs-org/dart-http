@@ -1,3 +1,9 @@
+## 0.3.43
+
+- Add `NativeMultipartFile.copyNativeLease()` to detach uploaded file parts
+  into single-owner Native Exchange buffers without a Dart-heap copy.
+- Bump the native artifact version to 0.1.26 for the multipart lease ABI.
+
 ## 0.3.42
 
 - Preserve bodies declared with `RequestBody.binary` as raw bytes during

@@ -23,6 +23,12 @@ external bool dart_http_server_runtime_accept_web_transport(
   ffi.Pointer<NativePair> headers,
 );
 
+@ffi.Native<ffi.Bool Function(NativeBytes, ffi.Pointer<ffi.Void>)>()
+external bool dart_http_server_runtime_copy_native_bytes(
+  NativeBytes value,
+  ffi.Pointer<ffi.Void> out_buffer,
+);
+
 @ffi.Native<ffi.Bool Function(ffi.Int64)>()
 external bool dart_http_server_runtime_finish_binary_stream_response(int request_id);
 

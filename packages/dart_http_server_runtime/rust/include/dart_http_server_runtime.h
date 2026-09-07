@@ -186,6 +186,10 @@ NativeMultipartForm* dart_http_server_runtime_parse_multipart(
 
 void dart_http_server_runtime_free_multipart_form(NativeMultipartForm* value);
 
+bool dart_http_server_runtime_copy_native_bytes(
+    NativeBytes value,
+    void* out_buffer);
+
 NativeWebSocketConnection* dart_http_server_runtime_take_web_socket_connection(
     int64_t session_id);
 

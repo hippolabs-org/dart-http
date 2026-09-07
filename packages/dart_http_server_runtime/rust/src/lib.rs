@@ -37,7 +37,7 @@ use native_exchange_rust::abi::{
     NEX_STREAM_READ_CHUNK, NEX_STREAM_READ_DONE, NEX_STREAM_READ_ERROR, NexBuffer, NexByteStream,
     NexUtf8View,
 };
-use native_exchange_rust::{AdoptedByteStream, StreamCancelHandle, StreamRead};
+use native_exchange_rust::{AdoptedByteStream, ProducedBuffer, StreamCancelHandle, StreamRead};
 use once_cell::sync::Lazy;
 use serde::Deserialize;
 use serde_json::Value;
@@ -49,7 +49,7 @@ use wtransport::{
     ServerConfig as WebTransportServerConfig, VarInt,
 };
 
-const DART_HTTP_SERVER_RUNTIME_NATIVE_ABI_VERSION: i32 = 18;
+const DART_HTTP_SERVER_RUNTIME_NATIVE_ABI_VERSION: i32 = 19;
 const SCHEMA_REGISTRY_URI: &str = "urn:dart-http:schema-registry";
 const DEFAULT_REALTIME_MAX_PENDING_MESSAGES: usize = 256;
 const DEFAULT_REALTIME_MAX_PENDING_BYTES: usize = 8 * 1024 * 1024;
@@ -1451,6 +1451,28 @@ pub extern "C" fn dart_http_server_runtime_free_multipart_form(value: *mut Nativ
     unsafe {
         let _ = Box::from_raw(value.cast::<NativeMultipartFormHandle>());
     }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn dart_http_server_runtime_copy_native_bytes(
+    value: NativeBytes,
+    out_buffer: *mut NexBuffer,
+) -> bool {
+    if out_buffer.is_null() {
+        set_last_error("Native buffer output pointer must not be null.");
+        return false;
+    }
+    let bytes = match unsafe { read_native_bytes(value) } {
+        Some(bytes) => bytes,
+        None => {
+            set_last_error("Native bytes contain an invalid pointer/length pair.");
+            return false;
+        }
+    };
+    unsafe {
+        out_buffer.write(ProducedBuffer::from_vec(bytes.to_vec()).into_descriptor());
+    }
+    true
 }
 
 #[unsafe(no_mangle)]

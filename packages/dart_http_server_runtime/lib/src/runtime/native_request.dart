@@ -4,6 +4,7 @@ import 'dart:typed_data';
 
 import 'package:dart_http_core/dart_http_core.dart';
 import 'package:dart_http_server_runtime/src/native/http_native_bridge.dart' as core_ffi;
+import 'package:dart_http_server_runtime/src/native/generated_bindings.dart' as gen;
 import 'package:ffi/ffi.dart';
 import 'package:native_exchange/native_exchange_ffi.dart';
 
@@ -155,6 +156,25 @@ final class NativeMultipartFile implements MultipartFile {
 
   /// Copies the uploaded file into Dart-owned memory.
   Uint8List copyBytes() => body.copyBytes();
+
+  /// Copies the borrowed file body into an independently owned native lease.
+  ///
+  /// This is the ownership boundary for asynchronous native consumers: the
+  /// returned lease remains valid after the HTTP request is released and the
+  /// payload never passes through Dart-owned memory. The caller must close or
+  /// transfer the returned lease exactly once.
+  NativeBufferLease copyNativeLease() {
+    final descriptor = calloc<NexBuffer>();
+    try {
+      if (!gen.dart_http_server_runtime_copy_native_bytes(nativeBytes, descriptor.cast())) {
+        throw StateError('Failed to copy the multipart file into a native lease.');
+      }
+      return NativeBufferLease.fromPointer(descriptor);
+    } catch (_) {
+      calloc.free(descriptor);
+      rethrow;
+    }
+  }
 }
 
 /// Borrowed multipart form view for one request.
