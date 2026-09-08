@@ -1,3 +1,9 @@
+## 0.2.4
+
+- Publish native assets for Android arm, arm64, and x64; iOS arm64 devices and
+  arm64/x64 simulators; macOS arm64/x64; Linux arm64/x64; and Windows arm64/x64.
+- Add Windows runtime smoke coverage for the HTTP and WebSocket transport.
+
 ## 0.2.3
 
 - Add ownership-transferring outbound WebSocket binary frames backed by Native

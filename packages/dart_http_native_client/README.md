@@ -5,6 +5,10 @@ reqwest runtime owns connection pooling, request cancellation, and response
 streaming. Native Exchange bodies transfer ownership directly to Rust; network
 response chunks remain native-owned until consumed or explicitly copied.
 
+The package ships native assets for Android (arm, arm64, and x64), iOS devices
+and simulators, Linux, macOS, and Windows. It requires `dart:ffi` and therefore
+does not support web builds.
+
 ```dart
 final transport = await NativeHttpClientTransport.open();
 final response = await transport.sendStream(request);

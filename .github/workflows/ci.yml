@@ -46,3 +46,28 @@ jobs:
       - run: >-
           cargo test
           --manifest-path packages/${{ matrix.package }}/rust/Cargo.toml
+
+  native-client-smoke:
+    name: Native client smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-14
+          - windows-2025
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: ${{ env.DART_VERSION }}
+      - name: Install Rust toolchain
+        shell: bash
+        run: rustup toolchain install 1.95.0 --profile minimal
+      - name: Get dependencies
+        working-directory: packages/dart_http_native_client
+        run: dart pub get
+      - name: Run native HTTP and WebSocket tests
+        working-directory: packages/dart_http_native_client
+        run: dart test test/native_http_client_test.dart

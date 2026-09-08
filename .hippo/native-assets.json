@@ -8,9 +8,18 @@
         "packages/dart_http_native_client/rust"
       ],
       "targets": [
+        "android-arm",
+        "android-arm64",
+        "android-x64",
+        "ios-device-arm64",
+        "ios-simulator-arm64",
+        "ios-simulator-x64",
         "linux-x64",
         "linux-arm64",
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64",
+        "windows-arm64",
+        "windows-x64"
       ],
       "linux_packages": [
         "pkg-config"
