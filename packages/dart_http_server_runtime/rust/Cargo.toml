@@ -16,7 +16,7 @@ dart_http_server_core = { path = "crates/dart_http_server_core" }
 futures-util = "0.3"
 http = "1.3"
 jsonschema = { version = "0.46", default-features = false }
-native-exchange-rust = { version = "0.2.1", features = ["bytes"] }
+native-exchange-rust = { version = "0.3.0", features = ["bytes"] }
 once_cell = "1.21"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

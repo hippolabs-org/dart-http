@@ -1,3 +1,7 @@
+## 0.3.50
+
+- Update Native Exchange dependencies to the latest release line.
+
 ## 0.3.49
 
 - Add `RequestBody.binary` and `RequestBody.binaryStream` so routes can declare

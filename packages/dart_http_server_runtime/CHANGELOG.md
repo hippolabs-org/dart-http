@@ -1,3 +1,7 @@
+## 0.3.44
+
+- Update Native Exchange dependencies to the latest release line.
+
 ## 0.3.43
 
 - Add `NativeMultipartFile.copyNativeLease()` to detach uploaded file parts

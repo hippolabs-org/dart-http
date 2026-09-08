@@ -1,3 +1,7 @@
+## 0.2.1
+
+- Update Native Exchange dependencies to the latest release line.
+
 ## 0.2.0
 
 - Implement the generated-client WebSocket transport with Tokio/tungstenite.
