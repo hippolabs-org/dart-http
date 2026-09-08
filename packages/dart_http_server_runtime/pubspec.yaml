@@ -16,7 +16,7 @@ dependencies:
   ffi: ^2.2.0
   hippolabs_native_assets:
     hosted: "https://pub.hippolabs.org"
-    version: ^0.1.1
+    version: ^0.1.2
   hooks: ^2.0.2
   json_schema:
     hosted: https://pub.hippolabs.org
