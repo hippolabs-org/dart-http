@@ -1,6 +1,6 @@
 name: dart_http_server_codegen
 description: HTTP server code generation and generator-facing APIs for Dart HTTP.
-version: 0.4.1
+version: 0.4.2
 publish_to: "https://pub.hippolabs.org"
 repository: https://github.com/hippolabs-org/dart-http/tree/main/packages/dart_http_server_codegen
 

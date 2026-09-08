@@ -270,6 +270,7 @@ final class DartHttpClientOperation {
     this.queryType,
     this.headersType,
     this.bodyType,
+    this.schemaTypes = const <String, String>{},
   });
 
   final HttpMethod method;
@@ -281,6 +282,7 @@ final class DartHttpClientOperation {
   final String? queryType;
   final String? headersType;
   final String? bodyType;
+  final Map<String, String> schemaTypes;
 
   String get resolvedMethodName => methodName ?? _lowerCamel(options.operationId!);
 }
@@ -339,15 +341,18 @@ final class DartHttpClientGenerator {
     DartHttpClientLibrarySpec spec, {
     DartHttpClientFormatterOptions formatterOptions = const DartHttpClientFormatterOptions(),
   }) {
+    final models = _modelSpecs(spec);
     final library = Library((builder) {
       builder
         ..comments.add('GENERATED CODE - DO NOT MODIFY BY HAND.')
-        ..directives.add(Directive.import('package:dart_http_core/dart_http_core.dart'))
-        ..directives.add(Directive.import('package:json_schema/json_schema.dart'));
+        ..directives.add(Directive.import('package:dart_http_core/dart_http_core.dart'));
+      if (models.isNotEmpty) {
+        builder.directives.add(Directive.import('package:json_schema/json_schema.dart'));
+      }
       if (_needsTypedDataImport(spec)) {
         builder.directives.add(Directive.import('dart:typed_data'));
       }
-      builder.body.addAll([..._modelSpecs(spec), ...buildSpecs(spec)]);
+      builder.body.addAll([...models, ...buildSpecs(spec)]);
 
       for (final import in spec.additionalImports) {
         builder.directives.add(Directive.import(import));
@@ -363,11 +368,14 @@ final class DartHttpClientGenerator {
     String modelsPart = 'client.models.g.dart',
     DartHttpClientFormatterOptions formatterOptions = const DartHttpClientFormatterOptions(),
   }) {
+    final hasModels = _modelSpecs(spec).isNotEmpty;
     final library = Library((builder) {
       builder
         ..comments.add('GENERATED CODE - DO NOT MODIFY BY HAND.')
-        ..directives.add(Directive.import('package:dart_http_core/dart_http_core.dart'))
-        ..directives.add(Directive.import('package:json_schema/json_schema.dart'));
+        ..directives.add(Directive.import('package:dart_http_core/dart_http_core.dart'));
+      if (hasModels) {
+        builder.directives.add(Directive.import('package:json_schema/json_schema.dart'));
+      }
       if (_needsTypedDataImport(spec)) {
         builder.directives.add(Directive.import('dart:typed_data'));
       }
@@ -1120,8 +1128,7 @@ $forwarded,
           if (options.responses.success.streamingMode == ResponseStreamingMode.serverSentEvents)
             'responseMode': refer('DartHttpClientResponseMode').property('serverSentEvents'),
           if (successSchemaId case final schemaId?) 'schemaId': literalString(schemaId),
-          if (!_isRawTransportType(operation.successType))
-            'decoder': refer(operation.successType).property('decode'),
+          'decoder': ?_responseDecoder(operation),
         },
         <Reference>[refer(operation.successType)],
       ),
@@ -1678,7 +1685,21 @@ DartHttpClientOperation _operationFromOptions({
                 schemaTypes: schemaTypes,
               ) ??
               'Object?',
+    schemaTypes: schemaTypes,
   );
+}
+
+Expression? _responseDecoder(DartHttpClientOperation operation) {
+  final schema = operation.options.responses.success.schema;
+  if (schema is JsonArraySchema) {
+    return CodeExpression(
+      Code('(value) => ${_decodeSchemaValue(schema, 'value', operation.schemaTypes)}'),
+    );
+  }
+  if (_isRawTransportType(operation.successType)) {
+    return null;
+  }
+  return refer(operation.successType).property('decode');
 }
 
 DartHttpClientWebSocketOperation _webSocketOperationFromOptions({
