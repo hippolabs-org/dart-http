@@ -96,6 +96,39 @@ void main() {
     expect(streamLease.closeCount, 1);
   });
 
+  test('client WebSocket leased send falls back and releases ownership', () async {
+    final lease = _TrackingBinaryPayloadLease([4, 5, 6]);
+    final socket = _CopyingClientWebSocket();
+
+    await socket.sendBinaryLease(lease);
+
+    expect(socket.sent, [
+      [4, 5, 6],
+    ]);
+    expect(lease.closeCount, 1);
+  });
+
+  test('client WebSocket leased prefix falls back to one combined message', () async {
+    final lease = _TrackingBinaryPayloadLease([4, 5, 6]);
+    final socket = _CopyingClientWebSocket();
+
+    await socket.sendBinaryLease(lease, prefix: [1, 2, 3]);
+
+    expect(socket.sent, [
+      [1, 2, 3, 4, 5, 6],
+    ]);
+    expect(lease.closeCount, 1);
+  });
+
+  test('client WebSocket leased send releases ownership after failure', () async {
+    final lease = _TrackingBinaryPayloadLease([7, 8, 9]);
+    final socket = _CopyingClientWebSocket(fail: true);
+
+    await expectLater(socket.sendBinaryLease(lease), throwsStateError);
+
+    expect(lease.closeCount, 1);
+  });
+
   test('persistent WebTransport stream exposes incremental leases', () async {
     final first = _TrackingBinaryPayloadLease([1, 2]);
     final second = _TrackingBinaryPayloadLease([3, 4]);
@@ -147,6 +180,31 @@ void main() {
     ]);
     expect(lease.closeCount, 1);
   });
+}
+
+final class _CopyingClientWebSocket implements DartHttpClientWebSocket {
+  _CopyingClientWebSocket({this.fail = false});
+
+  final bool fail;
+  final List<List<int>> sent = [];
+
+  @override
+  Stream<WebSocketMessage> get messages => const Stream.empty();
+
+  @override
+  Future<void> close([int? code, String? reason]) async {}
+
+  @override
+  Future<void> sendBinary(List<int> value) async {
+    if (fail) throw StateError('send failed');
+    sent.add(List<int>.from(value));
+  }
+
+  @override
+  Future<void> sendJson(Object? value) async {}
+
+  @override
+  Future<void> sendText(String value) async {}
 }
 
 final class _TrackingBinaryPayloadLease implements BinaryPayloadLease {

@@ -23,10 +23,16 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
-use tokio_tungstenite::tungstenite::protocol::{CloseFrame, frame::coding::CloseCode};
+use tokio_tungstenite::tungstenite::protocol::{
+    CloseFrame,
+    frame::{
+        Frame,
+        coding::{CloseCode, Data, OpCode},
+    },
+};
 use tokio_util::sync::CancellationToken;
 
-const ABI_VERSION: i32 = 2;
+const ABI_VERSION: i32 = 4;
 const REQUEST_CANCELED: &str = "Native HTTP request canceled.";
 const WEBSOCKET_EVENT_OPENED: i32 = 1;
 const WEBSOCKET_EVENT_TEXT: i32 = 2;
@@ -99,7 +105,7 @@ struct WebSocketState {
 enum WebSocketCommand {
     Send {
         operation_id: i64,
-        message: Message,
+        messages: Vec<Message>,
     },
     Close {
         operation_id: i64,
@@ -188,7 +194,7 @@ impl RequestStreamReader {
                     return Err("Native request body returned an invalid buffer.".to_owned());
                 }
                 Ok(RequestStreamRead::Chunk(Bytes::from_owner(
-                    RequestBufferOwner(Some(buffer)),
+                    AdoptedBufferOwner(Some(buffer)),
                 )))
             }
             NEX_STREAM_READ_DONE | NEX_STREAM_READ_CANCELED => {
@@ -258,9 +264,9 @@ impl Drop for RequestStreamInner {
 unsafe impl Send for RequestStreamInner {}
 unsafe impl Sync for RequestStreamInner {}
 
-struct RequestBufferOwner(Option<NexBuffer>);
+struct AdoptedBufferOwner(Option<NexBuffer>);
 
-impl AsRef<[u8]> for RequestBufferOwner {
+impl AsRef<[u8]> for AdoptedBufferOwner {
     fn as_ref(&self) -> &[u8] {
         let descriptor = self.0.as_ref().expect("request buffer is still owned");
         if descriptor.len == 0 {
@@ -270,7 +276,7 @@ impl AsRef<[u8]> for RequestBufferOwner {
     }
 }
 
-impl Drop for RequestBufferOwner {
+impl Drop for AdoptedBufferOwner {
     fn drop(&mut self) {
         if let Some(descriptor) = self.0.take() {
             release_buffer(descriptor);
@@ -278,8 +284,8 @@ impl Drop for RequestBufferOwner {
     }
 }
 
-unsafe impl Send for RequestBufferOwner {}
-unsafe impl Sync for RequestBufferOwner {}
+unsafe impl Send for AdoptedBufferOwner {}
+unsafe impl Sync for AdoptedBufferOwner {}
 
 struct ResponseData {
     status: i32,
@@ -658,6 +664,54 @@ pub unsafe extern "C" fn dart_http_native_client_websocket_send_binary(
 }
 
 #[unsafe(no_mangle)]
+/// Enqueues one logical WebSocket binary message by adopting a Native Exchange
+/// buffer. A non-empty prefix is emitted as the first fragment and the adopted
+/// buffer as the final continuation fragment.
+///
+/// A positive result is the send operation ID. `-1` means ownership moved but
+/// the bounded WebSocket queue rejected and released the frame. `0` means the
+/// descriptor was not adopted.
+///
+/// # Safety
+///
+/// `native_buffer` must point to a live `NexBuffer` descriptor until this call
+/// returns. The buffer must support release from a foreign thread.
+pub unsafe extern "C" fn dart_http_native_client_websocket_send_binary_native_prefixed(
+    client_id: i64,
+    socket_id: i64,
+    prefix: *const u8,
+    prefix_length: isize,
+    native_buffer: *mut c_void,
+) -> i64 {
+    if native_buffer.is_null() {
+        return 0;
+    }
+    let descriptor_pointer = native_buffer.cast::<NexBuffer>();
+    let descriptor = unsafe { &*descriptor_pointer };
+    if !descriptor.is_valid() || descriptor.capabilities & NEX_CAPABILITY_THREAD_SAFE == 0 {
+        return 0;
+    }
+    let prefix = match unsafe { copy_optional_bytes(prefix, prefix_length) } {
+        Ok(value) => value,
+        Err(_) => return 0,
+    };
+    let descriptor = unsafe { ptr::read(descriptor_pointer) };
+    let bytes = Bytes::from_owner(AdoptedBufferOwner(Some(descriptor)));
+    let messages = if prefix.is_empty() {
+        vec![Message::Binary(bytes)]
+    } else {
+        vec![
+            Message::Frame(Frame::message(prefix, OpCode::Data(Data::Binary), false)),
+            Message::Frame(Frame::message(bytes, OpCode::Data(Data::Continue), true)),
+        ]
+    };
+    match enqueue_web_socket_messages(client_id, socket_id, messages) {
+        0 => -1,
+        operation_id => operation_id,
+    }
+}
+
+#[unsafe(no_mangle)]
 /// Enqueues a graceful WebSocket close frame.
 ///
 /// # Safety
@@ -789,13 +843,17 @@ pub unsafe extern "C" fn dart_http_native_client_websocket_free_event(
 }
 
 fn enqueue_web_socket_message(client_id: i64, socket_id: i64, message: Message) -> i64 {
+    enqueue_web_socket_messages(client_id, socket_id, vec![message])
+}
+
+fn enqueue_web_socket_messages(client_id: i64, socket_id: i64, messages: Vec<Message>) -> i64 {
     let Some(socket) = web_socket_state(client_id, socket_id) else {
         return 0;
     };
     let operation_id = socket.next_operation_id.fetch_add(1, Ordering::Relaxed);
     match socket.commands.try_send(WebSocketCommand::Send {
         operation_id,
-        message,
+        messages,
     }) {
         Ok(()) => operation_id,
         Err(_) => 0,
@@ -898,8 +956,8 @@ async fn run_web_socket(
                     let _ = writer.close().await;
                     return;
                 };
-                let (operation_id, message) = match command {
-                    WebSocketCommand::Send { operation_id, message } => (operation_id, message),
+                let (operation_id, messages) = match command {
+                    WebSocketCommand::Send { operation_id, messages } => (operation_id, messages),
                     WebSocketCommand::Close { operation_id, code, reason } => {
                         let frame = match (code, reason.is_empty()) {
                             (None, true) => None,
@@ -908,19 +966,21 @@ async fn run_web_socket(
                                 reason: reason.into(),
                             }),
                         };
-                        (operation_id, Message::Close(frame))
+                        (operation_id, vec![Message::Close(frame)])
                     }
                 };
-                if let Err(error) = writer.send(message).await {
-                    let _ = send_web_socket_event(
-                        &state,
-                        socket_id,
-                        &events,
-                        &control_events,
-                        WebSocketEventData::Error(format!("Native WebSocket send failed: {error}")),
-                        &cancellation,
-                    ).await;
-                    return;
+                for message in messages {
+                    if let Err(error) = writer.send(message).await {
+                        let _ = send_web_socket_event(
+                            &state,
+                            socket_id,
+                            &events,
+                            &control_events,
+                            WebSocketEventData::Error(format!("Native WebSocket send failed: {error}")),
+                            &cancellation,
+                        ).await;
+                        return;
+                    }
                 }
                 if !send_web_socket_event(
                     &state,

@@ -107,13 +107,21 @@ void main() {
     expect(nativeSocket.selectedProtocol, 'native-v1');
 
     final text = Completer<WebSocketMessage>();
-    final binary = Completer<WebSocketMessage>();
+    final firstBinary = Completer<WebSocketMessage>();
+    final secondBinary = Completer<WebSocketMessage>();
+    final thirdBinary = Completer<WebSocketMessage>();
     final subscription = socket.messages.listen((message) {
       switch (message.kind) {
         case WebSocketMessageKind.text:
           if (!text.isCompleted) text.complete(message);
         case WebSocketMessageKind.binary:
-          if (!binary.isCompleted) binary.complete(message);
+          if (!firstBinary.isCompleted) {
+            firstBinary.complete(message);
+          } else if (!secondBinary.isCompleted) {
+            secondBinary.complete(message);
+          } else if (!thirdBinary.isCompleted) {
+            thirdBinary.complete(message);
+          }
       }
     });
     addTearDown(subscription.cancel);
@@ -123,12 +131,23 @@ void main() {
     expect(jsonDecode((await text.future).text), {'native': true});
 
     await socket.sendBinary(<int>[1, 2, 3, 4]);
-    final binaryMessage = await binary.future;
+    final binaryMessage = await firstBinary.future;
     expect(binaryMessage.hasBinaryLease, isTrue);
     final lease = binaryMessage.takeBinaryLease();
     expect(lease.bytesView, <int>[1, 2, 3, 4]);
-    lease.close();
+    await socket.sendBinaryLease(lease);
     expect(lease.isClosed, isTrue);
+
+    final forwardedMessage = await secondBinary.future;
+    final forwardedLease = forwardedMessage.takeBinaryLease();
+    expect(forwardedLease.bytesView, <int>[1, 2, 3, 4]);
+    await socket.sendBinaryLease(forwardedLease, prefix: const <int>[9, 8]);
+    expect(forwardedLease.isClosed, isTrue);
+
+    final prefixedMessage = await thirdBinary.future;
+    final prefixedLease = prefixedMessage.takeBinaryLease();
+    expect(prefixedLease.bytesView, <int>[9, 8, 1, 2, 3, 4]);
+    prefixedLease.close();
   });
 
   test('bounds native receive work while the Dart subscription is paused', () async {
@@ -169,6 +188,7 @@ void main() {
     transport = await NativeHttpClientTransport.open(webSocketOutgoingCapacity: 1);
     server.listen((request) async {
       final socket = await WebSocketTransformer.upgrade(request);
+      socket.add(<int>[9, 8, 7]);
       socket.listen((_) {});
     });
     final socket = await transport.connect(
@@ -178,9 +198,14 @@ void main() {
     );
     addTearDown(socket.close);
 
+    final received = Completer<WebSocketMessage>();
+    final subscription = socket.messages.listen(received.complete);
+    addTearDown(subscription.cancel);
+    final lease = (await received.future).takeBinaryLease();
+
     final first = socket.sendText('first');
     await expectLater(
-      socket.sendText('second'),
+      socket.sendBinaryLease(lease),
       throwsA(
         isA<NativeHttpClientException>().having(
           (error) => error.message,
@@ -189,6 +214,7 @@ void main() {
         ),
       ),
     );
+    expect(lease.isClosed, isTrue);
     await first;
   });
 

@@ -81,7 +81,7 @@ extension on NativeHttpClientTransport {
 }
 
 /// Active WebSocket driven by Tokio/tungstenite with leased binary frames.
-final class NativeHttpWebSocket implements DartHttpClientWebSocket {
+final class NativeHttpWebSocket implements DartHttpClientOwnedWebSocket {
   NativeHttpWebSocket._(this._transport, this._socketId) {
     _controller = StreamController<WebSocketMessage>(
       sync: true,
@@ -146,6 +146,56 @@ final class NativeHttpWebSocket implements DartHttpClientWebSocket {
       if (pointer != nullptr) calloc.free(pointer);
     }
   });
+
+  @override
+  Future<void> sendBinaryLease(BinaryPayloadLease lease, {List<int> prefix = const <int>[]}) {
+    final exchangeLease = switch (lease) {
+      NativeExchangeBinaryPayloadLease(lease: final byteLease) => byteLease,
+      _ => null,
+    };
+    if (exchangeLease is! TransferableNativeByteLease) {
+      if (prefix.isEmpty) {
+        return sendBinary(lease.takeBytes());
+      }
+      try {
+        final combined = Uint8List(prefix.length + lease.length)
+          ..setRange(0, prefix.length, prefix)
+          ..setRange(prefix.length, prefix.length + lease.length, lease.bytesView);
+        return sendBinary(combined);
+      } finally {
+        lease.close();
+      }
+    }
+    return _scheduleOperation(() {
+      final prefixPointer = prefix.isEmpty ? nullptr.cast<Uint8>() : calloc<Uint8>(prefix.length);
+      final transfer = exchangeLease.takeNative();
+      try {
+        if (prefix.isNotEmpty) {
+          prefixPointer.asTypedList(prefix.length).setAll(0, prefix);
+        }
+        final result = native.dart_http_native_client_websocket_send_binary_native_prefixed(
+          _transport._clientId,
+          _socketId,
+          prefixPointer,
+          prefix.length,
+          transfer.descriptor.cast(),
+        );
+        if (result != 0) {
+          transfer.markAdopted();
+        } else {
+          transfer.close();
+        }
+        return result > 0 ? result : 0;
+      } catch (_) {
+        transfer.close();
+        rethrow;
+      } finally {
+        if (prefixPointer != nullptr) calloc.free(prefixPointer);
+      }
+    }).whenComplete(() {
+      if (!lease.isClosed) lease.close();
+    });
+  }
 
   @override
   Future<void> close([int? code, String? reason]) async {

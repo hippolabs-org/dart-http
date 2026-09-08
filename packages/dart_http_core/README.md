@@ -20,7 +20,8 @@ same contract model.
 - `JsonEncodable`, `JsonSchema`, and `JsonSchemaRegistry` for schema-driven
   request and response metadata
 - `WebSocketOptions`, `WebSocketContext`, `WebSocketMessage`, and related route
-  definitions for text, JSON, and binary WebSocket routes
+  definitions for text, JSON, binary, and ownership-transferring WebSocket
+  payloads, including reusable prefixes for native framed sends
 - `WebTransportContext` plus persistent unidirectional and bidirectional stream
   contracts with incremental binary payload leases
 

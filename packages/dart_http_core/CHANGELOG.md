@@ -1,3 +1,9 @@
+## 0.3.51
+
+- Add ownership-transferring outbound WebSocket binary sends, including a
+  reusable prefix for transports that can fragment without copying the leased
+  payload in Dart.
+
 ## 0.3.50
 
 - Update Native Exchange dependencies to the latest release line.

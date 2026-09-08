@@ -1,3 +1,11 @@
+## 0.2.3
+
+- Add ownership-transferring outbound WebSocket binary frames backed by Native
+  Exchange buffers.
+- Allow a reusable Dart prefix and an adopted native payload to be sent as one
+  fragmented WebSocket message without concatenating the payload in Dart.
+- Advance the native ABI to version 4 for the adopted-buffer send entry point.
+
 ## 0.2.2
 
 - Use `hippolabs_native_assets` 0.1.2 so precompiled artifacts are reused from

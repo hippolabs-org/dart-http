@@ -170,11 +170,58 @@ abstract interface class DartHttpClientWebSocket {
 
   Future<void> sendText(String value);
 
+  /// Sends one binary frame.
+  ///
+  /// The returned future completes only after the transport no longer reads
+  /// [value]. It does not imply that the peer received or acknowledged the
+  /// frame.
   Future<void> sendBinary(List<int> value);
 
   Future<void> sendJson(Object? value);
 
   Future<void> close([int? code, String? reason]);
+}
+
+/// Optional WebSocket capability for consuming binary payload ownership.
+///
+/// Implementations may transfer native payloads directly into their outbound
+/// queue. The lease is consumed whether the send succeeds or fails. The
+/// returned future completes once the transport no longer borrows the payload,
+/// not when the peer acknowledges it.
+abstract interface class DartHttpClientOwnedWebSocket implements DartHttpClientWebSocket {
+  /// Sends [prefix] followed by [lease] as one logical binary message.
+  ///
+  /// Native transports may use WebSocket fragmentation so the payload can be
+  /// transferred without concatenating it into another Dart buffer. [prefix]
+  /// must remain unchanged until the returned future completes.
+  Future<void> sendBinaryLease(BinaryPayloadLease lease, {List<int> prefix = const <int>[]});
+}
+
+/// Ownership-aware binary sending for every client WebSocket.
+///
+/// Native transports can implement [DartHttpClientOwnedWebSocket] to avoid a
+/// Dart byte copy. Other transports use [DartHttpClientWebSocket.sendBinary]
+/// and release the lease after that operation no longer reads its view.
+extension DartHttpClientWebSocketOwnedSending on DartHttpClientWebSocket {
+  Future<void> sendBinaryLease(BinaryPayloadLease lease, {List<int> prefix = const <int>[]}) async {
+    final socket = this;
+    if (socket is DartHttpClientOwnedWebSocket) {
+      await socket.sendBinaryLease(lease, prefix: prefix);
+      return;
+    }
+    try {
+      if (prefix.isEmpty) {
+        await sendBinary(lease.bytesView);
+      } else {
+        final combined = Uint8List(prefix.length + lease.length)
+          ..setRange(0, prefix.length, prefix)
+          ..setRange(prefix.length, prefix.length + lease.length, lease.bytesView);
+        await sendBinary(combined);
+      }
+    } finally {
+      lease.close();
+    }
+  }
 }
 
 /// Transport abstraction used by generated WebSocket client methods.

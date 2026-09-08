@@ -72,6 +72,12 @@ int64_t dart_http_native_client_websocket_send_binary(
     int64_t socket_id,
     const uint8_t* value,
     intptr_t length);
+int64_t dart_http_native_client_websocket_send_binary_native_prefixed(
+    int64_t client_id,
+    int64_t socket_id,
+    const uint8_t* prefix,
+    intptr_t prefix_length,
+    void* native_buffer);
 int64_t dart_http_native_client_websocket_close(
     int64_t client_id,
     int64_t socket_id,

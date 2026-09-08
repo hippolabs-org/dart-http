@@ -41,3 +41,25 @@ Incoming and outgoing queues are bounded. Pausing the Dart stream subscription
 stops native receive draining and applies socket backpressure. Queue capacities
 can be configured with `webSocketIncomingCapacity` and
 `webSocketOutgoingCapacity` when opening the transport.
+
+Outbound Native Exchange buffers can also move directly into the native send
+queue. The send consumes the lease on success or failure, and completes once
+the transport no longer owns the payload:
+
+```dart
+await socket.sendBinaryLease(BinaryPayloadLease.fromByteLease(nativeLease));
+```
+
+For protocols with a small header followed by a native payload, pass a reusable
+prefix. The native client sends the two buffers as fragments of one logical
+WebSocket message, so Dart never concatenates the payload:
+
+```dart
+await socket.sendBinaryLease(
+  BinaryPayloadLease.fromByteLease(nativeLease),
+  prefix: reusableHeader,
+);
+```
+
+Portable WebSocket transports support the same helper through a safe copying
+fallback.
