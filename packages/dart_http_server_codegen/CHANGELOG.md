@@ -1,3 +1,9 @@
+## Unreleased
+
+- Decode top-level JSON arrays item by item in generated clients, including
+  arrays of external schema model types.
+- Omit the JSON Schema import when a generated client has no local models.
+
 ## 0.4.1
 
 - Generate explicit server-sent event delivery semantics from

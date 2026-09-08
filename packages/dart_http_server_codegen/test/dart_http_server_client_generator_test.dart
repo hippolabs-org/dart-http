@@ -812,6 +812,38 @@ void main() {
       expect(source, contains("schemaId: 'UserDto'"));
     });
 
+    test('decodes top-level arrays of external models item by item', () {
+      const userSchema = JsonSchema.object(
+        id: 'UserDto',
+        properties: {'id': JsonSchema.string()},
+        required: ['id'],
+        additionalProperties: false,
+      );
+      final router = Router<TestServices>();
+      router.get(
+        '/users',
+        options: const RouteOptions(
+          operationId: 'listUsers',
+          success: ResponseSpec.json(schema: JsonSchema.array(items: JsonSchema.ref('UserDto'))),
+        ),
+        handler: (_) => const <Object?>[],
+      );
+
+      final spec = DartHttpClientLibrarySpec.fromRouter(
+        className: 'UsersClient',
+        router: router,
+        schemas: const [userSchema],
+        externalSchemaIds: const {'UserDto'},
+      );
+      final source = const DartHttpClientGenerator().generate(spec);
+
+      expect(source, contains('DartHttpClientResponseObject<List<UserDto>>'));
+      expect(source, contains('decoder: (value) => (value as List)'));
+      expect(source, contains('.map((item) => UserDto.decode(item))'));
+      expect(source, isNot(contains('List<UserDto>.decode')));
+      expect(source, isNot(contains("import 'package:json_schema/json_schema.dart';")));
+    });
+
     test('throws a clear error for unresolved operation schema types', () {
       final router = Router<TestServices>();
       router.get(
