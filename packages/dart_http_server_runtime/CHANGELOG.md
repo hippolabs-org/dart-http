@@ -1,6 +1,7 @@
 ## 0.3.44
 
 - Update Native Exchange dependencies to the latest release line.
+- Bump the native artifact version to 0.1.27.
 
 ## 0.3.43
 
