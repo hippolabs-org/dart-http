@@ -1,3 +1,8 @@
+## 0.3.45
+
+- Use `hippolabs_native_assets` 0.1.2 so precompiled artifacts are reused from
+  Dart's shared hook output instead of copied into build-specific directories.
+
 ## 0.3.44
 
 - Update Native Exchange dependencies to the latest release line.
