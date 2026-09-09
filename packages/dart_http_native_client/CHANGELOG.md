@@ -1,3 +1,7 @@
+## 0.2.7
+
+- Advance the native ABI for byte-stream boundary statistics.
+
 ## 0.2.6
 
 - Return exact native chunk and byte counters from byte-stream boundary fences.

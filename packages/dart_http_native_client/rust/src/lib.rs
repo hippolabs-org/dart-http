@@ -34,7 +34,7 @@ use tokio_tungstenite::tungstenite::protocol::{
 };
 use tokio_util::sync::CancellationToken;
 
-const ABI_VERSION: i32 = 5;
+const ABI_VERSION: i32 = 6;
 const REQUEST_CANCELED: &str = "Native HTTP request canceled.";
 const WEBSOCKET_EVENT_OPENED: i32 = 1;
 const WEBSOCKET_EVENT_TEXT: i32 = 2;
