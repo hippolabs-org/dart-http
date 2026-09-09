@@ -1,3 +1,8 @@
+## 0.3.57
+
+- Add an optional close-aware WebSocket capability that exposes the peer's
+  close code and reason without breaking existing transports.
+
 ## 0.3.56
 
 - Add bounded queued base64 text sends and native-owned base64 text stream-pump

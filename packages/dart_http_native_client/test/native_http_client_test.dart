@@ -446,6 +446,29 @@ void main() {
     prefixedLease.close();
   });
 
+  test('exposes the peer WebSocket close code and reason', () async {
+    server.listen((request) async {
+      final socket = await WebSocketTransformer.upgrade(request);
+      await socket.close(1008, 'Session revoked');
+    });
+
+    final socket = await transport.connect(
+      DartHttpClientWebSocketRequest(
+        uri: Uri.parse('ws://${server.address.host}:${server.port}/native-close'),
+      ),
+    );
+    final nativeSocket = socket as NativeHttpWebSocket;
+
+    await socket.messages.drain<void>();
+
+    expect(
+      nativeSocket.closeDetails,
+      isA<DartHttpClientWebSocketCloseDetails>()
+          .having((details) => details.code, 'code', 1008)
+          .having((details) => details.reason, 'reason', 'Session revoked'),
+    );
+  });
+
   test('reports a WebSocket opening failure only through connect', () async {
     final resetServer = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
     var acceptedConnections = 0;

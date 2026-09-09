@@ -1,3 +1,8 @@
+## 0.2.17
+
+- Expose the peer WebSocket close code and reason through the optional
+  close-aware client capability.
+
 ## 0.2.16
 
 - Drive streamed Reqwest response bodies directly on Tokio with demand-based

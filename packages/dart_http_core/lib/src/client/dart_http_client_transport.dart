@@ -275,6 +275,22 @@ abstract interface class DartHttpClientWebSocket {
   Future<void> close([int? code, String? reason]);
 }
 
+/// Details supplied by the peer when it closes a WebSocket connection.
+final class DartHttpClientWebSocketCloseDetails {
+  const DartHttpClientWebSocketCloseDetails({this.code, this.reason});
+
+  final int? code;
+  final String? reason;
+}
+
+/// Optional WebSocket capability exposing the peer's terminal close frame.
+///
+/// [closeDetails] remains `null` until a close frame is received. Transport
+/// failures that terminate without a close frame leave it `null`.
+abstract interface class DartHttpClientCloseAwareWebSocket implements DartHttpClientWebSocket {
+  DartHttpClientWebSocketCloseDetails? get closeDetails;
+}
+
 /// Optional WebSocket capability for consuming binary payload ownership.
 ///
 /// Implementations may transfer native payloads directly into their outbound

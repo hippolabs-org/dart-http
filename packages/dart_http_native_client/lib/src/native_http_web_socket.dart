@@ -82,7 +82,10 @@ extension on NativeHttpClientTransport {
 
 /// Active WebSocket driven by Tokio/tungstenite with leased binary frames.
 final class NativeHttpWebSocket
-    implements DartHttpClientNativeStreamWebSocket, DartHttpClientBase64TextWebSocket {
+    implements
+        DartHttpClientNativeStreamWebSocket,
+        DartHttpClientBase64TextWebSocket,
+        DartHttpClientCloseAwareWebSocket {
   NativeHttpWebSocket._(this._transport, this._socketId) {
     _controller = StreamController<WebSocketMessage>(
       sync: true,
@@ -100,6 +103,7 @@ final class NativeHttpWebSocket
   final List<int> _deferredStreamNotifications = [];
   late final StreamController<WebSocketMessage> _controller;
   String? _selectedProtocol;
+  DartHttpClientWebSocketCloseDetails? _closeDetails;
   var _listening = false;
   var _paused = false;
   var _flushing = false;
@@ -111,6 +115,9 @@ final class NativeHttpWebSocket
 
   /// Subprotocol selected by the server, when one was negotiated.
   String? get selectedProtocol => _selectedProtocol;
+
+  @override
+  DartHttpClientWebSocketCloseDetails? get closeDetails => _closeDetails;
 
   @override
   Stream<WebSocketMessage> get messages => _controller.stream;
@@ -564,6 +571,10 @@ final class NativeHttpWebSocket
             _controller.add(message);
           }
         case _webSocketEventClosed:
+          _closeDetails = DartHttpClientWebSocketCloseDetails(
+            code: value.close_code < 0 ? null : value.close_code,
+            reason: text,
+          );
           _finish();
         case _webSocketEventError:
           final error = NativeHttpClientException(text ?? 'Native WebSocket failed.');
