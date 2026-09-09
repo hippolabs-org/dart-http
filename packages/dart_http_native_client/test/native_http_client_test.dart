@@ -380,7 +380,11 @@ void main() {
 
   test('reports a WebSocket opening failure only through connect', () async {
     final resetServer = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
-    final resetSubscription = resetServer.listen((socket) => socket.destroy());
+    var acceptedConnections = 0;
+    final resetSubscription = resetServer.listen((socket) {
+      acceptedConnections++;
+      socket.destroy();
+    });
     addTearDown(() async {
       await resetSubscription.cancel();
       await resetServer.close();
@@ -402,29 +406,7 @@ void main() {
     }, (error, _) => uncaughtErrors.add(error));
 
     expect(uncaughtErrors, isEmpty);
-  });
-
-  test('retries reset native WebSocket handshakes before returning', () async {
-    var attempts = 0;
-    server.listen((request) async {
-      attempts++;
-      if (attempts < 3) {
-        final socket = await request.response.detachSocket(writeHeaders: false);
-        socket.destroy();
-        return;
-      }
-      final socket = await WebSocketTransformer.upgrade(request);
-      socket.listen(socket.add);
-    });
-
-    final socket = await transport.connect(
-      DartHttpClientWebSocketRequest(
-        uri: Uri.parse('ws://${server.address.host}:${server.port}/retry-opening'),
-      ),
-    );
-    addTearDown(socket.close);
-
-    expect(attempts, 3);
+    expect(acceptedConnections, 1);
   });
 
   test('base64-encodes an adopted native lease into one text message', () async {

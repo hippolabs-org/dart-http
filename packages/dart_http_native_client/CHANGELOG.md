@@ -1,3 +1,9 @@
+## 0.2.14
+
+- Restore single-shot native WebSocket opening semantics. Establishment remains
+  bounded and cancellable, while reconnect policy stays with feature-level
+  controllers that understand authentication and session lifecycle.
+
 ## 0.2.13
 
 - Bound process-wide HTTP concurrency and cap each host's idle connection pool
