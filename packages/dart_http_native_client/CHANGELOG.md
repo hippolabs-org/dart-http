@@ -1,3 +1,8 @@
+## 0.2.8
+
+- Preserve stream ordering when text or binary frames are deferred before the
+  first listener or while paused, delivering them before close and error.
+
 ## 0.2.7
 
 - Advance the native ABI for byte-stream boundary statistics.

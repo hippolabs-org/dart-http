@@ -1,6 +1,6 @@
 name: dart_http_native_client
 description: Async Rust HTTP transport for Dart HTTP with Native Exchange streaming.
-version: 0.2.7
+version: 0.2.8
 publish_to: "https://pub.hippolabs.org"
 repository: https://github.com/hippolabs-org/dart-http/tree/main/packages/dart_http_native_client
 

@@ -325,6 +325,11 @@ abstract final class DartHttpNative {
     }
   }
 
+  /// Releases native state after a peer-closed WebSocket has been drained.
+  static void releaseWebSocketSession(int sessionId) {
+    gen.dart_http_server_runtime_release_web_socket_session(sessionId);
+  }
+
   /// Reads one queued WebTransport connection open event from the native runtime.
   static NativeWebTransportConnection? takeWebTransportConnection(int sessionId) {
     final connectionPtr = gen.dart_http_server_runtime_take_web_transport_connection(sessionId);

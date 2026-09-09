@@ -12,6 +12,9 @@ remains the routing and control plane.
 
 Native Exchange is resolved from `pub.hippolabs.org`.
 
+Realtime transports follow the shared ordered, buffered, backpressured delivery
+contract documented in [`docs/realtime-stream-contract.md`](docs/realtime-stream-contract.md).
+
 ## Packages
 
 | Package | Description |

@@ -511,8 +511,15 @@ class DartHttp<TServices> extends Router<TServices> {
   }
 
   Future<void> _handleWebSocketClosed(int sessionId) async {
-    final session = _activeWebSocketSessions[sessionId];
-    await session?.messages.close();
+    try {
+      // Drain frames posted immediately before the terminal notification
+      // before exposing done to the route handler.
+      _drainWebSocketMessages(sessionId);
+      final session = _activeWebSocketSessions[sessionId];
+      await session?.messages.close();
+    } finally {
+      DartHttpNative.releaseWebSocketSession(sessionId);
+    }
   }
 
   Future<void> _handleWebTransportHandshake(

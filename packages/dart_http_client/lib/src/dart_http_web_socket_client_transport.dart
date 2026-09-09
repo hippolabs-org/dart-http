@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 
@@ -44,25 +45,55 @@ final class DartHttpWebSocketClientTransport implements DartHttpClientWebSocketT
       timeout: timeout,
       binaryType: binaryType,
     );
-    await socket.connection.firstWhere(
-      (state) => state is web_socket_client.Connected || state is web_socket_client.Reconnected,
-    );
-    return DartHttpWebSocketClient(socket);
+    // Subscribe before awaiting the connection state. Some servers send their
+    // first protocol frame as part of the upgrade and package:web_socket_client
+    // exposes messages through a broadcast stream, which otherwise drops that
+    // frame while this method is still waiting for Connected.
+    final client = DartHttpWebSocketClient(socket);
+    try {
+      await socket.connection.firstWhere(
+        (state) => state is web_socket_client.Connected || state is web_socket_client.Reconnected,
+      );
+      return client;
+    } on Object {
+      await client.dispose();
+      rethrow;
+    }
   }
 }
 
 /// Active WebSocket connection backed by `package:web_socket_client`.
 final class DartHttpWebSocketClient implements DartHttpClientWebSocket {
-  const DartHttpWebSocketClient(this.socket);
+  DartHttpWebSocketClient(this.socket) {
+    late final StreamSubscription<dynamic> subscription;
+    _messages = StreamController<WebSocketMessage>(
+      sync: true,
+      onPause: () => subscription.pause(),
+      onResume: () => subscription.resume(),
+      onCancel: () => subscription.cancel(),
+    );
+    subscription = socket.messages
+        .asyncMap(webSocketMessageFromPayload)
+        .listen(_messages.add, onError: _messages.addError, onDone: _messages.close);
+    _messageSubscription = subscription;
+  }
 
   final web_socket_client.WebSocket socket;
+  late final StreamController<WebSocketMessage> _messages;
+  late final StreamSubscription<dynamic> _messageSubscription;
 
   @override
-  Stream<WebSocketMessage> get messages => socket.messages.asyncMap(webSocketMessageFromPayload);
+  Stream<WebSocketMessage> get messages => _messages.stream;
 
   @override
   Future<void> close([int? code, String? reason]) async {
     socket.close(code, reason);
+  }
+
+  Future<void> dispose() async {
+    await _messageSubscription.cancel();
+    socket.close();
+    if (!_messages.isClosed) await _messages.close();
   }
 
   @override

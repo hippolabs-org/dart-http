@@ -740,6 +740,32 @@ void main() {
     expect(await receivedNativeLease.future, isTrue);
   });
 
+  test('websocket routes drain final frames before peer close', () async {
+    final received = Completer<List<String>>();
+    final app = DartHttp<void>(services: () {});
+    app.websocket(
+      '/final-frames',
+      onConnect: (socket) async {
+        final values = <String>[];
+        await for (final frame in socket.messages.frames()) {
+          values.add(frame.text);
+        }
+        received.complete(values);
+      },
+    );
+
+    final server = await app.listen(port: 0);
+    final socket = await WebSocket.connect('ws://127.0.0.1:${server.port}/final-frames');
+    addTearDown(server.close);
+
+    socket
+      ..add('first')
+      ..add('last');
+    await socket.close();
+
+    expect(await received.future.timeout(const Duration(seconds: 5)), ['first', 'last']);
+  });
+
   test('websocket guards can reject the upgrade handshake', () async {
     final app = DartHttp<void>(services: () {});
     app.websocket(

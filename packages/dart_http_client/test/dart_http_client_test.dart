@@ -254,6 +254,32 @@ void main() {
       expect(jsonDecode(second.text), {'ok': true});
     });
 
+    test('buffers a server frame sent before the first listener attaches', () async {
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(server.close);
+
+      server.listen((request) async {
+        final socket = await WebSocketTransformer.upgrade(request);
+        socket.add('session.created');
+      });
+
+      final transport = DartHttpWebSocketClientTransport(
+        backoff: const ConstantBackoff(Duration.zero),
+      );
+      final socket = await transport.connect(
+        DartHttpClientWebSocketRequest(
+          uri: Uri.parse('ws://${server.address.host}:${server.port}/immediate'),
+        ),
+      );
+      addTearDown(socket.close);
+
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      expect(
+        (await socket.messages.first.timeout(const Duration(seconds: 5))).text,
+        'session.created',
+      );
+    });
+
     test('maps typed binary payloads to binary messages', () async {
       final fromBytes = await webSocketMessageFromPayload(<int>[1, 2, 3]);
       expect(fromBytes.kind, WebSocketMessageKind.binary);

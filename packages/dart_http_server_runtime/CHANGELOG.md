@@ -1,3 +1,11 @@
+## 0.3.46
+
+- Retain peer-closed WebSocket sessions until Dart drains every queued frame,
+  then release native state after ordered stream termination.
+- Apply socket-level backpressure when the bounded Dart ingress queue is full
+  instead of closing and discarding an otherwise valid stream.
+- Bump the native artifact version to 0.1.28 for the session-release ABI.
+
 ## 0.3.45
 
 - Use `hippolabs_native_assets` 0.1.2 so precompiled artifacts are reused from

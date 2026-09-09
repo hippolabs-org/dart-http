@@ -103,6 +103,9 @@ external ffi.Pointer<NativeMultipartForm> dart_http_server_runtime_parse_multipa
   ffi.Pointer<ffi.Char> content_type,
 );
 
+@ffi.Native<ffi.Void Function(ffi.Int64)>()
+external void dart_http_server_runtime_release_web_socket_session(int session_id);
+
 @ffi.Native<ffi.Bool Function(ffi.Int64, NativeBytes)>()
 external bool dart_http_server_runtime_send_binary_stream_chunk(int request_id, NativeBytes chunk);
 

@@ -1,3 +1,8 @@
+## 0.1.10
+
+- Eagerly subscribe to portable WebSocket messages and buffer frames until the
+  generated client's first listener attaches.
+
 ## 0.1.9
 
 - Apply `Accept: text/event-stream` and `Accept-Encoding: identity` for

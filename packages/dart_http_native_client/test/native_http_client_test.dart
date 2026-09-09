@@ -183,6 +183,30 @@ void main() {
     await completed.future.timeout(const Duration(seconds: 10));
   });
 
+  test('delivers buffered frames before an immediate peer close', () async {
+    server.listen((request) async {
+      final socket = await WebSocketTransformer.upgrade(request);
+      socket
+        ..add('first')
+        ..add(<int>[1, 2, 3]);
+      await socket.close();
+    });
+    final socket = await transport.connect(
+      DartHttpClientWebSocketRequest(
+        uri: Uri.parse('ws://${server.address.host}:${server.port}/immediate-close'),
+      ),
+    );
+    addTearDown(socket.close);
+
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    final messages = await socket.messages.toList().timeout(const Duration(seconds: 5));
+    expect(messages, hasLength(2));
+    expect(messages.first.text, 'first');
+    final binary = messages.last.takeBinaryLease();
+    expect(binary.bytesView, <int>[1, 2, 3]);
+    binary.close();
+  });
+
   test('enqueues native leases and flushes one ordered fence', () async {
     server.listen((request) async {
       final socket = await WebSocketTransformer.upgrade(request);

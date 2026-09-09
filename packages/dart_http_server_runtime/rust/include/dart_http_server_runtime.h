@@ -202,6 +202,9 @@ NativeWebSocketMessage* dart_http_server_runtime_take_web_socket_message(
 void dart_http_server_runtime_free_web_socket_message(
     NativeWebSocketMessage* value);
 
+/** Releases a peer-closed WebSocket session after Dart drains its messages. */
+void dart_http_server_runtime_release_web_socket_session(int64_t session_id);
+
 NativeWebTransportConnection* dart_http_server_runtime_take_web_transport_connection(
     int64_t session_id);
 

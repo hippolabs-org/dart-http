@@ -96,7 +96,7 @@ final class NativeHttpWebSocket implements DartHttpClientNativeStreamWebSocket {
   final int _socketId;
   final Completer<void> _connected = Completer<void>();
   final Map<int, Completer<void>> _pendingOperations = {};
-  final List<int> _deferredDataNotifications = [];
+  final List<int> _deferredStreamNotifications = [];
   late final StreamController<WebSocketMessage> _controller;
   String? _selectedProtocol;
   var _listening = false;
@@ -372,9 +372,15 @@ final class NativeHttpWebSocket implements DartHttpClientNativeStreamWebSocket {
     }
     if (kind == _webSocketEventText || kind == _webSocketEventBinary) {
       if (!_discardData && (!_listening || _paused)) {
-        _deferredDataNotifications.add(kind);
+        _deferredStreamNotifications.add(kind);
         return;
       }
+    }
+    if ((kind == _webSocketEventClosed || kind == _webSocketEventError) &&
+        !_discardData &&
+        _deferredStreamNotifications.isNotEmpty) {
+      _deferredStreamNotifications.add(kind);
+      return;
     }
     _takeNativeEvent(kind);
   }
@@ -467,14 +473,14 @@ final class NativeHttpWebSocket implements DartHttpClientNativeStreamWebSocket {
     _flushing = true;
     scheduleMicrotask(() {
       try {
-        while (_deferredDataNotifications.isNotEmpty &&
+        while (_deferredStreamNotifications.isNotEmpty &&
             !_terminal &&
             (_discardData || (_listening && !_paused))) {
-          _takeNativeEvent(_deferredDataNotifications.removeAt(0));
+          _takeNativeEvent(_deferredStreamNotifications.removeAt(0));
         }
       } finally {
         _flushing = false;
-        if (_deferredDataNotifications.isNotEmpty &&
+        if (_deferredStreamNotifications.isNotEmpty &&
             !_terminal &&
             (_discardData || (_listening && !_paused))) {
           _flushDeferredData();

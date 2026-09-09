@@ -42,14 +42,14 @@ use once_cell::sync::Lazy;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Notify, mpsc, watch};
 use tower_http::cors::{Any, CorsLayer};
 use wtransport::{
     Connection as WebTransportConnection, Endpoint as WebTransportEndpoint, Identity,
     ServerConfig as WebTransportServerConfig, VarInt,
 };
 
-const DART_HTTP_SERVER_RUNTIME_NATIVE_ABI_VERSION: i32 = 19;
+const DART_HTTP_SERVER_RUNTIME_NATIVE_ABI_VERSION: i32 = 20;
 const SCHEMA_REGISTRY_URI: &str = "urn:dart-http:schema-registry";
 const DEFAULT_REALTIME_MAX_PENDING_MESSAGES: usize = 256;
 const DEFAULT_REALTIME_MAX_PENDING_BYTES: usize = 8 * 1024 * 1024;
@@ -595,6 +595,9 @@ struct WebSocketSessionState {
     max_pending_messages: usize,
     max_pending_bytes: usize,
     command_tx: mpsc::UnboundedSender<WebSocketCommand>,
+    peer_closed: bool,
+    accepting_messages: bool,
+    queue_space: Arc<Notify>,
 }
 
 struct WebSocketConnection {
@@ -1145,6 +1148,7 @@ pub extern "C" fn dart_http_server_runtime_stop_server_by_id(server_id: i64) {
             let Some(session) = sessions.remove(&session_id) else {
                 continue;
             };
+            session.queue_space.notify_waiters();
             let _ = session.command_tx.send(WebSocketCommand::Close {
                 code: Some(1012),
                 reason: Some("Server stopped".to_string()),
@@ -1508,14 +1512,18 @@ pub extern "C" fn dart_http_server_runtime_free_web_socket_connection(
 pub extern "C" fn dart_http_server_runtime_take_web_socket_message(
     session_id: i64,
 ) -> *mut NativeWebSocketMessage {
-    let mut sessions = WEB_SOCKET_SESSIONS.lock().unwrap();
-    let Some(session) = sessions.get_mut(&session_id) else {
-        return std::ptr::null_mut();
+    let (message, queue_space) = {
+        let mut sessions = WEB_SOCKET_SESSIONS.lock().unwrap();
+        let Some(session) = sessions.get_mut(&session_id) else {
+            return std::ptr::null_mut();
+        };
+        let Some(message) = session.messages.pop_front() else {
+            return std::ptr::null_mut();
+        };
+        session.pending_bytes = session.pending_bytes.saturating_sub(message.body.len());
+        (message, Arc::clone(&session.queue_space))
     };
-    let Some(message) = session.messages.pop_front() else {
-        return std::ptr::null_mut();
-    };
-    session.pending_bytes = session.pending_bytes.saturating_sub(message.body.len());
+    queue_space.notify_one();
 
     let handle = Box::new(NativeWebSocketMessageHandle::from_message(message));
     Box::into_raw(handle).cast::<NativeWebSocketMessage>()
@@ -1531,6 +1539,17 @@ pub extern "C" fn dart_http_server_runtime_free_web_socket_message(
 
     unsafe {
         let _ = Box::from_raw(value.cast::<NativeWebSocketMessageHandle>());
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn dart_http_server_runtime_release_web_socket_session(session_id: i64) {
+    let mut sessions = WEB_SOCKET_SESSIONS.lock().unwrap();
+    if sessions
+        .get(&session_id)
+        .is_some_and(|session| session.peer_closed)
+    {
+        sessions.remove(&session_id);
     }
 }
 
@@ -1948,13 +1967,15 @@ pub extern "C" fn dart_http_server_runtime_web_socket_close(
     reason: *const c_char,
 ) -> bool {
     let reason = unsafe { read_optional_c_string(reason) };
-    let command_tx = {
-        let sessions = WEB_SOCKET_SESSIONS.lock().unwrap();
-        let Some(session) = sessions.get(&session_id) else {
+    let (command_tx, queue_space) = {
+        let mut sessions = WEB_SOCKET_SESSIONS.lock().unwrap();
+        let Some(session) = sessions.get_mut(&session_id) else {
             return false;
         };
-        session.command_tx.clone()
+        session.accepting_messages = false;
+        (session.command_tx.clone(), Arc::clone(&session.queue_space))
     };
+    queue_space.notify_waiters();
 
     command_tx
         .send(WebSocketCommand::Close {
@@ -2612,6 +2633,9 @@ async fn handle_web_socket_session(
                 max_pending_messages,
                 max_pending_bytes,
                 command_tx,
+                peer_closed: false,
+                accepting_messages: true,
+                queue_space: Arc::new(Notify::new()),
             },
         );
     }
@@ -2633,7 +2657,7 @@ async fn handle_web_socket_session(
                                 kind: WebSocketMessageKind::Text,
                                 body: text.as_str().as_bytes().to_vec(),
                             },
-                        );
+                        ).await;
                         if !accepted {
                             let _ = try_send_web_socket_close(
                                 &mut socket,
@@ -2652,7 +2676,7 @@ async fn handle_web_socket_session(
                                 kind: WebSocketMessageKind::Binary,
                                 body: bytes.to_vec(),
                             },
-                        );
+                        ).await;
                         if !accepted {
                             let _ = try_send_web_socket_close(
                                 &mut socket,
@@ -2690,7 +2714,14 @@ async fn handle_web_socket_session(
         }
     }
 
-    let _ = WEB_SOCKET_SESSIONS.lock().unwrap().remove(&session_id);
+    // Keep queued frames alive until Dart handles WebSocketClosed. A prior
+    // message-ready notification can still be waiting on the isolate event
+    // loop when a fast peer sends its final frame and closes.
+    if let Some(session) = WEB_SOCKET_SESSIONS.lock().unwrap().get_mut(&session_id) {
+        session.peer_closed = true;
+        session.accepting_messages = false;
+        session.queue_space.notify_waiters();
+    }
     notify_transport_event(
         &runtime_state,
         TransportEventKind::WebSocketClosed,
@@ -3123,20 +3154,28 @@ fn response_body_with_headers(
         .unwrap_or_else(|_| Response::new(Body::from("Internal Server Error")))
 }
 
-fn push_web_socket_message(session_id: i64, message: WebSocketIncomingMessage) -> bool {
-    let mut sessions = WEB_SOCKET_SESSIONS.lock().unwrap();
-    if let Some(session) = sessions.get_mut(&session_id) {
-        let next_bytes = session.pending_bytes.saturating_add(message.body.len());
-        if session.messages.len() >= session.max_pending_messages
-            || next_bytes > session.max_pending_bytes
-        {
-            return false;
-        }
-        session.pending_bytes = next_bytes;
-        session.messages.push_back(message);
-        return true;
+async fn push_web_socket_message(session_id: i64, message: WebSocketIncomingMessage) -> bool {
+    loop {
+        let wait_for_space = {
+            let mut sessions = WEB_SOCKET_SESSIONS.lock().unwrap();
+            let Some(session) = sessions.get_mut(&session_id) else {
+                return false;
+            };
+            if !session.accepting_messages || message.body.len() > session.max_pending_bytes {
+                return false;
+            }
+            let next_bytes = session.pending_bytes.saturating_add(message.body.len());
+            if session.messages.len() < session.max_pending_messages
+                && next_bytes <= session.max_pending_bytes
+            {
+                session.pending_bytes = next_bytes;
+                session.messages.push_back(message);
+                return true;
+            }
+            Arc::clone(&session.queue_space).notified_owned()
+        };
+        wait_for_space.await;
     }
-    false
 }
 
 fn push_web_transport_datagram(session_id: i64, datagram: WebTransportIncomingDatagram) -> bool {
@@ -4971,8 +5010,8 @@ mod tests {
         assert_eq!(query.get("value").map(String::as_str), Some("bad%zz%2"));
     }
 
-    #[test]
-    fn bounds_web_socket_ingress_by_count_and_bytes() {
+    #[tokio::test]
+    async fn bounds_web_socket_ingress_by_count_and_bytes() {
         let session_id = NEXT_WEB_SOCKET_SESSION_ID.fetch_add(1, Ordering::Relaxed);
         let (command_tx, _command_rx) = mpsc::unbounded_channel();
         WEB_SOCKET_SESSIONS.lock().unwrap().insert(
@@ -4985,25 +5024,51 @@ mod tests {
                 max_pending_messages: 1,
                 max_pending_bytes: 4,
                 command_tx,
+                peer_closed: false,
+                accepting_messages: true,
+                queue_space: Arc::new(Notify::new()),
             },
         );
 
-        assert!(push_web_socket_message(
+        assert!(
+            push_web_socket_message(
+                session_id,
+                WebSocketIncomingMessage {
+                    session_id,
+                    kind: WebSocketMessageKind::Binary,
+                    body: vec![0; 4],
+                },
+            )
+            .await
+        );
+
+        let blocked = tokio::spawn(push_web_socket_message(
             session_id,
             WebSocketIncomingMessage {
                 session_id,
                 kind: WebSocketMessageKind::Binary,
-                body: vec![0; 4],
+                body: vec![1],
             },
         ));
-        assert!(!push_web_socket_message(
-            session_id,
-            WebSocketIncomingMessage {
+        tokio::task::yield_now().await;
+        assert!(!blocked.is_finished());
+
+        let first = dart_http_server_runtime_take_web_socket_message(session_id);
+        assert!(!first.is_null());
+        dart_http_server_runtime_free_web_socket_message(first);
+        assert!(blocked.await.unwrap());
+
+        assert!(
+            !push_web_socket_message(
                 session_id,
-                kind: WebSocketMessageKind::Binary,
-                body: vec![0],
-            },
-        ));
+                WebSocketIncomingMessage {
+                    session_id,
+                    kind: WebSocketMessageKind::Binary,
+                    body: vec![0; 5],
+                },
+            )
+            .await
+        );
 
         let session = WEB_SOCKET_SESSIONS
             .lock()
@@ -5011,7 +5076,7 @@ mod tests {
             .remove(&session_id)
             .unwrap();
         assert_eq!(session.messages.len(), 1);
-        assert_eq!(session.pending_bytes, 4);
+        assert_eq!(session.pending_bytes, 1);
     }
 
     #[test]
