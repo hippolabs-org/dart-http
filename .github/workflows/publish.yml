@@ -18,12 +18,12 @@ permissions:
 
 jobs:
   publish:
-    uses: hipposphere/devops/.github/workflows/publish-dart-packages.yml@24878db00be911c1847f7470de9bf4726d08b610
+    uses: hipposphere/devops/.github/workflows/publish-dart-packages.yml@48675eed293989fce446b1ad72f5a3a336a0ceee
     with:
       package_scope: ${{ inputs.package_scope }}
       dry_run: ${{ inputs.dry_run }}
       dart_version: "3.13.0"
-      devops_ref: 24878db00be911c1847f7470de9bf4726d08b610
+      devops_ref: 48675eed293989fce446b1ad72f5a3a336a0ceee
     secrets:
       pub_credentials: ${{ secrets.PUB_CREDENTIALS }}
       native_artifacts_token: ${{ secrets.NATIVE_ARTIFACTS_TOKEN }}
