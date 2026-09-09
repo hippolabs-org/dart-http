@@ -5,6 +5,16 @@ reqwest runtime owns connection pooling, request cancellation, and response
 streaming. Native Exchange bodies transfer ownership directly to Rust; network
 response chunks remain native-owned until consumed or explicitly copied.
 
+The Tokio runtime, TLS configuration, and reqwest connection pool are initialized
+once per process. Opening a transport clones the shared client handle. Apps may
+start that work early, but normal opening performs the same initialization when
+needed:
+
+```dart
+await NativeHttpClientRuntime.prewarm();
+final transport = await NativeHttpClientTransport.open();
+```
+
 The package ships native assets for Android (arm, arm64, and x64), iOS devices
 and simulators, Linux, macOS, and Windows. It requires `dart:ffi` and therefore
 does not support web builds.
@@ -20,6 +30,22 @@ transport.close();
 
 Use `sendNative` when the consumer can keep the response body in Native
 Exchange instead of materializing chunks in the Dart heap.
+
+Use `sendLeased` for a buffered native-owned body. The lease must be closed or
+transferred. Ordinary `send` wraps the same lease and creates Dart bytes only
+when `bodyBytes` is requested:
+
+```dart
+final response = await transport.sendLeased(request);
+try {
+  consume(response.body.bytesView);
+} finally {
+  response.close();
+}
+```
+
+Requests accept a `bodyLease` as well. A transferable Native Exchange lease
+moves directly into reqwest without allocating payload-sized Dart storage.
 
 The same transport implements `DartHttpClientWebSocketTransport`. Incoming
 binary frames remain Native Exchange leases until the consumer copies,
@@ -82,6 +108,33 @@ await socket.sendTextBase64Lease(
 
 The native transport performs one allocation for the final UTF-8 message. The
 portable fallback uses Dart's standard padded base64 encoder.
+
+Realtime producers can avoid a completion future for every frame by using the
+bounded native queue and one ordered fence per logical segment:
+
+```dart
+final queued = socket as DartHttpClientQueuedWebSocket;
+queued.enqueueTextBase64Lease(
+  BinaryPayloadLease.fromByteLease(nativeLease),
+  prefix: '{"type":"input_audio_buffer.append","audio":"',
+  suffix: '"}',
+);
+await queued.flush();
+```
+
+When the producer already exposes a Native Exchange byte stream, the native
+stream pump keeps every chunk, base64 allocation, and WebSocket enqueue outside
+Dart. Dart only controls segment boundaries:
+
+```dart
+final nativeSocket = socket as DartHttpClientNativeStreamWebSocket;
+final pump = nativeSocket.adoptBase64TextStream(nativeStream);
+pump.resume(
+  prefix: '{"type":"input_audio_buffer.append","audio":"',
+  suffix: '"}',
+);
+final stats = await pump.pauseAndFlush();
+```
 
 Compare the Dart and fused-native paths over a loopback WebSocket with:
 

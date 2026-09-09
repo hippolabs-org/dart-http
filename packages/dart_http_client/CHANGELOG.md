@@ -1,3 +1,8 @@
+## 0.1.11
+
+- Consume single-owner request-body leases through the portable HTTP client.
+- Require `dart_http_core` 0.3.56.
+
 ## 0.1.10
 
 - Eagerly subscribe to portable WebSocket messages and buffer frames until the

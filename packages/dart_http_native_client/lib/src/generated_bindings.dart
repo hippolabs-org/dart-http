@@ -13,12 +13,15 @@ import 'dart:ffi' as ffi;
 external int dart_http_native_client_initialize_api_dl(ffi.Pointer<ffi.Void> data);
 
 @ffi.Native<ffi.Int32 Function()>()
+external int dart_http_native_client_engine_initialize();
+
+@ffi.Native<ffi.Int32 Function()>()
 external int dart_http_native_client_abi_version();
 
 @ffi.Native<ffi.Int64 Function(ffi.Int64, ffi.Int64, ffi.Int64)>()
 external int dart_http_native_client_create(
   int completion_port,
-  int connect_timeout_ms,
+  int websocket_connect_timeout_ms,
   int request_timeout_ms,
 );
 
@@ -35,11 +38,13 @@ external void dart_http_native_client_close(int client_id);
     ffi.Pointer<ffi.Uint8>,
     ffi.IntPtr,
     ffi.Pointer<ffi.Void>,
+    ffi.Pointer<ffi.Void>,
     ffi.Int64,
     ffi.Pointer<ffi.Uint8>,
     ffi.IntPtr,
     ffi.Pointer<ffi.Uint8>,
     ffi.IntPtr,
+    ffi.Bool,
   )
 >()
 external int dart_http_native_client_start(
@@ -50,12 +55,14 @@ external int dart_http_native_client_start(
   int header_count,
   ffi.Pointer<ffi.Uint8> body,
   int body_length,
+  ffi.Pointer<ffi.Void> native_buffer,
   ffi.Pointer<ffi.Void> native_body,
   int native_body_length,
   ffi.Pointer<ffi.Uint8> native_prefix,
   int native_prefix_length,
   ffi.Pointer<ffi.Uint8> native_suffix,
   int native_suffix_length,
+  bool buffer_response,
 );
 
 @ffi.Native<ffi.Bool Function(ffi.Int64, ffi.Int64)>()
@@ -114,6 +121,31 @@ external int dart_http_native_client_websocket_send_text(
   )
 >()
 external int dart_http_native_client_websocket_send_text_base64_native(
+  int client_id,
+  int socket_id,
+  ffi.Pointer<ffi.Uint8> prefix,
+  int prefix_length,
+  ffi.Pointer<ffi.Void> native_buffer,
+  int offset,
+  int length,
+  ffi.Pointer<ffi.Uint8> suffix,
+  int suffix_length,
+);
+
+@ffi.Native<
+  ffi.Int32 Function(
+    ffi.Int64,
+    ffi.Int64,
+    ffi.Pointer<ffi.Uint8>,
+    ffi.IntPtr,
+    ffi.Pointer<ffi.Void>,
+    ffi.IntPtr,
+    ffi.IntPtr,
+    ffi.Pointer<ffi.Uint8>,
+    ffi.IntPtr,
+  )
+>()
+external int dart_http_native_client_websocket_enqueue_text_base64_native(
   int client_id,
   int socket_id,
   ffi.Pointer<ffi.Uint8> prefix,
@@ -198,6 +230,25 @@ external bool dart_http_native_client_websocket_resume_byte_stream(
   int bytes_per_payload_unit,
 );
 
+@ffi.Native<
+  ffi.Bool Function(
+    ffi.Int64,
+    ffi.Int64,
+    ffi.Pointer<ffi.Uint8>,
+    ffi.IntPtr,
+    ffi.Pointer<ffi.Uint8>,
+    ffi.IntPtr,
+  )
+>()
+external bool dart_http_native_client_websocket_resume_base64_text_stream(
+  int client_id,
+  int socket_id,
+  ffi.Pointer<ffi.Uint8> prefix,
+  int prefix_length,
+  ffi.Pointer<ffi.Uint8> suffix,
+  int suffix_length,
+);
+
 @ffi.Native<ffi.Int64 Function(ffi.Int64, ffi.Int64)>()
 external int dart_http_native_client_websocket_pause_byte_stream(int client_id, int socket_id);
 
@@ -254,9 +305,14 @@ final class NativeHttpResult extends ffi.Struct {
   @ffi.Int32()
   external int status_code;
 
-  external ffi.Pointer<ffi.Char> metadata_json;
+  external ffi.Pointer<NativeHttpHeader> headers;
+
+  @ffi.IntPtr()
+  external int header_count;
 
   external ffi.Pointer<ffi.Void> body_stream;
+
+  external ffi.Pointer<ffi.Void> body_buffer;
 
   external ffi.Pointer<ffi.Char> error;
 }

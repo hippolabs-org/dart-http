@@ -5,6 +5,55 @@ import 'package:dart_http_core/dart_http_core.dart';
 import 'package:test/test.dart';
 
 void main() {
+  test('legacy HTTP response bytes are copied and cached once', () {
+    const response = DartHttpClientResponse(
+      status: 200,
+      contentType: 'application/octet-stream',
+      bodyBytes: [9, 8, 7],
+    );
+
+    final first = response.bodyBytes;
+    final second = response.bodyBytes;
+
+    expect(first, [9, 8, 7]);
+    expect(identical(first, second), isTrue);
+  });
+
+  test('leased HTTP response materializes once and then returns cached bytes', () {
+    final lease = _TrackingByteLease([1, 2, 3]);
+    final response = DartHttpClientResponse.leased(
+      status: 200,
+      contentType: 'application/octet-stream',
+      body: lease,
+    );
+
+    expect(lease.closeCount, 0);
+    expect(response.body, '\u0001\u0002\u0003');
+    expect(lease.closeCount, 0);
+    final first = response.bodyBytes;
+    final second = response.bodyBytes;
+
+    expect(first, [1, 2, 3]);
+    expect(identical(first, second), isTrue);
+    expect(lease.closeCount, 1);
+    response.close();
+    expect(lease.closeCount, 1);
+  });
+
+  test('leased HTTP response releases unmaterialized native ownership', () {
+    final lease = _TrackingByteLease([4, 5, 6]);
+    final response = DartHttpClientResponse.leased(
+      status: 204,
+      contentType: 'application/octet-stream',
+      body: lease,
+    );
+
+    response.close();
+
+    expect(lease.closeCount, 1);
+    expect(lease.isClosed, isTrue);
+  });
+
   test('Native Exchange leases adapt without copying their byte view', () {
     final bytes = Uint8List.fromList([1, 2, 3]);
     final exchangeLease = DartByteLease(bytes);
@@ -202,6 +251,39 @@ void main() {
     ]);
     expect(lease.closeCount, 1);
   });
+}
+
+final class _TrackingByteLease implements ByteLease {
+  _TrackingByteLease(List<int> bytes) : _bytes = Uint8List.fromList(bytes);
+
+  Uint8List? _bytes;
+  int closeCount = 0;
+
+  @override
+  Uint8List get bytesView => _bytes ?? (throw StateError('Tracking lease is closed.'));
+
+  @override
+  bool get isClosed => _bytes == null;
+
+  @override
+  int get length => bytesView.length;
+
+  @override
+  void close() {
+    if (_bytes == null) return;
+    _bytes = null;
+    closeCount += 1;
+  }
+
+  @override
+  Uint8List copyBytes() => Uint8List.fromList(bytesView);
+
+  @override
+  Uint8List takeDartBytes() {
+    final bytes = copyBytes();
+    close();
+    return bytes;
+  }
 }
 
 final class _CopyingClientWebSocket implements DartHttpClientWebSocket {

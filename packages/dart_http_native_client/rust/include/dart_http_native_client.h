@@ -13,8 +13,10 @@ typedef struct NativeHttpHeader {
 typedef struct NativeHttpResult {
   bool success;
   int32_t status_code;
-  char* metadata_json;
+  NativeHttpHeader* headers;
+  intptr_t header_count;
   void* body_stream;
+  void* body_buffer;
   char* error;
 } NativeHttpResult;
 
@@ -28,10 +30,11 @@ typedef struct NativeWebSocketEvent {
 } NativeWebSocketEvent;
 
 int32_t dart_http_native_client_initialize_api_dl(void* data);
+int32_t dart_http_native_client_engine_initialize(void);
 int32_t dart_http_native_client_abi_version(void);
 int64_t dart_http_native_client_create(
     int64_t completion_port,
-    int64_t connect_timeout_ms,
+    int64_t websocket_connect_timeout_ms,
     int64_t request_timeout_ms);
 void dart_http_native_client_close(int64_t client_id);
 int64_t dart_http_native_client_start(
@@ -42,12 +45,14 @@ int64_t dart_http_native_client_start(
     intptr_t header_count,
     const uint8_t* body,
     intptr_t body_length,
+    void* native_buffer,
     void* native_body,
     int64_t native_body_length,
     const uint8_t* native_prefix,
     intptr_t native_prefix_length,
     const uint8_t* native_suffix,
-    intptr_t native_suffix_length);
+    intptr_t native_suffix_length,
+    bool buffer_response);
 bool dart_http_native_client_cancel(int64_t client_id, int64_t request_id);
 NativeHttpResult* dart_http_native_client_take_result(
     int64_t client_id,
@@ -68,6 +73,16 @@ int64_t dart_http_native_client_websocket_send_text(
     int64_t socket_id,
     const char* value);
 int64_t dart_http_native_client_websocket_send_text_base64_native(
+    int64_t client_id,
+    int64_t socket_id,
+    const uint8_t* prefix,
+    intptr_t prefix_length,
+    void* native_buffer,
+    intptr_t offset,
+    intptr_t length,
+    const uint8_t* suffix,
+    intptr_t suffix_length);
+int32_t dart_http_native_client_websocket_enqueue_text_base64_native(
     int64_t client_id,
     int64_t socket_id,
     const uint8_t* prefix,
@@ -109,6 +124,13 @@ bool dart_http_native_client_websocket_resume_byte_stream(
     intptr_t sequence_offset,
     intptr_t payload_unit_count_offset,
     intptr_t bytes_per_payload_unit);
+bool dart_http_native_client_websocket_resume_base64_text_stream(
+    int64_t client_id,
+    int64_t socket_id,
+    const uint8_t* prefix,
+    intptr_t prefix_length,
+    const uint8_t* suffix,
+    intptr_t suffix_length);
 int64_t dart_http_native_client_websocket_pause_byte_stream(
     int64_t client_id,
     int64_t socket_id);

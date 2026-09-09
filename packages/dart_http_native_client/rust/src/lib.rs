@@ -36,7 +36,7 @@ use tokio_tungstenite::tungstenite::protocol::{
 };
 use tokio_util::sync::CancellationToken;
 
-const ABI_VERSION: i32 = 7;
+const ABI_VERSION: i32 = 9;
 const REQUEST_CANCELED: &str = "Native HTTP request canceled.";
 const WEBSOCKET_EVENT_OPENED: i32 = 1;
 const WEBSOCKET_EVENT_TEXT: i32 = 2;
@@ -44,14 +44,14 @@ const WEBSOCKET_EVENT_BINARY: i32 = 3;
 const WEBSOCKET_EVENT_CLOSED: i32 = 4;
 const WEBSOCKET_EVENT_ERROR: i32 = 5;
 const WEBSOCKET_EVENT_SENT: i32 = 6;
+const SHARED_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
-static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
-    Builder::new_multi_thread()
-        .enable_all()
-        .thread_name("dart-http-native")
-        .build()
-        .expect("native HTTP Tokio runtime must initialize")
-});
+struct NativeHttpEngine {
+    runtime: Runtime,
+    client: Client,
+}
+
+static ENGINE: OnceLock<Result<NativeHttpEngine, String>> = OnceLock::new();
 static CLIENTS: Lazy<Mutex<HashMap<i64, Arc<ClientState>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 static NEXT_CLIENT_ID: AtomicI64 = AtomicI64::new(1);
@@ -66,8 +66,10 @@ pub struct NativeHttpHeader {
 pub struct NativeHttpResult {
     success: bool,
     status_code: i32,
-    metadata_json: *mut c_char,
+    headers: *mut NativeHttpHeader,
+    header_count: isize,
     body_stream: *mut c_void,
+    body_buffer: *mut c_void,
     error: *mut c_char,
 }
 
@@ -84,6 +86,7 @@ pub struct NativeWebSocketEvent {
 struct ClientState {
     client: Client,
     connect_timeout: Duration,
+    request_timeout: Duration,
     completion_port: NativeCompletionPort,
     next_request_id: AtomicI64,
     next_socket_id: AtomicI64,
@@ -150,7 +153,12 @@ enum WebSocketByteStreamControl {
     Stop,
 }
 
-struct WebSocketByteStreamFraming {
+enum WebSocketByteStreamFraming {
+    Binary(WebSocketBinaryStreamFraming),
+    Base64Text { prefix: String, suffix: String },
+}
+
+struct WebSocketBinaryStreamFraming {
     prefix: Vec<u8>,
     sequence_offset: Option<usize>,
     payload_unit_count_offset: Option<usize>,
@@ -333,17 +341,39 @@ unsafe impl Sync for AdoptedBufferOwner {}
 
 struct ResponseData {
     status: i32,
-    metadata_json: String,
+    headers: Vec<(String, String)>,
     body_stream: Option<usize>,
+    body_buffer: Option<Bytes>,
 }
 
 impl ResponseData {
     fn into_ffi(mut self) -> NativeHttpResult {
+        let headers = std::mem::take(&mut self.headers)
+            .into_iter()
+            .map(|(name, value)| NativeHttpHeader {
+                name: c_string(name),
+                value: c_string(value),
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let header_count = headers.len() as isize;
+        let headers = if headers.is_empty() {
+            ptr::null_mut()
+        } else {
+            Box::into_raw(headers).cast::<NativeHttpHeader>()
+        };
+        let body_buffer = self
+            .body_buffer
+            .take()
+            .map(|bytes| Box::into_raw(Box::new(native_buffer(bytes))).cast())
+            .unwrap_or(ptr::null_mut());
         NativeHttpResult {
             success: true,
             status_code: self.status,
-            metadata_json: c_string(std::mem::take(&mut self.metadata_json)),
+            headers,
+            header_count,
             body_stream: self.body_stream.take().unwrap_or_default() as *mut c_void,
+            body_buffer,
             error: ptr::null_mut(),
         }
     }
@@ -356,6 +386,28 @@ impl Drop for ResponseData {
         };
         unsafe { release_stream_pointer(address as *mut NexByteStream) };
     }
+}
+
+fn shared_engine() -> Result<&'static NativeHttpEngine, String> {
+    ENGINE
+        .get_or_init(|| {
+            let runtime = Builder::new_multi_thread()
+                .enable_all()
+                .thread_name("dart-http-native")
+                .build()
+                .map_err(|error| format!("Could not initialize native HTTP runtime: {error}"))?;
+            let client = Client::builder()
+                .connect_timeout(SHARED_HTTP_CONNECT_TIMEOUT)
+                .build()
+                .map_err(|error| format!("Could not initialize native HTTP client: {error}"))?;
+            Ok(NativeHttpEngine { runtime, client })
+        })
+        .as_ref()
+        .map_err(Clone::clone)
+}
+
+fn shared_runtime() -> Result<&'static Runtime, String> {
+    shared_engine().map(|engine| &engine.runtime)
 }
 
 #[unsafe(no_mangle)]
@@ -373,6 +425,13 @@ pub unsafe extern "C" fn dart_http_native_client_initialize_api_dl(data: *mut c_
 }
 
 #[unsafe(no_mangle)]
+/// Initializes the process-wide Tokio runtime, TLS configuration, and reqwest
+/// connection pool. It is safe to call repeatedly and from multiple isolates.
+pub extern "C" fn dart_http_native_client_engine_initialize() -> i32 {
+    if shared_engine().is_ok() { 0 } else { -1 }
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn dart_http_native_client_abi_version() -> i32 {
     ABI_VERSION
 }
@@ -380,27 +439,24 @@ pub extern "C" fn dart_http_native_client_abi_version() -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn dart_http_native_client_create(
     completion_port: i64,
-    connect_timeout_ms: i64,
+    websocket_connect_timeout_ms: i64,
     request_timeout_ms: i64,
 ) -> i64 {
-    let Some(connect_timeout) = positive_duration(connect_timeout_ms) else {
+    let Some(connect_timeout) = positive_duration(websocket_connect_timeout_ms) else {
         return 0;
     };
     let Some(request_timeout) = positive_duration(request_timeout_ms) else {
         return 0;
     };
-    let client = match Client::builder()
-        .connect_timeout(connect_timeout)
-        .timeout(request_timeout)
-        .build()
-    {
-        Ok(client) => client,
+    let client = match shared_engine() {
+        Ok(engine) => engine.client.clone(),
         Err(_) => return 0,
     };
     let id = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
     let state = Arc::new(ClientState {
         client,
         connect_timeout,
+        request_timeout,
         completion_port: NativeCompletionPort::new(completion_port),
         next_request_id: AtomicI64::new(1),
         next_socket_id: AtomicI64::new(1),
@@ -463,12 +519,14 @@ pub unsafe extern "C" fn dart_http_native_client_start(
     header_count: isize,
     body: *const u8,
     body_length: isize,
+    native_buffer: *mut c_void,
     native_body: *mut c_void,
     native_body_length: i64,
     native_prefix: *const u8,
     native_prefix_length: isize,
     native_suffix: *const u8,
     native_suffix_length: isize,
+    buffer_response: bool,
 ) -> i64 {
     let Some(state) = client_state(client_id) else {
         return 0;
@@ -476,6 +534,9 @@ pub unsafe extern "C" fn dart_http_native_client_start(
     if state.closed.load(Ordering::Acquire) {
         return 0;
     }
+    let Ok(runtime) = shared_runtime() else {
+        return 0;
+    };
     let request = unsafe {
         prepare_request(
             &state,
@@ -485,6 +546,7 @@ pub unsafe extern "C" fn dart_http_native_client_start(
             header_count,
             body,
             body_length,
+            native_buffer,
             native_body,
             native_body_length,
             native_prefix,
@@ -511,10 +573,15 @@ pub unsafe extern "C" fn dart_http_native_client_start(
     }
 
     let task_state = Arc::clone(&state);
-    RUNTIME.spawn(async move {
+    runtime.spawn(async move {
         let result = tokio::select! {
             () = cancellation.cancelled() => Err(REQUEST_CANCELED.to_owned()),
-            result = send_request(task_state.client.clone(), request, cancellation.clone()) => result,
+            result = send_request(
+                task_state.client.clone(),
+                request,
+                cancellation.clone(),
+                buffer_response,
+            ) => result,
         };
         complete_request(&task_state, request_id, result);
     });
@@ -562,8 +629,10 @@ pub extern "C" fn dart_http_native_client_take_result(
         Err(error) => NativeHttpResult {
             success: false,
             status_code: 0,
-            metadata_json: ptr::null_mut(),
+            headers: ptr::null_mut(),
+            header_count: 0,
             body_stream: ptr::null_mut(),
+            body_buffer: ptr::null_mut(),
             error: c_string(error),
         },
     };
@@ -583,10 +652,22 @@ pub unsafe extern "C" fn dart_http_native_client_free_result(result: *mut Native
     }
     let result = unsafe { Box::from_raw(result) };
     unsafe {
-        free_c_string(result.metadata_json);
         free_c_string(result.error);
+        if !result.headers.is_null() && result.header_count > 0 {
+            let headers = Box::from_raw(ptr::slice_from_raw_parts_mut(
+                result.headers,
+                result.header_count as usize,
+            ));
+            for header in headers.iter() {
+                free_c_string(header.name.cast_mut());
+                free_c_string(header.value.cast_mut());
+            }
+        }
         if !result.body_stream.is_null() {
             drop(Box::from_raw(result.body_stream.cast::<NexByteStream>()));
+        }
+        if !result.body_buffer.is_null() {
+            release_buffer_pointer(result.body_buffer.cast::<NexBuffer>());
         }
     }
 }
@@ -654,7 +735,10 @@ pub unsafe extern "C" fn dart_http_native_client_websocket_connect(
         return 0;
     }
     let task_state = Arc::clone(&state);
-    RUNTIME.spawn(async move {
+    let Ok(runtime) = shared_runtime() else {
+        return 0;
+    };
+    runtime.spawn(async move {
         run_web_socket(
             task_state,
             socket_id,
@@ -770,6 +854,96 @@ pub unsafe extern "C" fn dart_http_native_client_websocket_send_text_base64_nati
     match enqueue_web_socket_message(client_id, socket_id, Message::Text(text.into())) {
         0 => -1,
         operation_id => operation_id,
+    }
+}
+
+#[unsafe(no_mangle)]
+/// Base64-encodes and enqueues one adopted Native Exchange buffer without a
+/// per-send completion. Return and ownership semantics match
+/// `dart_http_native_client_websocket_enqueue_binary_native_prefixed`.
+///
+/// # Safety
+///
+/// String pointers must contain readable UTF-8 bytes. `native_buffer` must
+/// point to a live, thread-safe `NexBuffer` descriptor until this call returns.
+pub unsafe extern "C" fn dart_http_native_client_websocket_enqueue_text_base64_native(
+    client_id: i64,
+    socket_id: i64,
+    prefix: *const u8,
+    prefix_length: isize,
+    native_buffer: *mut c_void,
+    offset: isize,
+    length: isize,
+    suffix: *const u8,
+    suffix_length: isize,
+) -> i32 {
+    if native_buffer.is_null() {
+        return 0;
+    }
+    let descriptor_pointer = native_buffer.cast::<NexBuffer>();
+    let descriptor = unsafe { &*descriptor_pointer };
+    if !descriptor.is_valid() || descriptor.capabilities & NEX_CAPABILITY_THREAD_SAFE == 0 {
+        return 0;
+    }
+    let (Ok(offset), Ok(length)) = (usize::try_from(offset), usize::try_from(length)) else {
+        return 0;
+    };
+    let Some(end) = offset.checked_add(length) else {
+        return 0;
+    };
+    if end > descriptor.len {
+        return 0;
+    }
+    let prefix = match unsafe { copy_optional_bytes(prefix, prefix_length) } {
+        Ok(value) => value,
+        Err(_) => return 0,
+    };
+    let suffix = match unsafe { copy_optional_bytes(suffix, suffix_length) } {
+        Ok(value) => value,
+        Err(_) => return 0,
+    };
+    let Ok(prefix) = str::from_utf8(&prefix) else {
+        return 0;
+    };
+    let Ok(suffix) = str::from_utf8(&suffix) else {
+        return 0;
+    };
+    let Some(encoded_length) = length
+        .checked_add(2)
+        .and_then(|value| value.checked_div(3))
+        .and_then(|value| value.checked_mul(4))
+    else {
+        return 0;
+    };
+    let Some(capacity) = prefix
+        .len()
+        .checked_add(encoded_length)
+        .and_then(|value| value.checked_add(suffix.len()))
+    else {
+        return 0;
+    };
+    let Some(socket) = web_socket_state(client_id, socket_id) else {
+        return 0;
+    };
+    let Ok(permit) = Arc::clone(&socket.outgoing_slots).try_acquire_owned() else {
+        return -1;
+    };
+
+    let descriptor = unsafe { ptr::read(descriptor_pointer) };
+    let bytes = Bytes::from_owner(AdoptedBufferOwner(Some(descriptor)));
+    let mut text = String::with_capacity(capacity);
+    text.push_str(prefix);
+    BASE64_STANDARD.encode_string(&bytes[offset..end], &mut text);
+    text.push_str(suffix);
+    drop(bytes);
+
+    match socket.commands.send(WebSocketCommand::Send {
+        operation_id: None,
+        messages: vec![Message::Text(text.into())],
+        permit,
+    }) {
+        Ok(()) => 1,
+        Err(_) => -2,
     }
 }
 
@@ -1009,13 +1183,57 @@ pub unsafe extern "C" fn dart_http_native_client_websocket_resume_byte_stream(
     };
     pump.controls
         .send(WebSocketByteStreamControl::Resume(
-            WebSocketByteStreamFraming {
+            WebSocketByteStreamFraming::Binary(WebSocketBinaryStreamFraming {
                 prefix,
                 sequence_offset: sequence_offset.ok().flatten(),
                 payload_unit_count_offset: payload_unit_count_offset.ok().flatten(),
                 bytes_per_payload_unit: bytes_per_payload_unit as usize,
                 sequence: 0,
-            },
+            }),
+        ))
+        .is_ok()
+}
+
+#[unsafe(no_mangle)]
+/// Resumes the attached stream with copied UTF-8 base64 text framing.
+///
+/// # Safety
+///
+/// String pointers may be null only when their corresponding length is zero.
+pub unsafe extern "C" fn dart_http_native_client_websocket_resume_base64_text_stream(
+    client_id: i64,
+    socket_id: i64,
+    prefix: *const u8,
+    prefix_length: isize,
+    suffix: *const u8,
+    suffix_length: isize,
+) -> bool {
+    let Some(socket) = web_socket_state(client_id, socket_id) else {
+        return false;
+    };
+    let prefix = match unsafe { copy_optional_bytes(prefix, prefix_length) } {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let suffix = match unsafe { copy_optional_bytes(suffix, suffix_length) } {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let (Ok(prefix), Ok(suffix)) = (
+        String::from_utf8(prefix.to_vec()),
+        String::from_utf8(suffix.to_vec()),
+    ) else {
+        return false;
+    };
+    let Ok(attached) = socket.byte_stream.lock() else {
+        return false;
+    };
+    let Some(pump) = attached.as_ref() else {
+        return false;
+    };
+    pump.controls
+        .send(WebSocketByteStreamControl::Resume(
+            WebSocketByteStreamFraming::Base64Text { prefix, suffix },
         ))
         .is_ok()
 }
@@ -1276,7 +1494,11 @@ fn run_web_socket_byte_stream(
     loop {
         if framing.is_none() {
             match controls.recv() {
-                Ok(WebSocketByteStreamControl::Resume(value)) => framing = Some(value),
+                Ok(WebSocketByteStreamControl::Resume(value)) => {
+                    stats.chunks.store(0, Ordering::Release);
+                    stats.bytes.store(0, Ordering::Release);
+                    framing = Some(value);
+                }
                 Ok(WebSocketByteStreamControl::Pause { operation_id }) => {
                     if commands
                         .send(WebSocketCommand::Fence { operation_id })
@@ -1358,36 +1580,75 @@ fn run_web_socket_byte_stream(
             pending = Some(bytes);
             continue;
         };
-        if bytes.len() % active_framing.bytes_per_payload_unit != 0 {
-            let _ = commands.send(WebSocketCommand::PumpError(
-                "Native WebSocket stream chunk is not aligned to its payload unit size.".to_owned(),
-            ));
-            return;
-        }
-        let mut prefix = active_framing.prefix.clone();
-        if let Some(offset) = active_framing.sequence_offset {
-            prefix[offset..offset + 8].copy_from_slice(&active_framing.sequence.to_be_bytes());
-        }
-        if let Some(offset) = active_framing.payload_unit_count_offset {
-            let count = bytes.len() / active_framing.bytes_per_payload_unit;
-            let Ok(count) = u32::try_from(count) else {
-                let _ = commands.send(WebSocketCommand::PumpError(
-                    "Native WebSocket stream chunk payload unit count exceeds u32.".to_owned(),
-                ));
-                return;
-            };
-            prefix[offset..offset + 4].copy_from_slice(&count.to_be_bytes());
-        }
         let byte_count = bytes.len() as u64;
-        let messages = if prefix.is_empty() {
-            vec![Message::Binary(bytes)]
-        } else {
-            vec![
-                Message::Frame(Frame::message(prefix, OpCode::Data(Data::Binary), false)),
-                Message::Frame(Frame::message(bytes, OpCode::Data(Data::Continue), true)),
-            ]
+        let messages = match active_framing {
+            WebSocketByteStreamFraming::Binary(active_framing) => {
+                if bytes.len() % active_framing.bytes_per_payload_unit != 0 {
+                    let _ = commands.send(WebSocketCommand::PumpError(
+                        "Native WebSocket stream chunk is not aligned to its payload unit size."
+                            .to_owned(),
+                    ));
+                    return;
+                }
+                let mut prefix = active_framing.prefix.clone();
+                if let Some(offset) = active_framing.sequence_offset {
+                    prefix[offset..offset + 8]
+                        .copy_from_slice(&active_framing.sequence.to_be_bytes());
+                }
+                if let Some(offset) = active_framing.payload_unit_count_offset {
+                    let count = bytes.len() / active_framing.bytes_per_payload_unit;
+                    let Ok(count) = u32::try_from(count) else {
+                        let _ = commands.send(WebSocketCommand::PumpError(
+                            "Native WebSocket stream chunk payload unit count exceeds u32."
+                                .to_owned(),
+                        ));
+                        return;
+                    };
+                    prefix[offset..offset + 4].copy_from_slice(&count.to_be_bytes());
+                }
+                active_framing.sequence += 1;
+                if prefix.is_empty() {
+                    vec![Message::Binary(bytes)]
+                } else {
+                    vec![
+                        Message::Frame(Frame::message(prefix, OpCode::Data(Data::Binary), false)),
+                        Message::Frame(Frame::message(bytes, OpCode::Data(Data::Continue), true)),
+                    ]
+                }
+            }
+            WebSocketByteStreamFraming::Base64Text { prefix, suffix } => {
+                let Some(encoded_length) = bytes
+                    .len()
+                    .checked_add(2)
+                    .and_then(|value| value.checked_div(3))
+                    .and_then(|value| value.checked_mul(4))
+                else {
+                    let _ = commands.send(WebSocketCommand::PumpError(
+                        "Native WebSocket base64 stream chunk is too large.".to_owned(),
+                    ));
+                    return;
+                };
+                let Some(capacity) = prefix
+                    .len()
+                    .checked_add(encoded_length)
+                    .and_then(|value| value.checked_add(suffix.len()))
+                else {
+                    let _ = commands.send(WebSocketCommand::PumpError(
+                        "Native WebSocket base64 text message is too large.".to_owned(),
+                    ));
+                    return;
+                };
+                let mut text = String::with_capacity(capacity);
+                text.push_str(prefix);
+                BASE64_STANDARD.encode_string(&bytes, &mut text);
+                text.push_str(suffix);
+                vec![Message::Text(text.into())]
+            }
         };
-        let Ok(permit) = RUNTIME.block_on(Arc::clone(&outgoing_slots).acquire_owned()) else {
+        let Ok(runtime) = shared_runtime() else {
+            return;
+        };
+        let Ok(permit) = runtime.block_on(Arc::clone(&outgoing_slots).acquire_owned()) else {
             return;
         };
         if commands
@@ -1402,7 +1663,6 @@ fn run_web_socket_byte_stream(
         }
         stats.chunks.fetch_add(1, Ordering::Release);
         stats.bytes.fetch_add(byte_count, Ordering::Release);
-        active_framing.sequence += 1;
     }
 }
 
@@ -1699,7 +1959,7 @@ fn web_socket_event_to_ffi(socket_id: i64, event: WebSocketEventData) -> NativeW
         }
         WebSocketEventData::Binary(bytes) => {
             value.kind = WEBSOCKET_EVENT_BINARY;
-            value.binary_buffer = Box::into_raw(Box::new(web_socket_buffer(bytes))).cast();
+            value.binary_buffer = Box::into_raw(Box::new(native_buffer(bytes))).cast();
         }
         WebSocketEventData::Closed { code, reason } => {
             value.kind = WEBSOCKET_EVENT_CLOSED;
@@ -1720,7 +1980,7 @@ fn web_socket_event_to_ffi(socket_id: i64, event: WebSocketEventData) -> NativeW
     value
 }
 
-fn web_socket_buffer(bytes: Bytes) -> NexBuffer {
+fn native_buffer(bytes: Bytes) -> NexBuffer {
     let context = Box::new(ResponseBufferContext { bytes });
     NexBuffer {
         abi_version: NEX_ABI_VERSION,
@@ -1742,6 +2002,7 @@ unsafe fn prepare_request(
     header_count: isize,
     body: *const u8,
     body_length: isize,
+    native_buffer: *mut c_void,
     native_body: *mut c_void,
     native_body_length: i64,
     native_prefix: *const u8,
@@ -1749,11 +2010,17 @@ unsafe fn prepare_request(
     native_suffix: *const u8,
     native_suffix_length: isize,
 ) -> Result<(reqwest::Request, Option<RequestStreamCancel>), String> {
+    if !native_buffer.is_null() && !native_body.is_null() {
+        return Err("A request cannot contain both a native buffer and native stream.".to_owned());
+    }
     let method = Method::from_bytes(unsafe { required_c_str(method, "method")? }.as_bytes())
         .map_err(|error| format!("Invalid HTTP method: {error}"))?;
     let url = Url::parse(&unsafe { required_c_str(url, "URL")? })
         .map_err(|error| format!("Invalid HTTP URL: {error}"))?;
-    let mut builder = state.client.request(method, url);
+    let mut builder = state
+        .client
+        .request(method, url)
+        .timeout(state.request_timeout);
     for (name, value) in unsafe { read_headers(headers, header_count)? } {
         builder = builder.header(name, value);
     }
@@ -1762,7 +2029,24 @@ unsafe fn prepare_request(
         .build()
         .map_err(|error| format!("Could not build HTTP request: {error}"))?;
     let mut body_cancel = None;
-    if !native_body.is_null() {
+    if !native_buffer.is_null() {
+        let descriptor_pointer = native_buffer.cast::<NexBuffer>();
+        let descriptor = unsafe { &*descriptor_pointer };
+        if !descriptor.is_valid() || descriptor.capabilities & NEX_CAPABILITY_THREAD_SAFE == 0 {
+            return Err("Native request buffer is invalid or not thread safe.".to_owned());
+        }
+        let descriptor = unsafe { ptr::read(descriptor_pointer) };
+        let length = descriptor.len;
+        let bytes = Bytes::from_owner(AdoptedBufferOwner(Some(descriptor)));
+        *request.body_mut() = Some(Body::from(bytes));
+        request.headers_mut().insert(
+            reqwest::header::CONTENT_LENGTH,
+            length
+                .to_string()
+                .parse()
+                .expect("a buffer length is a valid header value"),
+        );
+    } else if !native_body.is_null() {
         let prefix = unsafe { copy_optional_bytes(native_prefix, native_prefix_length)? };
         let suffix = unsafe { copy_optional_bytes(native_suffix, native_suffix_length)? };
         let descriptor = unsafe { ptr::read(native_body.cast::<NexByteStream>()) };
@@ -1795,29 +2079,31 @@ unsafe fn prepare_request(
 
 fn native_request_body(stream: AdoptedRequestStream, prefix: Vec<u8>, suffix: Vec<u8>) -> Body {
     let (sender, receiver) = mpsc::channel::<Result<Bytes, io::Error>>(1);
-    RUNTIME.spawn_blocking(move || {
-        if !prefix.is_empty() && sender.blocking_send(Ok(Bytes::from(prefix))).is_err() {
-            return;
-        }
-        let reader = stream.reader();
-        loop {
-            match reader.read_next() {
-                Ok(RequestStreamRead::Chunk(bytes)) => {
-                    if !bytes.is_empty() && sender.blocking_send(Ok(bytes)).is_err() {
+    shared_runtime()
+        .expect("native HTTP engine was initialized before preparing a request")
+        .spawn_blocking(move || {
+            if !prefix.is_empty() && sender.blocking_send(Ok(Bytes::from(prefix))).is_err() {
+                return;
+            }
+            let reader = stream.reader();
+            loop {
+                match reader.read_next() {
+                    Ok(RequestStreamRead::Chunk(bytes)) => {
+                        if !bytes.is_empty() && sender.blocking_send(Ok(bytes)).is_err() {
+                            return;
+                        }
+                    }
+                    Ok(RequestStreamRead::Done) => break,
+                    Err(error) => {
+                        let _ = sender.blocking_send(Err(io::Error::other(error)));
                         return;
                     }
                 }
-                Ok(RequestStreamRead::Done) => break,
-                Err(error) => {
-                    let _ = sender.blocking_send(Err(io::Error::other(error)));
-                    return;
-                }
             }
-        }
-        if !suffix.is_empty() {
-            let _ = sender.blocking_send(Ok(Bytes::from(suffix)));
-        }
-    });
+            if !suffix.is_empty() {
+                let _ = sender.blocking_send(Ok(Bytes::from(suffix)));
+            }
+        });
     Body::wrap_stream(ReceiverStream::new(receiver))
 }
 
@@ -1825,6 +2111,7 @@ async fn send_request(
     client: Client,
     request: reqwest::Request,
     cancellation: CancellationToken,
+    buffer_response: bool,
 ) -> Result<ResponseData, String> {
     let response = client
         .execute(request)
@@ -1834,21 +2121,40 @@ async fn send_request(
     let headers = response
         .headers()
         .iter()
-        .map(|(name, value)| serde_json::json!([name.as_str(), value.to_str().unwrap_or_default()]))
+        .map(|(name, value)| {
+            (
+                name.as_str().to_owned(),
+                value.to_str().unwrap_or_default().to_owned(),
+            )
+        })
         .collect::<Vec<_>>();
-    let metadata_json = serde_json::json!({"headers": headers}).to_string();
+    if buffer_response {
+        let body_bytes = response
+            .bytes()
+            .await
+            .map_err(|error| format!("Native HTTP response failed: {error}"))?;
+        return Ok(ResponseData {
+            status,
+            headers,
+            body_stream: None,
+            body_buffer: Some(body_bytes),
+        });
+    }
     let body_stream = response_stream(response, cancellation);
     Ok(ResponseData {
         status,
-        metadata_json,
+        headers,
         body_stream: Some(Box::into_raw(Box::new(body_stream)) as usize),
+        body_buffer: None,
     })
 }
 
 fn response_stream(response: reqwest::Response, cancellation: CancellationToken) -> NexByteStream {
     let (sender, receiver) = mpsc::channel::<Result<Bytes, String>>(1);
     let stream_cancel = cancellation.clone();
-    RUNTIME.spawn(async move {
+    shared_runtime()
+        .expect("native HTTP engine was initialized before streaming a response")
+        .spawn(async move {
         use futures_util::StreamExt;
         let mut body = response.bytes_stream();
         loop {
@@ -1866,7 +2172,7 @@ fn response_stream(response: reqwest::Response, cancellation: CancellationToken)
                 }
             }
         }
-    });
+        });
     let context = Box::new(ResponseStreamContext {
         receiver: Mutex::new(receiver),
         cancellation,
@@ -2147,7 +2453,7 @@ unsafe fn initialize_dart_api_dl(data: *mut c_void) -> Result<(), String> {
         ));
     }
     let function = unsafe { api.lookup("Dart_PostInteger")? };
-    DART_API
+    if DART_API
         .set(DartApi {
             post_integer: unsafe {
                 std::mem::transmute::<*const c_void, unsafe extern "C" fn(i64, i64) -> bool>(
@@ -2155,7 +2461,12 @@ unsafe fn initialize_dart_api_dl(data: *mut c_void) -> Result<(), String> {
                 )
             },
         })
-        .map_err(|_| "Dart API DL initialization raced.".to_owned())
+        .is_err()
+        && DART_API.get().is_none()
+    {
+        return Err("Dart API DL initialization raced without a winner.".to_owned());
+    }
+    Ok(())
 }
 
 impl Api {

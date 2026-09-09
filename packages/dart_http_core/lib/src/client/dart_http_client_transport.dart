@@ -42,17 +42,23 @@ final class DartHttpClientRequest {
     this.headers = const <String, String>{},
     this.body,
     this.bodyBytes,
+    this.bodyLease,
     this.bodyStream,
     this.bodyStreamLength,
     this.nativeBody,
     this.abortTrigger,
     this.responseMode = DartHttpClientResponseMode.buffered,
   }) : assert(
-         bodyStream == null || (body == null && bodyBytes == null),
-         'bodyStream cannot be combined with body or bodyBytes.',
+         bodyStream == null || (body == null && bodyBytes == null && bodyLease == null),
+         'bodyStream cannot be combined with another request body.',
        ),
        assert(
-         nativeBody == null || (body == null && bodyBytes == null && bodyStream == null),
+         bodyLease == null || (body == null && bodyBytes == null && bodyStream == null),
+         'bodyLease cannot be combined with another request body.',
+       ),
+       assert(
+         nativeBody == null ||
+             (body == null && bodyBytes == null && bodyLease == null && bodyStream == null),
          'nativeBody cannot be combined with another request body.',
        );
 
@@ -61,6 +67,9 @@ final class DartHttpClientRequest {
   final Map<String, String> headers;
   final String? body;
   final List<int>? bodyBytes;
+
+  /// Single-owner request bytes that the transport must consume or release.
+  final ByteLease? bodyLease;
   final Stream<List<int>>? bodyStream;
   final int? bodyStreamLength;
   final DartHttpClientNativeBody? nativeBody;
@@ -75,6 +84,7 @@ final class DartHttpClientRequest {
     Map<String, String>? headers,
     String? body,
     List<int>? bodyBytes,
+    ByteLease? bodyLease,
     Stream<List<int>>? bodyStream,
     int? bodyStreamLength,
     DartHttpClientNativeBody? nativeBody,
@@ -87,6 +97,7 @@ final class DartHttpClientRequest {
       headers: headers ?? this.headers,
       body: body ?? this.body,
       bodyBytes: bodyBytes ?? this.bodyBytes,
+      bodyLease: bodyLease ?? this.bodyLease,
       bodyStream: bodyStream ?? this.bodyStream,
       bodyStreamLength: bodyStreamLength ?? this.bodyStreamLength,
       nativeBody: nativeBody ?? this.nativeBody,
@@ -104,16 +115,41 @@ final class DartHttpClientResponse {
     this.headers = const <String, String>{},
     this._body,
     this._bodyBytes,
-  });
+  }) : _storage = null;
+
+  /// Creates a response that already owns its Dart byte representation.
+  DartHttpClientResponse.ownedBytes({
+    required this.status,
+    required this.contentType,
+    this.headers = const <String, String>{},
+    required Uint8List bodyBytes,
+  }) : _body = null,
+       _bodyBytes = null,
+       _storage = _DartHttpClientResponseBodyStorage.dartBytes(bodyBytes);
+
+  /// Creates a response whose bytes remain leased until materialized or closed.
+  DartHttpClientResponse.leased({
+    required this.status,
+    required this.contentType,
+    this.headers = const <String, String>{},
+    required ByteLease body,
+  }) : _body = null,
+       _bodyBytes = null,
+       _storage = _DartHttpClientResponseBodyStorage.leased(body);
 
   final int status;
   final String contentType;
   final Map<String, String> headers;
   final String? _body;
   final List<int>? _bodyBytes;
+  final _DartHttpClientResponseBodyStorage? _storage;
 
   /// Response body decoded as UTF-8 text.
   String get body {
+    final storage = _storage;
+    if (storage != null) {
+      return storage.text;
+    }
     final body = _body;
     if (body != null) {
       return body;
@@ -123,11 +159,66 @@ final class DartHttpClientResponse {
 
   /// Raw response body bytes.
   Uint8List get bodyBytes {
+    final storage = _storage;
+    if (storage != null) {
+      return storage.bytes;
+    }
+    final cached = _legacyResponseByteCache[this];
+    if (cached != null) return cached;
     final bytes = _bodyBytes;
     if (bytes != null) {
-      return Uint8List.fromList(bytes);
+      return _legacyResponseByteCache[this] = Uint8List.fromList(bytes);
     }
-    return Uint8List.fromList(utf8.encode(_body ?? ''));
+    return _legacyResponseByteCache[this] = Uint8List.fromList(utf8.encode(_body ?? ''));
+  }
+
+  /// Releases a native body that has not been materialized.
+  void close() => _storage?.close();
+}
+
+final Expando<Uint8List> _legacyResponseByteCache = Expando<Uint8List>(
+  'DartHttpClientResponse.bodyBytes',
+);
+
+final class _DartHttpClientResponseBodyStorage {
+  _DartHttpClientResponseBodyStorage.dartBytes(Uint8List bytes) : _bytes = bytes, _lease = null;
+
+  _DartHttpClientResponseBodyStorage.leased(ByteLease lease) : _lease = lease;
+
+  ByteLease? _lease;
+  Uint8List? _bytes;
+  String? _text;
+  bool _closed = false;
+
+  String get text {
+    final text = _text;
+    if (text != null) return text;
+    final ownedBytes = _bytes;
+    if (ownedBytes != null) {
+      return _text = utf8.decode(ownedBytes, allowMalformed: true);
+    }
+    if (_closed) throw StateError('HTTP response body is closed.');
+    final bytes = _lease?.bytesView ?? Uint8List(0);
+    return _text = utf8.decode(bytes, allowMalformed: true);
+  }
+
+  Uint8List get bytes {
+    final bytes = _bytes;
+    if (bytes != null) return bytes;
+    if (_closed) throw StateError('HTTP response body is closed.');
+    final lease = _lease;
+    if (lease != null) {
+      _lease = null;
+      return _bytes = lease.takeDartBytes();
+    }
+    return _bytes = Uint8List.fromList(utf8.encode(_text ?? ''));
+  }
+
+  void close() {
+    if (_closed) return;
+    _closed = true;
+    _lease?.close();
+    _lease = null;
   }
 }
 
@@ -239,6 +330,19 @@ abstract interface class DartHttpClientQueuedWebSocket implements DartHttpClient
   /// throw synchronously when their bounded outbound payload queue is full.
   void enqueueBinaryLease(BinaryPayloadLease lease, {List<int> prefix = const <int>[]});
 
+  /// Base64-encodes [lease] between [prefix] and [suffix] and enqueues the
+  /// resulting text message without creating a per-message completion.
+  ///
+  /// The lease is consumed on both success and failure. Implementations must
+  /// throw synchronously when their bounded outbound payload queue is full.
+  void enqueueTextBase64Lease(
+    BinaryPayloadLease lease, {
+    String prefix = '',
+    String suffix = '',
+    int offset = 0,
+    int? length,
+  });
+
   /// Waits until all messages enqueued before this call have been flushed.
   Future<void> flush();
 }
@@ -267,6 +371,19 @@ abstract interface class DartHttpClientNativeWebSocketByteStream {
   void close();
 }
 
+/// A native byte stream encoded and framed as one WebSocket text message per
+/// producer chunk without exposing those chunks to Dart.
+abstract interface class DartHttpClientNativeWebSocketBase64TextStream {
+  /// Starts routing chunks as [prefix] + padded base64 + [suffix].
+  void resume({String prefix = '', String suffix = ''});
+
+  /// Pauses pulls and completes after previously accepted chunks are flushed.
+  Future<DartHttpClientNativeWebSocketByteStreamStats> pauseAndFlush();
+
+  /// Cancels and releases the adopted producer stream natively.
+  void close();
+}
+
 /// Counters for the segment completed by a native byte-stream boundary fence.
 final class DartHttpClientNativeWebSocketByteStreamStats {
   const DartHttpClientNativeWebSocketByteStreamStats({
@@ -283,6 +400,9 @@ abstract interface class DartHttpClientNativeStreamWebSocket
     implements DartHttpClientQueuedWebSocket {
   /// Transfers [stream] into a paused native WebSocket pump.
   DartHttpClientNativeWebSocketByteStream adoptByteStream(ByteStreamLease stream);
+
+  /// Transfers [stream] into a paused native base64-text WebSocket pump.
+  DartHttpClientNativeWebSocketBase64TextStream adoptBase64TextStream(ByteStreamLease stream);
 }
 
 /// Ownership-aware binary sending for every client WebSocket.

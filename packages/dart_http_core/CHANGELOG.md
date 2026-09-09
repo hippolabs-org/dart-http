@@ -1,3 +1,10 @@
+## 0.3.56
+
+- Add bounded queued base64 text sends and native-owned base64 text stream-pump
+  contracts for realtime binary producers.
+- Add single-owner request-body leases and lazily materialized response leases.
+- Cache owned response bytes so compatibility access does not copy repeatedly.
+
 ## 0.3.55
 
 - Add an ownership-consuming base64 text WebSocket send capability with a

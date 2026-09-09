@@ -1,3 +1,16 @@
+## 0.2.10
+
+- Share one process-wide Tokio runtime, reqwest connection pool, and TLS client
+  across transport handles, with optional asynchronous prewarming.
+- Return buffered responses as Native Exchange leases and materialize Dart
+  compatibility bytes lazily and at most once.
+- Transfer Native Exchange request buffers directly into reqwest.
+- Replace JSON response metadata with typed header descriptors.
+- Add bounded fused-base64 WebSocket enqueueing and a native-owned base64 text
+  stream pump with pause/resume and ordered flush fences.
+- Keep Native Exchange response streams for explicitly streamed requests and
+  advance the combined native ABI to version 9.
+
 ## 0.2.9
 
 - Add fused native base64 text WebSocket sends for transferred Native Exchange

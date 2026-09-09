@@ -43,6 +43,155 @@ void main() {
     expect(jsonDecode(response.body), {'received': 'native request'});
   });
 
+  test('prewarms idempotently and reuses the process-wide connection pool', () async {
+    await Future.wait([NativeHttpClientRuntime.prewarm(), NativeHttpClientRuntime.prewarm()]);
+    final remotePorts = <int>[];
+    server.listen((request) async {
+      remotePorts.add(request.connectionInfo!.remotePort);
+      request.response
+        ..persistentConnection = true
+        ..write('ok');
+      await request.response.close();
+    });
+    final uri = Uri.parse('http://${server.address.host}:${server.port}/pooled');
+
+    expect(
+      (await transport.send(DartHttpClientRequest(method: HttpMethod.get, uri: uri))).body,
+      'ok',
+    );
+    transport.close();
+    transport = await NativeHttpClientTransport.open();
+    expect(
+      (await transport.send(DartHttpClientRequest(method: HttpMethod.get, uri: uri))).body,
+      'ok',
+    );
+
+    expect(remotePorts, hasLength(2));
+    expect(remotePorts[1], remotePorts[0]);
+  });
+
+  test('keeps buffered response bytes native until explicitly materialized', () async {
+    server.listen((request) async {
+      request.response
+        ..headers.set('x-native-metadata', 'typed')
+        ..add(const [1, 2, 3, 4]);
+      await request.response.close();
+    });
+
+    final response = await transport.sendLeased(
+      DartHttpClientRequest(
+        method: HttpMethod.get,
+        uri: Uri.parse('http://${server.address.host}:${server.port}/leased'),
+      ),
+    );
+
+    expect(response.headers['x-native-metadata'], 'typed');
+    expect(response.body.bytesView, const [1, 2, 3, 4]);
+    expect(response.body.isClosed, isFalse);
+    response.close();
+    expect(response.body.isClosed, isTrue);
+  });
+
+  test('materializes compatibility response bytes once', () async {
+    server.listen((request) async {
+      request.response.add(const [4, 3, 2, 1]);
+      await request.response.close();
+    });
+
+    final response = await transport.send(
+      DartHttpClientRequest(
+        method: HttpMethod.get,
+        uri: Uri.parse('http://${server.address.host}:${server.port}/compatibility'),
+      ),
+    );
+    final first = response.bodyBytes;
+    final second = response.bodyBytes;
+
+    expect(first, const [4, 3, 2, 1]);
+    expect(identical(first, second), isTrue);
+  });
+
+  test('transfers a native response lease into a request without Dart bytes', () async {
+    server.listen((request) async {
+      if (request.uri.path == '/source') {
+        request.response.add(const [8, 6, 7, 5, 3, 0, 9]);
+      } else {
+        request.response.add(
+          await request.fold<List<int>>(<int>[], (all, bytes) => all..addAll(bytes)),
+        );
+      }
+      await request.response.close();
+    });
+    final base = 'http://${server.address.host}:${server.port}';
+    final source = await transport.sendLeased(
+      DartHttpClientRequest(method: HttpMethod.get, uri: Uri.parse('$base/source')),
+    );
+
+    final echoed = await transport.send(
+      DartHttpClientRequest(
+        method: HttpMethod.post,
+        uri: Uri.parse('$base/echo'),
+        bodyLease: source.body,
+      ),
+    );
+
+    expect(source.body.isClosed, isTrue);
+    expect(echoed.bodyBytes, const [8, 6, 7, 5, 3, 0, 9]);
+  });
+
+  test('buffers concurrent immediate responses without losing completion', () async {
+    server.listen((request) async {
+      final index = request.uri.queryParameters['index'];
+      request.response
+        ..headers.contentType = ContentType.json
+        ..write(jsonEncode({'index': index}));
+      await request.response.close();
+    });
+
+    for (var batch = 0; batch < 20; batch++) {
+      final responses = await Future.wait([
+        for (var index = 0; index < 32; index++)
+          transport
+              .send(
+                DartHttpClientRequest(
+                  method: HttpMethod.get,
+                  uri: Uri.parse(
+                    'http://${server.address.host}:${server.port}/fast'
+                    '?index=$batch-$index',
+                  ),
+                ),
+              )
+              .timeout(const Duration(seconds: 5)),
+      ]);
+
+      for (var index = 0; index < responses.length; index++) {
+        expect(jsonDecode(responses[index].body), {'index': '$batch-$index'});
+      }
+    }
+  });
+
+  test('receives concurrent immediate response metadata', () async {
+    server.listen((request) async {
+      request.response.write('ok');
+      await request.response.close();
+    });
+
+    final responses = await Future.wait([
+      for (var index = 0; index < 64; index++)
+        transport
+            .sendNative(
+              DartHttpClientRequest(
+                method: HttpMethod.get,
+                uri: Uri.parse('http://${server.address.host}:${server.port}/fast/$index'),
+              ),
+            )
+            .timeout(const Duration(seconds: 5)),
+    ]);
+    for (final response in responses) {
+      response.body.close();
+    }
+  });
+
   test('streams a native response through the compatibility byte stream', () async {
     server.listen((request) async {
       request.response
@@ -285,6 +434,87 @@ void main() {
     final result = (await forwarded.future).takeBinaryLease();
     expect(result.bytesView, const <int>[9, 8, 1, 2, 3, 4]);
     result.close();
+  });
+
+  test('enqueues native base64 text without a per-message completion', () async {
+    server.listen((request) async {
+      final socket = await WebSocketTransformer.upgrade(request);
+      socket.listen(socket.add);
+    });
+    final socket = await transport.connect(
+      DartHttpClientWebSocketRequest(
+        uri: Uri.parse('ws://${server.address.host}:${server.port}/queued-base64'),
+      ),
+    );
+    addTearDown(socket.close);
+    final queued = socket as DartHttpClientQueuedWebSocket;
+
+    final first = Completer<WebSocketMessage>();
+    final second = Completer<WebSocketMessage>();
+    final subscription = socket.messages.listen((message) {
+      if (!first.isCompleted) {
+        first.complete(message);
+      } else {
+        second.complete(message);
+      }
+    });
+    addTearDown(subscription.cancel);
+    await socket.sendBinary(const <int>[0, 1, 2, 3, 4, 5]);
+    final source = (await first.future).takeBinaryLease();
+
+    queued.enqueueTextBase64Lease(source, prefix: '{"audio":"', suffix: '"}', offset: 1, length: 4);
+    expect(source.isClosed, isTrue);
+    await queued.flush();
+
+    expect((await second.future).text, '{"audio":"${base64Encode(const <int>[1, 2, 3, 4])}"}');
+  });
+
+  test('pumps a native byte stream into base64 text frames', () async {
+    final sourceBytes = <int>[for (var index = 0; index < 256 * 1024; index++) index & 0xff];
+    final receivedBytes = <int>[];
+    final receivedAll = Completer<void>();
+    server.listen((request) async {
+      if (WebSocketTransformer.isUpgradeRequest(request)) {
+        final socket = await WebSocketTransformer.upgrade(request);
+        socket.listen((message) {
+          final text = message as String;
+          expect(text, startsWith('{"audio":"'));
+          expect(text, endsWith('"}'));
+          receivedBytes.addAll(base64Decode(text.substring(10, text.length - 2)));
+          if (receivedBytes.length >= sourceBytes.length && !receivedAll.isCompleted) {
+            receivedAll.complete();
+          }
+        });
+        return;
+      }
+      for (var offset = 0; offset < sourceBytes.length; offset += 16 * 1024) {
+        request.response.add(sourceBytes.sublist(offset, offset + 16 * 1024));
+        await request.response.flush();
+      }
+      await request.response.close();
+    });
+    final socket = await transport.connect(
+      DartHttpClientWebSocketRequest(
+        uri: Uri.parse('ws://${server.address.host}:${server.port}/base64-pump'),
+      ),
+    );
+    addTearDown(socket.close);
+    final source = await transport.sendNative(
+      DartHttpClientRequest(
+        method: HttpMethod.get,
+        uri: Uri.parse('http://${server.address.host}:${server.port}/audio'),
+      ),
+    );
+    final pump = (socket as DartHttpClientNativeStreamWebSocket).adoptBase64TextStream(source.body);
+    addTearDown(pump.close);
+
+    pump.resume(prefix: '{"audio":"', suffix: '"}');
+    await receivedAll.future.timeout(const Duration(seconds: 10));
+    final stats = await pump.pauseAndFlush().timeout(const Duration(seconds: 10));
+
+    expect(receivedBytes, sourceBytes);
+    expect(stats.byteCount, sourceBytes.length);
+    expect(stats.chunkCount, greaterThan(0));
   });
 
   test('rejects sends beyond the configured bounded queue', () async {

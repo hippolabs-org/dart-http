@@ -58,7 +58,7 @@ final class DartHttpClientTransport implements HttpClientTransport {
   Future<DartHttpClientResponse> _sendWithoutInterceptors(DartHttpClientRequest request) async {
     final streamed = await _client.send(_httpRequestFrom(request));
     final response = await http.Response.fromStream(streamed);
-    return DartHttpClientResponse(
+    return DartHttpClientResponse.ownedBytes(
       status: response.statusCode,
       contentType: response.headers['content-type'] ?? '',
       headers: response.headers,
@@ -101,7 +101,9 @@ final class DartHttpClientTransport implements HttpClientTransport {
         abortTrigger: request.abortTrigger,
       )..headers.addAll(headers);
 
-      if (request.bodyBytes case final bodyBytes?) {
+      if (request.bodyLease case final bodyLease?) {
+        bufferedRequest.bodyBytes = bodyLease.takeDartBytes();
+      } else if (request.bodyBytes case final bodyBytes?) {
         bufferedRequest.bodyBytes = bodyBytes;
       } else if (request.body case final body?) {
         bufferedRequest.body = body;

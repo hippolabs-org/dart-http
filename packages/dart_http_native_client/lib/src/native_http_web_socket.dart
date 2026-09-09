@@ -107,7 +107,7 @@ final class NativeHttpWebSocket
   var _terminal = false;
   var _closing = false;
   var _queuedOperations = 0;
-  _NativeHttpWebSocketByteStream? _byteStream;
+  _NativeHttpWebSocketAdoptedStream? _byteStream;
 
   /// Subprotocol selected by the server, when one was negotiated.
   String? get selectedProtocol => _selectedProtocol;
@@ -332,12 +332,91 @@ final class NativeHttpWebSocket
   }
 
   @override
+  void enqueueTextBase64Lease(
+    BinaryPayloadLease lease, {
+    String prefix = '',
+    String suffix = '',
+    int offset = 0,
+    int? length,
+  }) {
+    final selectedLength = length ?? lease.length - offset;
+    try {
+      RangeError.checkValidRange(offset, offset + selectedLength, lease.length, 'offset');
+    } catch (_) {
+      lease.close();
+      rethrow;
+    }
+    final byteLease = switch (lease) {
+      NativeExchangeBinaryPayloadLease(lease: final value) => value,
+      _ => null,
+    };
+    if (byteLease is! TransferableNativeByteLease) {
+      lease.close();
+      throw UnsupportedError(
+        'Queued base64 WebSocket sends require a Native Exchange payload lease.',
+      );
+    }
+    if (_terminal || !_connected.isCompleted || _closing) {
+      lease.close();
+      throw const NativeHttpClientException('Native WebSocket cannot accept a queued send.');
+    }
+    final prefixPointer = prefix.toNativeUtf8();
+    final suffixPointer = suffix.toNativeUtf8();
+    final transfer = byteLease.takeNative();
+    try {
+      final result = native.dart_http_native_client_websocket_enqueue_text_base64_native(
+        _transport._clientId,
+        _socketId,
+        prefixPointer.cast(),
+        prefixPointer.length,
+        transfer.descriptor.cast(),
+        offset,
+        selectedLength,
+        suffixPointer.cast(),
+        suffixPointer.length,
+      );
+      if (result == 1 || result == -2) {
+        transfer.markAdopted();
+      } else {
+        transfer.close();
+      }
+      if (result == 1) return;
+      if (result == -1) {
+        throw const NativeHttpClientException('Native WebSocket send queue is full.');
+      }
+      if (result == -2) {
+        throw const NativeHttpClientException('Native WebSocket closed while accepting a send.');
+      }
+      throw const NativeHttpClientException('Native WebSocket rejected the base64 payload lease.');
+    } catch (_) {
+      transfer.close();
+      rethrow;
+    } finally {
+      if (!lease.isClosed) lease.close();
+      calloc
+        ..free(prefixPointer)
+        ..free(suffixPointer);
+    }
+  }
+
+  @override
   Future<void> flush() => _scheduleOperation(
     () => native.dart_http_native_client_websocket_flush(_transport._clientId, _socketId),
   );
 
   @override
   DartHttpClientNativeWebSocketByteStream adoptByteStream(ByteStreamLease stream) {
+    _adoptByteStream(stream);
+    return _byteStream = _NativeHttpWebSocketByteStream(this);
+  }
+
+  @override
+  DartHttpClientNativeWebSocketBase64TextStream adoptBase64TextStream(ByteStreamLease stream) {
+    _adoptByteStream(stream);
+    return _byteStream = _NativeHttpWebSocketBase64TextStream(this);
+  }
+
+  void _adoptByteStream(ByteStreamLease stream) {
     if (_terminal || !_connected.isCompleted || _closing) {
       unawaited(Future<void>.sync(stream.close));
       throw const NativeHttpClientException('Native WebSocket cannot adopt a byte stream.');
@@ -361,7 +440,7 @@ final class NativeHttpWebSocket
       );
       if (result == 1) {
         transfer.markAdopted();
-        return _byteStream = _NativeHttpWebSocketByteStream(this);
+        return;
       }
       transfer.close();
       if (result == -1) {
@@ -580,11 +659,64 @@ final class NativeHttpWebSocket
   }
 }
 
-final class _NativeHttpWebSocketByteStream implements DartHttpClientNativeWebSocketByteStream {
-  _NativeHttpWebSocketByteStream(this._socket);
+abstract base class _NativeHttpWebSocketAdoptedStream {
+  _NativeHttpWebSocketAdoptedStream(this._socket);
 
   final NativeHttpWebSocket _socket;
   bool _closed = false;
+
+  Future<DartHttpClientNativeWebSocketByteStreamStats> pauseAndFlush() async {
+    _ensureOpen();
+    await _socket._scheduleOperation(
+      () => native.dart_http_native_client_websocket_pause_byte_stream(
+        _socket._transport._clientId,
+        _socket._socketId,
+      ),
+    );
+    final chunkCount = calloc<Uint64>();
+    final byteCount = calloc<Uint64>();
+    try {
+      final read = native.dart_http_native_client_websocket_byte_stream_stats(
+        _socket._transport._clientId,
+        _socket._socketId,
+        chunkCount,
+        byteCount,
+      );
+      if (!read) {
+        throw const NativeHttpClientException('Native WebSocket stream counters are unavailable.');
+      }
+      return DartHttpClientNativeWebSocketByteStreamStats(
+        chunkCount: chunkCount.value,
+        byteCount: byteCount.value,
+      );
+    } finally {
+      calloc.free(chunkCount);
+      calloc.free(byteCount);
+    }
+  }
+
+  void close() {
+    if (_closed) return;
+    _closed = true;
+    native.dart_http_native_client_websocket_close_byte_stream(
+      _socket._transport._clientId,
+      _socket._socketId,
+    );
+    _socket._byteStream = null;
+  }
+
+  void _socketClosed() => _closed = true;
+
+  void _ensureOpen() {
+    if (_closed || _socket._terminal || _socket._closing) {
+      throw StateError('Native WebSocket byte stream is closed.');
+    }
+  }
+}
+
+final class _NativeHttpWebSocketByteStream extends _NativeHttpWebSocketAdoptedStream
+    implements DartHttpClientNativeWebSocketByteStream {
+  _NativeHttpWebSocketByteStream(super.socket);
 
   @override
   void resume({
@@ -616,54 +748,33 @@ final class _NativeHttpWebSocketByteStream implements DartHttpClientNativeWebSoc
       if (prefixPointer != nullptr) calloc.free(prefixPointer);
     }
   }
+}
+
+final class _NativeHttpWebSocketBase64TextStream extends _NativeHttpWebSocketAdoptedStream
+    implements DartHttpClientNativeWebSocketBase64TextStream {
+  _NativeHttpWebSocketBase64TextStream(super.socket);
 
   @override
-  Future<DartHttpClientNativeWebSocketByteStreamStats> pauseAndFlush() async {
+  void resume({String prefix = '', String suffix = ''}) {
     _ensureOpen();
-    await _socket._scheduleOperation(
-      () => native.dart_http_native_client_websocket_pause_byte_stream(
-        _socket._transport._clientId,
-        _socket._socketId,
-      ),
-    );
-    final chunkCount = calloc<Uint64>();
-    final byteCount = calloc<Uint64>();
+    final prefixPointer = prefix.toNativeUtf8();
+    final suffixPointer = suffix.toNativeUtf8();
     try {
-      final read = native.dart_http_native_client_websocket_byte_stream_stats(
+      final accepted = native.dart_http_native_client_websocket_resume_base64_text_stream(
         _socket._transport._clientId,
         _socket._socketId,
-        chunkCount,
-        byteCount,
+        prefixPointer.cast(),
+        prefixPointer.length,
+        suffixPointer.cast(),
+        suffixPointer.length,
       );
-      if (!read) {
-        throw const NativeHttpClientException('Native WebSocket stream counters are unavailable.');
+      if (!accepted) {
+        throw const NativeHttpClientException('Native WebSocket rejected the base64 framing.');
       }
-      return DartHttpClientNativeWebSocketByteStreamStats(
-        chunkCount: chunkCount.value,
-        byteCount: byteCount.value,
-      );
     } finally {
-      calloc.free(chunkCount);
-      calloc.free(byteCount);
-    }
-  }
-
-  @override
-  void close() {
-    if (_closed) return;
-    _closed = true;
-    native.dart_http_native_client_websocket_close_byte_stream(
-      _socket._transport._clientId,
-      _socket._socketId,
-    );
-    _socket._byteStream = null;
-  }
-
-  void _socketClosed() => _closed = true;
-
-  void _ensureOpen() {
-    if (_closed || _socket._terminal || _socket._closing) {
-      throw StateError('Native WebSocket byte stream is closed.');
+      calloc
+        ..free(prefixPointer)
+        ..free(suffixPointer);
     }
   }
 }

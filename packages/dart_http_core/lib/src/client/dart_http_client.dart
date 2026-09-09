@@ -848,7 +848,7 @@ final class DartHttpClientResponseObject<T> {
   Uint8List get rawBodyBytes {
     final bytes = _rawBodyBytes;
     if (bytes != null) {
-      return Uint8List.fromList(bytes);
+      return bytes;
     }
     return Uint8List.fromList(utf8.encode(rawBody));
   }
@@ -1007,7 +1007,7 @@ final class DartHttpClientError {
   Uint8List get rawBodyBytes {
     final bytes = _rawBodyBytes;
     if (bytes != null) {
-      return Uint8List.fromList(bytes);
+      return bytes;
     }
     return Uint8List.fromList(utf8.encode(rawBody));
   }

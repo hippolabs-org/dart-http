@@ -58,6 +58,26 @@ void main() {
       expect(response.status, 204);
     });
 
+    test('consumes leased request bytes through package:http', () async {
+      final lease = DartByteLease(Uint8List.fromList([3, 1, 4]));
+      final transport = DartHttpClientTransport(
+        client: MockClient((request) async {
+          expect(request.bodyBytes, [3, 1, 4]);
+          return http.Response('', 204);
+        }),
+      );
+
+      await transport.send(
+        DartHttpClientRequest(
+          method: HttpMethod.post,
+          uri: Uri.parse('https://api.example.test/leased'),
+          bodyLease: lease,
+        ),
+      );
+
+      expect(lease.isClosed, isTrue);
+    });
+
     test('sends request body streams through package:http', () async {
       final transport = DartHttpClientTransport(
         client: MockClient.streaming((request, bodyStream) async {

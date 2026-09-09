@@ -6,10 +6,16 @@ environment:
   sdk: ">=3.13.0 <4.0.0"
 
 dev_dependencies:
+  dart_http_client: any
+  dart_http_core: any
+  dart_http_native_client: any
   hippo_analysis:
     hosted: https://pub.hippolabs.org
     version: ^0.1.2
   melos: ^8.6.0
+  native_exchange_runtime:
+    hosted: https://pub.hippolabs.org
+    version: ^0.2.0
 
 workspace:
   - packages/*
