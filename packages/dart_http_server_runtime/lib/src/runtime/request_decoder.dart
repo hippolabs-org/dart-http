@@ -101,6 +101,9 @@ Future<Object?> _decodeBody(
   final decoded = switch (request.bodyKind) {
     TransportRequestBodyKind.json => jsonDecode(utf8.decode(payload)),
     _ when body.contentType.startsWith('application/json') => jsonDecode(utf8.decode(payload)),
+    _ when body.contentType.startsWith('application/x-www-form-urlencoded') => Uri.splitQueryString(
+      utf8.decode(payload),
+    ),
     _ when body.isBinary => payload,
     _ => utf8.decode(payload),
   };

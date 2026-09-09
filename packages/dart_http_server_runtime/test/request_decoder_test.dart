@@ -125,6 +125,28 @@ void main() {
     expect(input.body<CreateUserInput>().name, 'Ada');
   });
 
+  test('decodes URL-encoded request bodies before invoking the route decoder', () async {
+    final input = await decodeRequestInput(
+      TransportRequest(
+        routeId: 'route_0',
+        pathParams: const <String, String>{},
+        query: const <String, String>{},
+        headers: const <String, String>{},
+        bodyBytes: Uint8List.fromList(utf8.encode('code=authorization%2Bcode&state=state%20value')),
+      ),
+      codecs: DartHttpCodecRegistry.empty,
+      paramsSchemaId: null,
+      querySchemaId: null,
+      headersSchemaId: null,
+      body: RequestBody.urlEncoded(decoder: (value) => _readObject(value)),
+    );
+
+    expect(input.body<Map<String, Object?>>(), {
+      'code': 'authorization+code',
+      'state': 'state value',
+    });
+  });
+
   test('preserves binary request bodies without UTF-8 decoding', () async {
     final bytes = Uint8List.fromList(<int>[0, 255, 1, 128]);
     final input = await decodeRequestInput(

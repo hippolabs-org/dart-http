@@ -68,6 +68,14 @@ final class RequestBody {
   const RequestBody.text()
     : this._(contentType: 'text/plain; charset=utf-8', schema: null, decoder: null);
 
+  /// Declares an `application/x-www-form-urlencoded` request body.
+  ///
+  /// Server runtimes decode the body to a `Map<String, String>` before applying
+  /// [decoder] or schema decoding. This is primarily useful for standards-based
+  /// OAuth callbacks and simple HTML forms.
+  const RequestBody.urlEncoded({JsonSchema? schema, RequestBodyDecoder? decoder})
+    : this._(contentType: 'application/x-www-form-urlencoded', schema: schema, decoder: decoder);
+
   /// Declares a raw binary request body.
   ///
   /// Concrete runtimes expose the received value as bytes without attempting

@@ -1,3 +1,7 @@
+## 0.3.47
+
+- Decode `application/x-www-form-urlencoded` request bodies for typed route handlers.
+
 ## 0.3.46
 
 - Retain peer-closed WebSocket sessions until Dart drains every queued frame,

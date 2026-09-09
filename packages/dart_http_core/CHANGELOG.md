@@ -1,3 +1,7 @@
+## 0.3.54
+
+- Add typed `application/x-www-form-urlencoded` request bodies and client encoding.
+
 ## 0.3.53
 
 - Return exact native chunk and byte counters from byte-stream boundary fences.

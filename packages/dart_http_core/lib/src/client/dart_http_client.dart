@@ -271,6 +271,22 @@ abstract base class DartHttpClientBase {
       );
     }
 
+    if (_isUrlEncodedContentType(contentType)) {
+      if (encodedBody is! Map) {
+        throw StateError('Expected a Map for an application/x-www-form-urlencoded request body.');
+      }
+      return _EncodedClientRequestBody(
+        contentType: body.contentType,
+        body: encodedBody.entries
+            .map(
+              (entry) =>
+                  '${Uri.encodeQueryComponent(entry.key.toString())}='
+                  '${Uri.encodeQueryComponent(entry.value.toString())}',
+            )
+            .join('&'),
+      );
+    }
+
     if (_isMultipartFormDataContentType(contentType)) {
       final form = encodedBody is MultipartFormData
           ? encodedBody
@@ -479,6 +495,9 @@ abstract base class DartHttpClientBase {
         mimeType.startsWith('video/');
   }
 }
+
+bool _isUrlEncodedContentType(String contentType) =>
+    contentType.split(';').first.trim().toLowerCase() == 'application/x-www-form-urlencoded';
 
 final _pathParameterPattern = RegExp(r'<([^>]+)>');
 
