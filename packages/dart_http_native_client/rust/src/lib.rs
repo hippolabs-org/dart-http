@@ -20,10 +20,10 @@ use native_exchange_abi::{
 };
 use once_cell::sync::Lazy;
 use reqwest::{Body, Client, Method, Url};
+use rustls::{ClientConfig, RootCertStore};
 use tokio::runtime::{Builder, Runtime};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
-use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
@@ -34,6 +34,7 @@ use tokio_tungstenite::tungstenite::protocol::{
         coding::{CloseCode, Data, OpCode},
     },
 };
+use tokio_tungstenite::{Connector, connect_async_tls_with_config};
 use tokio_util::sync::CancellationToken;
 
 const ABI_VERSION: i32 = 9;
@@ -52,6 +53,7 @@ const SHARED_HTTP_MAX_IN_FLIGHT: usize = 12;
 struct NativeHttpEngine {
     runtime: Runtime,
     client: Client,
+    web_socket_tls: Arc<ClientConfig>,
     http_slots: Arc<Semaphore>,
 }
 
@@ -89,6 +91,7 @@ pub struct NativeWebSocketEvent {
 
 struct ClientState {
     client: Client,
+    web_socket_tls: Arc<ClientConfig>,
     http_slots: Arc<Semaphore>,
     connect_timeout: Duration,
     request_timeout: Duration,
@@ -401,7 +404,18 @@ fn shared_engine() -> Result<&'static NativeHttpEngine, String> {
                 .thread_name("dart-http-native")
                 .build()
                 .map_err(|error| format!("Could not initialize native HTTP runtime: {error}"))?;
+            let mut roots = RootCertStore::empty();
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            let base_tls = ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            let mut http_tls = base_tls.clone();
+            http_tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+            let mut web_socket_tls = base_tls;
+            web_socket_tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+            let web_socket_tls = Arc::new(web_socket_tls);
             let client = Client::builder()
+                .use_preconfigured_tls(http_tls)
                 .connect_timeout(SHARED_HTTP_CONNECT_TIMEOUT)
                 .pool_idle_timeout(SHARED_HTTP_IDLE_TIMEOUT)
                 .pool_max_idle_per_host(SHARED_HTTP_MAX_IDLE_PER_HOST)
@@ -411,6 +425,7 @@ fn shared_engine() -> Result<&'static NativeHttpEngine, String> {
             Ok(NativeHttpEngine {
                 runtime,
                 client,
+                web_socket_tls,
                 http_slots: Arc::new(Semaphore::new(SHARED_HTTP_MAX_IN_FLIGHT)),
             })
         })
@@ -465,10 +480,12 @@ pub extern "C" fn dart_http_native_client_create(
         Err(_) => return 0,
     };
     let client = engine.client.clone();
+    let web_socket_tls = Arc::clone(&engine.web_socket_tls);
     let http_slots = Arc::clone(&engine.http_slots);
     let id = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
     let state = Arc::new(ClientState {
         client,
+        web_socket_tls,
         http_slots,
         connect_timeout,
         request_timeout,
@@ -1727,7 +1744,15 @@ async fn run_web_socket(
     let connected = tokio::select! {
         biased;
         () = cancellation.cancelled() => return,
-        result = tokio::time::timeout(state.connect_timeout, connect_async(request)) => result,
+        result = tokio::time::timeout(
+            state.connect_timeout,
+            connect_async_tls_with_config(
+                request,
+                None,
+                false,
+                Some(Connector::Rustls(Arc::clone(&state.web_socket_tls))),
+            ),
+        ) => result,
     };
     let (socket, response) = match connected {
         Ok(Ok(value)) => value,

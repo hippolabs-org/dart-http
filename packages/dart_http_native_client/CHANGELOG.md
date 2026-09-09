@@ -1,3 +1,9 @@
+## 0.2.15
+
+- Share one process-wide Rustls trust policy and TLS session cache between
+  Reqwest HTTP requests and Tokio-Tungstenite WebSocket connections, while
+  retaining protocol-appropriate ALPN settings for each transport.
+
 ## 0.2.14
 
 - Restore single-shot native WebSocket opening semantics. Establishment remains
