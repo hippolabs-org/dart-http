@@ -46,6 +46,9 @@ const WEBSOCKET_EVENT_CLOSED: i32 = 4;
 const WEBSOCKET_EVENT_ERROR: i32 = 5;
 const WEBSOCKET_EVENT_SENT: i32 = 6;
 const SHARED_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const SHARED_HTTP_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
+const SHARED_HTTP_MAX_IDLE_PER_HOST: usize = 8;
+const SHARED_HTTP_MAX_IN_FLIGHT: usize = 12;
 const WEBSOCKET_CONNECT_ATTEMPTS: usize = 3;
 const WEBSOCKET_CONNECT_RETRY_DELAYS: [Duration; WEBSOCKET_CONNECT_ATTEMPTS - 1] =
     [Duration::from_millis(50), Duration::from_millis(150)];
@@ -53,6 +56,7 @@ const WEBSOCKET_CONNECT_RETRY_DELAYS: [Duration; WEBSOCKET_CONNECT_ATTEMPTS - 1]
 struct NativeHttpEngine {
     runtime: Runtime,
     client: Client,
+    http_slots: Arc<Semaphore>,
 }
 
 static ENGINE: OnceLock<Result<NativeHttpEngine, String>> = OnceLock::new();
@@ -89,6 +93,7 @@ pub struct NativeWebSocketEvent {
 
 struct ClientState {
     client: Client,
+    http_slots: Arc<Semaphore>,
     connect_timeout: Duration,
     request_timeout: Duration,
     completion_port: NativeCompletionPort,
@@ -402,10 +407,16 @@ fn shared_engine() -> Result<&'static NativeHttpEngine, String> {
                 .map_err(|error| format!("Could not initialize native HTTP runtime: {error}"))?;
             let client = Client::builder()
                 .connect_timeout(SHARED_HTTP_CONNECT_TIMEOUT)
+                .pool_idle_timeout(SHARED_HTTP_IDLE_TIMEOUT)
+                .pool_max_idle_per_host(SHARED_HTTP_MAX_IDLE_PER_HOST)
                 .tcp_nodelay(true)
                 .build()
                 .map_err(|error| format!("Could not initialize native HTTP client: {error}"))?;
-            Ok(NativeHttpEngine { runtime, client })
+            Ok(NativeHttpEngine {
+                runtime,
+                client,
+                http_slots: Arc::new(Semaphore::new(SHARED_HTTP_MAX_IN_FLIGHT)),
+            })
         })
         .as_ref()
         .map_err(Clone::clone)
@@ -453,13 +464,16 @@ pub extern "C" fn dart_http_native_client_create(
     let Some(request_timeout) = positive_duration(request_timeout_ms) else {
         return 0;
     };
-    let client = match shared_engine() {
-        Ok(engine) => engine.client.clone(),
+    let engine = match shared_engine() {
+        Ok(engine) => engine,
         Err(_) => return 0,
     };
+    let client = engine.client.clone();
+    let http_slots = Arc::clone(&engine.http_slots);
     let id = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
     let state = Arc::new(ClientState {
         client,
+        http_slots,
         connect_timeout,
         request_timeout,
         completion_port: NativeCompletionPort::new(completion_port),
@@ -581,12 +595,18 @@ pub unsafe extern "C" fn dart_http_native_client_start(
     runtime.spawn(async move {
         let result = tokio::select! {
             () = cancellation.cancelled() => Err(REQUEST_CANCELED.to_owned()),
-            result = send_request(
-                task_state.client.clone(),
-                request,
-                cancellation.clone(),
-                buffer_response,
-            ) => result,
+            result = async {
+                let _permit = Arc::clone(&task_state.http_slots)
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| "Native HTTP worker infrastructure closed.".to_owned())?;
+                send_request(
+                    task_state.client.clone(),
+                    request,
+                    cancellation.clone(),
+                    buffer_response,
+                ).await
+            } => result,
         };
         complete_request(&task_state, request_id, result);
     });

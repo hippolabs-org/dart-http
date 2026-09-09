@@ -1,3 +1,11 @@
+## 0.2.13
+
+- Bound process-wide HTTP concurrency and cap each host's idle connection pool
+  so a burst of parallel application startup requests cannot retain dozens of
+  sockets alongside native WebSocket upgrades.
+- Match Dart's 15-second idle connection lifetime instead of retaining the
+  unlimited reqwest default pool for 90 seconds.
+
 ## 0.2.12
 
 - Enable `TCP_NODELAY` explicitly for pooled HTTP connections and native

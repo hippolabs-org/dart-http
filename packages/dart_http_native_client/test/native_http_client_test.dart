@@ -70,6 +70,42 @@ void main() {
     expect(remotePorts[1], remotePorts[0]);
   });
 
+  test('bounds process-wide HTTP startup concurrency', () async {
+    const expectedLimit = 12;
+    var activeRequests = 0;
+    var maxActiveRequests = 0;
+    final reachedLimit = Completer<void>();
+    final releaseRequests = Completer<void>();
+    server.listen((request) async {
+      activeRequests++;
+      if (activeRequests > maxActiveRequests) maxActiveRequests = activeRequests;
+      if (activeRequests == expectedLimit && !reachedLimit.isCompleted) {
+        reachedLimit.complete();
+      }
+      await releaseRequests.future;
+      request.response.write('ok');
+      await request.response.close();
+      activeRequests--;
+    });
+    addTearDown(() {
+      if (!releaseRequests.isCompleted) releaseRequests.complete();
+    });
+    final uri = Uri.parse('http://${server.address.host}:${server.port}/startup');
+    final requests = List<Future<DartHttpClientResponse>>.generate(
+      36,
+      (_) => transport.send(DartHttpClientRequest(method: HttpMethod.get, uri: uri)),
+    );
+
+    await reachedLimit.future.timeout(const Duration(seconds: 5));
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    expect(maxActiveRequests, expectedLimit);
+
+    releaseRequests.complete();
+    final responses = await Future.wait(requests).timeout(const Duration(seconds: 10));
+    expect(responses.every((response) => response.body == 'ok'), isTrue);
+    expect(maxActiveRequests, expectedLimit);
+  });
+
   test('keeps buffered response bytes native until explicitly materialized', () async {
     server.listen((request) async {
       request.response
