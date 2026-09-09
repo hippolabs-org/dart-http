@@ -548,14 +548,34 @@ final class _NativeHttpWebSocketByteStream implements DartHttpClientNativeWebSoc
   }
 
   @override
-  Future<void> pauseAndFlush() {
+  Future<DartHttpClientNativeWebSocketByteStreamStats> pauseAndFlush() async {
     _ensureOpen();
-    return _socket._scheduleOperation(
+    await _socket._scheduleOperation(
       () => native.dart_http_native_client_websocket_pause_byte_stream(
         _socket._transport._clientId,
         _socket._socketId,
       ),
     );
+    final chunkCount = calloc<Uint64>();
+    final byteCount = calloc<Uint64>();
+    try {
+      final read = native.dart_http_native_client_websocket_byte_stream_stats(
+        _socket._transport._clientId,
+        _socket._socketId,
+        chunkCount,
+        byteCount,
+      );
+      if (!read) {
+        throw const NativeHttpClientException('Native WebSocket stream counters are unavailable.');
+      }
+      return DartHttpClientNativeWebSocketByteStreamStats(
+        chunkCount: chunkCount.value,
+        byteCount: byteCount.value,
+      );
+    } finally {
+      calloc.free(chunkCount);
+      calloc.free(byteCount);
+    }
   }
 
   @override

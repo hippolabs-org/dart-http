@@ -240,10 +240,21 @@ abstract interface class DartHttpClientNativeWebSocketByteStream {
   });
 
   /// Pauses pulls and completes after previously accepted chunks are flushed.
-  Future<void> pauseAndFlush();
+  Future<DartHttpClientNativeWebSocketByteStreamStats> pauseAndFlush();
 
   /// Cancels and releases the adopted producer stream natively.
   void close();
+}
+
+/// Counters for the segment completed by a native byte-stream boundary fence.
+final class DartHttpClientNativeWebSocketByteStreamStats {
+  const DartHttpClientNativeWebSocketByteStreamStats({
+    required this.chunkCount,
+    required this.byteCount,
+  });
+
+  final int chunkCount;
+  final int byteCount;
 }
 
 /// WebSocket capability for adopting one Native Exchange byte stream.

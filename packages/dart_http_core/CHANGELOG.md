@@ -1,3 +1,7 @@
+## 0.3.53
+
+- Return exact native chunk and byte counters from byte-stream boundary fences.
+
 ## 0.3.52
 
 - Add `DartHttpClientQueuedWebSocket` for synchronous, bounded ownership

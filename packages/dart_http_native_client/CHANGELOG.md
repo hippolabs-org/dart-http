@@ -1,3 +1,7 @@
+## 0.2.6
+
+- Return exact native chunk and byte counters from byte-stream boundary fences.
+
 ## 0.2.5
 
 - Add a bounded, synchronous native WebSocket lease enqueue that transfers

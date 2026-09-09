@@ -176,6 +176,16 @@ external bool dart_http_native_client_websocket_resume_byte_stream(
 @ffi.Native<ffi.Int64 Function(ffi.Int64, ffi.Int64)>()
 external int dart_http_native_client_websocket_pause_byte_stream(int client_id, int socket_id);
 
+@ffi.Native<
+  ffi.Bool Function(ffi.Int64, ffi.Int64, ffi.Pointer<ffi.Uint64>, ffi.Pointer<ffi.Uint64>)
+>()
+external bool dart_http_native_client_websocket_byte_stream_stats(
+  int client_id,
+  int socket_id,
+  ffi.Pointer<ffi.Uint64> chunk_count,
+  ffi.Pointer<ffi.Uint64> byte_count,
+);
+
 @ffi.Native<ffi.Bool Function(ffi.Int64, ffi.Int64)>()
 external bool dart_http_native_client_websocket_close_byte_stream(int client_id, int socket_id);
 

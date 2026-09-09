@@ -3,7 +3,7 @@ use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::io;
 use std::mem::size_of;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -126,6 +126,13 @@ enum WebSocketCommand {
 struct WebSocketByteStreamPump {
     controls: std_mpsc::Sender<WebSocketByteStreamControl>,
     cancel: RequestStreamCancel,
+    stats: Arc<WebSocketByteStreamStats>,
+}
+
+#[derive(Default)]
+struct WebSocketByteStreamStats {
+    chunks: AtomicU64,
+    bytes: AtomicU64,
 }
 
 impl Drop for WebSocketByteStreamPump {
@@ -863,13 +870,18 @@ pub unsafe extern "C" fn dart_http_native_client_websocket_adopt_byte_stream(
     let (control_tx, control_rx) = std_mpsc::channel();
     let commands = socket.commands.clone();
     let outgoing_slots = Arc::clone(&socket.outgoing_slots);
+    let stats = Arc::new(WebSocketByteStreamStats::default());
+    let worker_stats = Arc::clone(&stats);
     thread::Builder::new()
         .name("dart-http-ws-stream".to_owned())
-        .spawn(move || run_web_socket_byte_stream(reader, control_rx, commands, outgoing_slots))
+        .spawn(move || {
+            run_web_socket_byte_stream(reader, control_rx, commands, outgoing_slots, worker_stats)
+        })
         .expect("native WebSocket byte-stream worker must start");
     *attached = Some(WebSocketByteStreamPump {
         controls: control_tx,
         cancel,
+        stats,
     });
     1
 }
@@ -945,6 +957,37 @@ pub extern "C" fn dart_http_native_client_websocket_pause_byte_stream(
         Ok(()) => operation_id,
         Err(_) => 0,
     }
+}
+
+#[unsafe(no_mangle)]
+/// Reads counters for the last segment after its pause fence has completed.
+///
+/// # Safety
+///
+/// Both output pointers must be non-null and writable.
+pub unsafe extern "C" fn dart_http_native_client_websocket_byte_stream_stats(
+    client_id: i64,
+    socket_id: i64,
+    chunk_count: *mut u64,
+    byte_count: *mut u64,
+) -> bool {
+    if chunk_count.is_null() || byte_count.is_null() {
+        return false;
+    }
+    let Some(socket) = web_socket_state(client_id, socket_id) else {
+        return false;
+    };
+    let Ok(attached) = socket.byte_stream.lock() else {
+        return false;
+    };
+    let Some(pump) = attached.as_ref() else {
+        return false;
+    };
+    unsafe {
+        *chunk_count = pump.stats.chunks.load(Ordering::Acquire);
+        *byte_count = pump.stats.bytes.load(Ordering::Acquire);
+    }
+    true
 }
 
 #[unsafe(no_mangle)]
@@ -1140,6 +1183,7 @@ fn run_web_socket_byte_stream(
     controls: std_mpsc::Receiver<WebSocketByteStreamControl>,
     commands: mpsc::UnboundedSender<WebSocketCommand>,
     outgoing_slots: Arc<Semaphore>,
+    stats: Arc<WebSocketByteStreamStats>,
 ) {
     let mut framing: Option<WebSocketByteStreamFraming> = None;
     let mut pending: Option<Bytes> = None;
@@ -1162,7 +1206,11 @@ fn run_web_socket_byte_stream(
 
         while let Ok(control) = controls.try_recv() {
             match control {
-                WebSocketByteStreamControl::Resume(value) => framing = Some(value),
+                WebSocketByteStreamControl::Resume(value) => {
+                    stats.chunks.store(0, Ordering::Release);
+                    stats.bytes.store(0, Ordering::Release);
+                    framing = Some(value);
+                }
                 WebSocketByteStreamControl::Pause { operation_id } => {
                     framing = None;
                     if commands
@@ -1183,7 +1231,12 @@ fn run_web_socket_byte_stream(
             Some(value) => value,
             None => match reader.read_next() {
                 Ok(RequestStreamRead::Chunk(value)) => value,
-                Ok(RequestStreamRead::Done) => return,
+                // Keep the control side alive after producer EOF so a segment
+                // commit can still enqueue its ordered pause fence.
+                Ok(RequestStreamRead::Done) => {
+                    framing = None;
+                    continue;
+                }
                 Err(error) => {
                     let _ = commands.send(WebSocketCommand::PumpError(error));
                     return;
@@ -1206,7 +1259,11 @@ fn run_web_socket_byte_stream(
                 }
                 continue;
             }
-            Ok(WebSocketByteStreamControl::Resume(value)) => framing = Some(value),
+            Ok(WebSocketByteStreamControl::Resume(value)) => {
+                stats.chunks.store(0, Ordering::Release);
+                stats.bytes.store(0, Ordering::Release);
+                framing = Some(value);
+            }
             Ok(WebSocketByteStreamControl::Stop) => return,
             Err(std_mpsc::TryRecvError::Disconnected) => return,
             Err(std_mpsc::TryRecvError::Empty) => {}
@@ -1235,6 +1292,7 @@ fn run_web_socket_byte_stream(
             };
             prefix[offset..offset + 4].copy_from_slice(&count.to_be_bytes());
         }
+        let byte_count = bytes.len() as u64;
         let messages = if prefix.is_empty() {
             vec![Message::Binary(bytes)]
         } else {
@@ -1256,6 +1314,8 @@ fn run_web_socket_byte_stream(
         {
             return;
         }
+        stats.chunks.fetch_add(1, Ordering::Release);
+        stats.bytes.fetch_add(byte_count, Ordering::Release);
         active_framing.sequence += 1;
     }
 }

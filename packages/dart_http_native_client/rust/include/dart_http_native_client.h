@@ -102,6 +102,11 @@ bool dart_http_native_client_websocket_resume_byte_stream(
 int64_t dart_http_native_client_websocket_pause_byte_stream(
     int64_t client_id,
     int64_t socket_id);
+bool dart_http_native_client_websocket_byte_stream_stats(
+    int64_t client_id,
+    int64_t socket_id,
+    uint64_t* chunk_count,
+    uint64_t* byte_count);
 bool dart_http_native_client_websocket_close_byte_stream(
     int64_t client_id,
     int64_t socket_id);
