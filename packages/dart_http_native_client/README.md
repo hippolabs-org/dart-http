@@ -67,3 +67,24 @@ await socket.sendBinaryLease(
 
 Portable WebSocket transports support the same helper through a safe copying
 fallback.
+
+Protocols that require base64 inside a text frame can encode and frame a
+transferred native payload without creating the base64 or enclosing message as
+Dart strings:
+
+```dart
+await socket.sendTextBase64Lease(
+  BinaryPayloadLease.fromByteLease(nativeLease),
+  prefix: '{"type":"input_audio_buffer.append","audio":"',
+  suffix: '"}',
+);
+```
+
+The native transport performs one allocation for the final UTF-8 message. The
+portable fallback uses Dart's standard padded base64 encoder.
+
+Compare the Dart and fused-native paths over a loopback WebSocket with:
+
+```sh
+dart run benchmark/websocket_base64_send_benchmark.dart
+```

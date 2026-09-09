@@ -1,3 +1,8 @@
+## 0.3.55
+
+- Add an ownership-consuming base64 text WebSocket send capability with a
+  portable Dart fallback.
+
 ## 0.3.54
 
 - Add typed `application/x-www-form-urlencoded` request bodies and client encoding.

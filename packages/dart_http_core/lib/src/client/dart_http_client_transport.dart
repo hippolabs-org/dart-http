@@ -199,6 +199,27 @@ abstract interface class DartHttpClientOwnedWebSocket implements DartHttpClientW
   Future<void> sendBinaryLease(BinaryPayloadLease lease, {List<int> prefix = const <int>[]});
 }
 
+/// Optional WebSocket capability for base64-encoding an owned binary payload
+/// directly into a text message.
+///
+/// Native transports can use this to avoid materializing the base64 value and
+/// enclosing text message as Dart strings. The lease is consumed whether the
+/// send succeeds or fails.
+abstract interface class DartHttpClientBase64TextWebSocket implements DartHttpClientWebSocket {
+  /// Sends [prefix], the standard padded base64 encoding of [lease], and
+  /// [suffix] as one logical WebSocket text message.
+  ///
+  /// The returned future completes once the transport no longer owns the
+  /// payload, not when the peer acknowledges it.
+  Future<void> sendTextBase64Lease(
+    BinaryPayloadLease lease, {
+    String prefix = '',
+    String suffix = '',
+    int offset = 0,
+    int? length,
+  });
+}
+
 /// Optional native WebSocket capability for bounded, synchronous lease enqueueing.
 ///
 /// [enqueueBinaryLease] transfers payload ownership into the transport without
@@ -285,6 +306,38 @@ extension DartHttpClientWebSocketOwnedSending on DartHttpClientWebSocket {
           ..setRange(prefix.length, prefix.length + lease.length, lease.bytesView);
         await sendBinary(combined);
       }
+    } finally {
+      lease.close();
+    }
+  }
+
+  /// Sends a base64 value inside a text message while consuming [lease].
+  ///
+  /// Native transports may encode directly from transferred native storage.
+  /// Other transports use a portable Dart base64 encoding fallback.
+  Future<void> sendTextBase64Lease(
+    BinaryPayloadLease lease, {
+    String prefix = '',
+    String suffix = '',
+    int offset = 0,
+    int? length,
+  }) async {
+    final socket = this;
+    if (socket is DartHttpClientBase64TextWebSocket) {
+      await socket.sendTextBase64Lease(
+        lease,
+        prefix: prefix,
+        suffix: suffix,
+        offset: offset,
+        length: length,
+      );
+      return;
+    }
+    try {
+      final selectedLength = length ?? lease.length - offset;
+      RangeError.checkValidRange(offset, offset + selectedLength, lease.length, 'offset');
+      final bytes = Uint8List.sublistView(lease.bytesView, offset, offset + selectedLength);
+      await sendText('$prefix${base64Encode(bytes)}$suffix');
     } finally {
       lease.close();
     }

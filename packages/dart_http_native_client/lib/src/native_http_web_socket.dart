@@ -81,7 +81,8 @@ extension on NativeHttpClientTransport {
 }
 
 /// Active WebSocket driven by Tokio/tungstenite with leased binary frames.
-final class NativeHttpWebSocket implements DartHttpClientNativeStreamWebSocket {
+final class NativeHttpWebSocket
+    implements DartHttpClientNativeStreamWebSocket, DartHttpClientBase64TextWebSocket {
   NativeHttpWebSocket._(this._transport, this._socketId) {
     _controller = StreamController<WebSocketMessage>(
       sync: true,
@@ -130,6 +131,69 @@ final class NativeHttpWebSocket implements DartHttpClientNativeStreamWebSocket {
 
   @override
   Future<void> sendJson(Object? value) => sendText(jsonEncode(value));
+
+  @override
+  Future<void> sendTextBase64Lease(
+    BinaryPayloadLease lease, {
+    String prefix = '',
+    String suffix = '',
+    int offset = 0,
+    int? length,
+  }) {
+    final selectedLength = length ?? lease.length - offset;
+    try {
+      RangeError.checkValidRange(offset, offset + selectedLength, lease.length, 'offset');
+    } catch (_) {
+      lease.close();
+      rethrow;
+    }
+    final exchangeLease = switch (lease) {
+      NativeExchangeBinaryPayloadLease(lease: final byteLease) => byteLease,
+      _ => null,
+    };
+    if (exchangeLease is! TransferableNativeByteLease) {
+      try {
+        final bytes = Uint8List.sublistView(lease.bytesView, offset, offset + selectedLength);
+        return sendText('$prefix${base64Encode(bytes)}$suffix').whenComplete(lease.close);
+      } catch (_) {
+        lease.close();
+        rethrow;
+      }
+    }
+    return _scheduleOperation(() {
+      final prefixPointer = prefix.toNativeUtf8();
+      final suffixPointer = suffix.toNativeUtf8();
+      final transfer = exchangeLease.takeNative();
+      try {
+        final result = native.dart_http_native_client_websocket_send_text_base64_native(
+          _transport._clientId,
+          _socketId,
+          prefixPointer.cast(),
+          prefixPointer.length,
+          transfer.descriptor.cast(),
+          offset,
+          selectedLength,
+          suffixPointer.cast(),
+          suffixPointer.length,
+        );
+        if (result != 0) {
+          transfer.markAdopted();
+        } else {
+          transfer.close();
+        }
+        return result > 0 ? result : 0;
+      } catch (_) {
+        transfer.close();
+        rethrow;
+      } finally {
+        calloc
+          ..free(prefixPointer)
+          ..free(suffixPointer);
+      }
+    }).whenComplete(() {
+      if (!lease.isClosed) lease.close();
+    });
+  }
 
   @override
   Future<void> sendBinary(List<int> value) => _scheduleOperation(() {

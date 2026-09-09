@@ -100,6 +100,31 @@ external int dart_http_native_client_websocket_send_text(
   ffi.Pointer<ffi.Char> value,
 );
 
+@ffi.Native<
+  ffi.Int64 Function(
+    ffi.Int64,
+    ffi.Int64,
+    ffi.Pointer<ffi.Uint8>,
+    ffi.IntPtr,
+    ffi.Pointer<ffi.Void>,
+    ffi.IntPtr,
+    ffi.IntPtr,
+    ffi.Pointer<ffi.Uint8>,
+    ffi.IntPtr,
+  )
+>()
+external int dart_http_native_client_websocket_send_text_base64_native(
+  int client_id,
+  int socket_id,
+  ffi.Pointer<ffi.Uint8> prefix,
+  int prefix_length,
+  ffi.Pointer<ffi.Void> native_buffer,
+  int offset,
+  int length,
+  ffi.Pointer<ffi.Uint8> suffix,
+  int suffix_length,
+);
+
 @ffi.Native<ffi.Int64 Function(ffi.Int64, ffi.Int64, ffi.Pointer<ffi.Uint8>, ffi.IntPtr)>()
 external int dart_http_native_client_websocket_send_binary(
   int client_id,

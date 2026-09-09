@@ -150,6 +150,47 @@ void main() {
     prefixedLease.close();
   });
 
+  test('base64-encodes an adopted native lease into one text message', () async {
+    server.listen((request) async {
+      final socket = await WebSocketTransformer.upgrade(request);
+      socket
+        ..listen(socket.add)
+        ..add(<int>[99, 1, 2, 3, 4, 88]);
+    });
+
+    final socket = await transport.connect(
+      DartHttpClientWebSocketRequest(
+        uri: Uri.parse('ws://${server.address.host}:${server.port}/base64'),
+      ),
+    );
+    addTearDown(socket.close);
+    final binary = Completer<WebSocketMessage>();
+    final text = Completer<WebSocketMessage>();
+    final subscription = socket.messages.listen((message) {
+      switch (message.kind) {
+        case WebSocketMessageKind.text:
+          text.complete(message);
+        case WebSocketMessageKind.binary:
+          binary.complete(message);
+      }
+    });
+    addTearDown(subscription.cancel);
+
+    final lease = (await binary.future).takeBinaryLease();
+    await socket.sendTextBase64Lease(
+      lease,
+      prefix: '{"audio":"',
+      suffix: '"}',
+      offset: 1,
+      length: 4,
+    );
+
+    expect(lease.isClosed, isTrue);
+    expect(jsonDecode((await text.future).text), <String, Object?>{
+      'audio': base64Encode(<int>[1, 2, 3, 4]),
+    });
+  });
+
   test('bounds native receive work while the Dart subscription is paused', () async {
     transport.close();
     transport = await NativeHttpClientTransport.open(webSocketIncomingCapacity: 2);

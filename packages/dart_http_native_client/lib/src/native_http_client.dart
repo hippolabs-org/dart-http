@@ -15,7 +15,7 @@ import 'native_http_response.dart';
 
 part 'native_http_web_socket.dart';
 
-const _nativeAbiVersion = 6;
+const _nativeAbiVersion = 7;
 
 /// Failure reported by the asynchronous native HTTP engine.
 final class NativeHttpClientException implements Exception {

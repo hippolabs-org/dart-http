@@ -1,3 +1,8 @@
+## 0.2.9
+
+- Add fused native base64 text WebSocket sends for transferred Native Exchange
+  buffers, avoiding large intermediate Dart strings and copies.
+
 ## 0.2.8
 
 - Preserve stream ordering when text or binary frames are deferred before the

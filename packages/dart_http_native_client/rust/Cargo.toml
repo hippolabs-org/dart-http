@@ -1,6 +1,6 @@
 [package]
 name = "dart_http_native_client"
-version = "0.2.8"
+version = "0.2.9"
 edition = "2024"
 publish = false
 
@@ -9,6 +9,7 @@ name = "dart_http_native_client"
 crate-type = ["staticlib", "cdylib"]
 
 [dependencies]
+base64 = "0.22"
 bytes = "1"
 futures-util = "0.3"
 native-exchange-abi = "0.2.0"

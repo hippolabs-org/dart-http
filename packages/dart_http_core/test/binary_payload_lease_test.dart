@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:dart_http_core/dart_http_core.dart';
@@ -129,6 +130,27 @@ void main() {
     expect(lease.closeCount, 1);
   });
 
+  test('client WebSocket base64 text send falls back and releases ownership', () async {
+    final lease = _TrackingBinaryPayloadLease([1, 2, 3, 4]);
+    final socket = _CopyingClientWebSocket();
+
+    await socket.sendTextBase64Lease(lease, prefix: '{"audio":"', suffix: '"}');
+
+    expect(socket.sentText, [
+      '{"audio":"${base64Encode([1, 2, 3, 4])}"}',
+    ]);
+    expect(lease.closeCount, 1);
+  });
+
+  test('client WebSocket base64 text send releases ownership after failure', () async {
+    final lease = _TrackingBinaryPayloadLease([1, 2, 3, 4]);
+    final socket = _CopyingClientWebSocket(fail: true);
+
+    await expectLater(socket.sendTextBase64Lease(lease), throwsStateError);
+
+    expect(lease.closeCount, 1);
+  });
+
   test('persistent WebTransport stream exposes incremental leases', () async {
     final first = _TrackingBinaryPayloadLease([1, 2]);
     final second = _TrackingBinaryPayloadLease([3, 4]);
@@ -187,6 +209,7 @@ final class _CopyingClientWebSocket implements DartHttpClientWebSocket {
 
   final bool fail;
   final List<List<int>> sent = [];
+  final List<String> sentText = [];
 
   @override
   Stream<WebSocketMessage> get messages => const Stream.empty();
@@ -204,7 +227,10 @@ final class _CopyingClientWebSocket implements DartHttpClientWebSocket {
   Future<void> sendJson(Object? value) async {}
 
   @override
-  Future<void> sendText(String value) async {}
+  Future<void> sendText(String value) async {
+    if (fail) throw StateError('send failed');
+    sentText.add(value);
+  }
 }
 
 final class _TrackingBinaryPayloadLease implements BinaryPayloadLease {

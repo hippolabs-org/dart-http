@@ -17,6 +17,11 @@ workspace:
 dependency_overrides:
   cli_util: ^0.5.1
 
+hooks:
+  user_defines:
+    dart_http_native_client:
+      build_from_source: true
+
 melos:
   ide:
     intellij:

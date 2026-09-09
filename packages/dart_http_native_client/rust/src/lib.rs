@@ -3,12 +3,14 @@ use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::io;
 use std::mem::size_of;
 use std::ptr;
+use std::str;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use native_exchange_abi::{
@@ -34,7 +36,7 @@ use tokio_tungstenite::tungstenite::protocol::{
 };
 use tokio_util::sync::CancellationToken;
 
-const ABI_VERSION: i32 = 6;
+const ABI_VERSION: i32 = 7;
 const REQUEST_CANCELED: &str = "Native HTTP request canceled.";
 const WEBSOCKET_EVENT_OPENED: i32 = 1;
 const WEBSOCKET_EVENT_TEXT: i32 = 2;
@@ -685,6 +687,90 @@ pub unsafe extern "C" fn dart_http_native_client_websocket_send_text(
         Err(_) => return 0,
     };
     enqueue_web_socket_message(client_id, socket_id, Message::Text(value.into()))
+}
+
+#[unsafe(no_mangle)]
+/// Base64-encodes one adopted Native Exchange buffer directly into a UTF-8
+/// WebSocket text message between the supplied prefix and suffix.
+///
+/// A positive result is the send operation ID. `-1` means ownership moved but
+/// the bounded WebSocket queue rejected and released the message. `0` means the
+/// descriptor was not adopted.
+///
+/// # Safety
+///
+/// `prefix` and `suffix` must be null only for zero lengths and otherwise point
+/// to readable UTF-8 bytes. `native_buffer` must point to a live `NexBuffer`
+/// descriptor until this call returns and support release from a foreign thread.
+pub unsafe extern "C" fn dart_http_native_client_websocket_send_text_base64_native(
+    client_id: i64,
+    socket_id: i64,
+    prefix: *const u8,
+    prefix_length: isize,
+    native_buffer: *mut c_void,
+    offset: isize,
+    length: isize,
+    suffix: *const u8,
+    suffix_length: isize,
+) -> i64 {
+    if native_buffer.is_null() {
+        return 0;
+    }
+    let descriptor_pointer = native_buffer.cast::<NexBuffer>();
+    let descriptor = unsafe { &*descriptor_pointer };
+    if !descriptor.is_valid() || descriptor.capabilities & NEX_CAPABILITY_THREAD_SAFE == 0 {
+        return 0;
+    }
+    let (Ok(offset), Ok(length)) = (usize::try_from(offset), usize::try_from(length)) else {
+        return 0;
+    };
+    let Some(end) = offset.checked_add(length) else {
+        return 0;
+    };
+    if end > descriptor.len {
+        return 0;
+    }
+    let prefix = match unsafe { copy_optional_bytes(prefix, prefix_length) } {
+        Ok(value) => value,
+        Err(_) => return 0,
+    };
+    let suffix = match unsafe { copy_optional_bytes(suffix, suffix_length) } {
+        Ok(value) => value,
+        Err(_) => return 0,
+    };
+    let Ok(prefix) = str::from_utf8(&prefix) else {
+        return 0;
+    };
+    let Ok(suffix) = str::from_utf8(&suffix) else {
+        return 0;
+    };
+    let Some(encoded_length) = length
+        .checked_add(2)
+        .and_then(|value| value.checked_div(3))
+        .and_then(|value| value.checked_mul(4))
+    else {
+        return 0;
+    };
+    let Some(capacity) = prefix
+        .len()
+        .checked_add(encoded_length)
+        .and_then(|value| value.checked_add(suffix.len()))
+    else {
+        return 0;
+    };
+
+    let descriptor = unsafe { ptr::read(descriptor_pointer) };
+    let bytes = Bytes::from_owner(AdoptedBufferOwner(Some(descriptor)));
+    let mut text = String::with_capacity(capacity);
+    text.push_str(prefix);
+    BASE64_STANDARD.encode_string(&bytes[offset..end], &mut text);
+    text.push_str(suffix);
+    drop(bytes);
+
+    match enqueue_web_socket_message(client_id, socket_id, Message::Text(text.into())) {
+        0 => -1,
+        operation_id => operation_id,
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -1458,17 +1544,18 @@ async fn run_web_socket(
                         return;
                     }
                 }
-                if let Some(operation_id) = operation_id {
-                    if !send_web_socket_event(
+                if let Some(operation_id) = operation_id
+                    && !send_web_socket_event(
                         &state,
                         socket_id,
                         &events,
                         &control_events,
                         WebSocketEventData::Sent { operation_id },
                         &cancellation,
-                    ).await {
-                        return;
-                    }
+                    )
+                    .await
+                {
+                    return;
                 }
             }
             incoming = reader.next() => {
