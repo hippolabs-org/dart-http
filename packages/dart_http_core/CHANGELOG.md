@@ -1,3 +1,7 @@
+## 0.3.58
+
+- Add an EOF-aware drain-and-flush boundary for native WebSocket byte streams.
+
 ## 0.3.57
 
 - Add an optional close-aware WebSocket capability that exposes the peer's

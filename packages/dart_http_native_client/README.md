@@ -62,6 +62,29 @@ try {
 Requests accept a `bodyLease` as well. A transferable Native Exchange lease
 moves directly into reqwest without allocating payload-sized Dart storage.
 
+Ordinary Dart `bodyStream` requests start immediately and feed a bounded
+Dart-to-Tokio upload. Each chunk is copied once into Rust-owned storage; Dart
+only waits when the native channel applies backpressure. Supplying
+`bodyStreamLength` emits a content length and validates that the source produces
+exactly that many bytes. Omitting it uses HTTP streaming semantics.
+
+```dart
+await transport.send(
+  DartHttpClientRequest(
+    method: HttpMethod.post,
+    uri: uploadUri,
+    bodyStream: chunks,
+    bodyStreamLength: expectedBytes,
+  ),
+);
+```
+
+Run the focused upload benchmark with:
+
+```sh
+dart run benchmark/request_body_stream_benchmark.dart
+```
+
 The same transport implements `DartHttpClientWebSocketTransport`. Incoming
 binary frames remain Native Exchange leases until the consumer copies,
 transfers, or closes them:
@@ -149,6 +172,14 @@ pump.resume(
   suffix: '"}',
 );
 final stats = await pump.pauseAndFlush();
+```
+
+For a final segment, start an EOF-aware drain before other producer shutdown
+work. It keeps consuming through producer EOF and completes after the ordered
+WebSocket writer fence:
+
+```dart
+final stats = await pump.drainAndFlush();
 ```
 
 Compare the Dart and fused-native paths over a loopback WebSocket with:

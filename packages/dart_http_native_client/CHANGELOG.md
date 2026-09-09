@@ -1,3 +1,20 @@
+## 0.2.19
+
+- Stream ordinary Dart request bodies through a bounded Dart-to-Tokio upload
+  bridge instead of collecting the complete body before starting HTTP.
+- Allocate each upload chunk once in native memory, propagate source failures
+  and cancellation, and validate declared content lengths.
+- Add an EOF-aware native WebSocket stream drain that overlaps producer
+  shutdown with other finalization work and advances the native ABI to version
+  13.
+
+## 0.2.18
+
+- Transfer buffered response descriptors through an ABI-owned take operation,
+  releasing the original Rust descriptor storage without copying payload bytes.
+- Let native and directly streamed responses be closed explicitly before their
+  bodies are consumed, and advance the native ABI to version 11.
+
 ## 0.2.17
 
 - Expose the peer WebSocket close code and reason through the optional

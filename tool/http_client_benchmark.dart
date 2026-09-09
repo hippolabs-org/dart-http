@@ -14,6 +14,9 @@ const _largeBodyBytes = 1024 * 1024;
 const _streamRequestCount = 8;
 const _streamBodyBytes = 16 * 1024 * 1024;
 const _streamChunkBytes = 64 * 1024;
+const _uploadRequestCount = 32;
+const _uploadBodyBytes = 4 * 1024 * 1024;
+const _uploadChunkBytes = 64 * 1024;
 
 Future<void> main(List<String> arguments) async {
   if (arguments.length != 1 ||
@@ -47,6 +50,12 @@ Future<void> main(List<String> arguments) async {
         for (var sent = 0; sent < _streamBodyBytes; sent += responseChunk.length) {
           request.response.add(responseChunk);
         }
+      case '/upload':
+        var received = 0;
+        await for (final chunk in request) {
+          received += chunk.length;
+        }
+        request.response.write(received);
       default:
         request.response.statusCode = HttpStatus.notFound;
     }
@@ -131,6 +140,26 @@ Future<void> main(List<String> arguments) async {
         final response = await _sendBuffered(transport, baseUri.resolve('/large'));
         if (response.bodyBytes.length != _largeBodyBytes) {
           throw StateError('Incomplete buffered response.');
+        }
+      }
+    },
+  );
+  final uploadChunk = Uint8List(_uploadChunkBytes);
+  measurements['streamedUpload'] = await _measure(
+    operations: _uploadRequestCount,
+    bytes: _uploadRequestCount * _uploadBodyBytes,
+    action: () async {
+      for (var index = 0; index < _uploadRequestCount; index++) {
+        final response = await transport.send(
+          DartHttpClientRequest(
+            method: HttpMethod.post,
+            uri: baseUri.resolve('/upload'),
+            bodyStream: _repeatedChunks(uploadChunk, totalBytes: _uploadBodyBytes),
+            bodyStreamLength: _uploadBodyBytes,
+          ),
+        );
+        if (response.body != '$_uploadBodyBytes') {
+          throw StateError('Incomplete streamed upload.');
         }
       }
     },
@@ -221,6 +250,12 @@ Future<void> main(List<String> arguments) async {
 Future<DartHttpClientResponse> _sendBuffered(HttpClientTransport transport, Uri uri) =>
     transport.send(DartHttpClientRequest(method: HttpMethod.get, uri: uri));
 
+Stream<List<int>> _repeatedChunks(Uint8List chunk, {required int totalBytes}) async* {
+  for (var sent = 0; sent < totalBytes; sent += chunk.length) {
+    yield chunk;
+  }
+}
+
 Future<void> _runConcurrent({
   required int concurrency,
   required int operations,
@@ -239,7 +274,8 @@ Future<Map<String, Object?>> _measure({
   required Future<void> Function() action,
   int? bytes,
 }) async {
-  var peakRss = ProcessInfo.currentRss;
+  final rssAtStart = ProcessInfo.currentRss;
+  var peakRss = rssAtStart;
   Object? failure;
   final cpuBefore = await _cpuSeconds();
   final sampler = Timer.periodic(const Duration(milliseconds: 5), (_) {
@@ -264,7 +300,9 @@ Future<Map<String, Object?>> _measure({
     if (bytes != null) 'MiBPerSecond': bytes / (1024 * 1024) / seconds,
     'cpuSeconds': cpuSeconds,
     'cpuPercentOfOneCore': cpuSeconds == null ? null : cpuSeconds / seconds * 100,
+    'rssAtStartMiB': _mib(rssAtStart),
     'peakRssMiB': _mib(peakRss),
+    'peakRssDeltaMiB': _mib(peakRss - rssAtStart),
   };
 }
 

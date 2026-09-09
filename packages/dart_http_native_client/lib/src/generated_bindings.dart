@@ -37,6 +37,8 @@ external void dart_http_native_client_close(int client_id);
     ffi.IntPtr,
     ffi.Pointer<ffi.Uint8>,
     ffi.IntPtr,
+    ffi.Int64,
+    ffi.Int64,
     ffi.Pointer<ffi.Void>,
     ffi.Pointer<ffi.Void>,
     ffi.Int64,
@@ -55,6 +57,8 @@ external int dart_http_native_client_start(
   int header_count,
   ffi.Pointer<ffi.Uint8> body,
   int body_length,
+  int dart_upload_id,
+  int dart_upload_length,
   ffi.Pointer<ffi.Void> native_buffer,
   ffi.Pointer<ffi.Void> native_body,
   int native_body_length,
@@ -65,6 +69,30 @@ external int dart_http_native_client_start(
   int response_mode,
 );
 
+@ffi.Native<ffi.Int64 Function(ffi.Int64, ffi.Int64, ffi.IntPtr)>()
+external int dart_http_native_client_upload_create(
+  int client_id,
+  int completion_port,
+  int capacity,
+);
+
+@ffi.Native<ffi.Pointer<ffi.Uint8> Function(ffi.IntPtr)>()
+external ffi.Pointer<ffi.Uint8> dart_http_native_client_upload_chunk_allocate(int length);
+
+@ffi.Native<
+  ffi.Int32 Function(ffi.Int64, ffi.Int64, ffi.Int64, ffi.Pointer<ffi.Uint8>, ffi.IntPtr)
+>()
+external int dart_http_native_client_upload_write(
+  int client_id,
+  int upload_id,
+  int write_id,
+  ffi.Pointer<ffi.Uint8> bytes,
+  int length,
+);
+
+@ffi.Native<ffi.Bool Function(ffi.Int64, ffi.Int64)>()
+external bool dart_http_native_client_upload_close(int client_id, int upload_id);
+
 @ffi.Native<ffi.Bool Function(ffi.Int64, ffi.Int64)>()
 external bool dart_http_native_client_cancel(int client_id, int request_id);
 
@@ -72,6 +100,12 @@ external bool dart_http_native_client_cancel(int client_id, int request_id);
 external ffi.Pointer<NativeHttpResult> dart_http_native_client_take_result(
   int client_id,
   int request_id,
+);
+
+@ffi.Native<ffi.Bool Function(ffi.Pointer<NativeHttpResult>, ffi.Pointer<ffi.Void>)>()
+external bool dart_http_native_client_result_take_body_buffer(
+  ffi.Pointer<NativeHttpResult> result,
+  ffi.Pointer<ffi.Void> out_buffer,
 );
 
 @ffi.Native<ffi.Void Function(ffi.Pointer<NativeHttpResult>)>()
@@ -270,6 +304,9 @@ external bool dart_http_native_client_websocket_resume_base64_text_stream(
 
 @ffi.Native<ffi.Int64 Function(ffi.Int64, ffi.Int64)>()
 external int dart_http_native_client_websocket_pause_byte_stream(int client_id, int socket_id);
+
+@ffi.Native<ffi.Int64 Function(ffi.Int64, ffi.Int64)>()
+external int dart_http_native_client_websocket_drain_byte_stream(int client_id, int socket_id);
 
 @ffi.Native<
   ffi.Bool Function(ffi.Int64, ffi.Int64, ffi.Pointer<ffi.Uint64>, ffi.Pointer<ffi.Uint64>)

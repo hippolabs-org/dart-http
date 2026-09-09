@@ -15,7 +15,7 @@ import 'native_http_response.dart';
 part 'native_http_web_socket.dart';
 part 'native_http_response_reader.dart';
 
-const _nativeAbiVersion = 10;
+const _nativeAbiVersion = 13;
 const _responseModeNativeStream = 0;
 const _responseModeBuffered = 1;
 const _responseModeDirectStream = 2;
@@ -150,7 +150,7 @@ final class NativeHttpClientTransport
     required int responseMode,
   }) async {
     _ensureOpen();
-    final prepared = await _prepareRequest(request);
+    final prepared = _prepareRequest(request);
     final method = request.method.wireName.toNativeUtf8();
     final url = request.uri.toString().toNativeUtf8();
     final headers = calloc<native.NativeHttpHeader>(request.headers.length);
@@ -167,6 +167,10 @@ final class NativeHttpClientTransport
         : calloc<Uint8>(nativeSuffix.length);
     NativeByteStreamTransfer? nativeTransfer;
     NativeBufferTransfer? nativeBufferTransfer;
+    final upload = prepared.bodyStream == null ? null : _NativeRequestBodyUpload.open(_clientId);
+    final uploadIterator = prepared.bodyStream == null
+        ? null
+        : StreamIterator<List<int>>(prepared.bodyStream!);
     try {
       var index = 0;
       for (final entry in request.headers.entries) {
@@ -203,6 +207,8 @@ final class NativeHttpClientTransport
         request.headers.length,
         bodyPointer,
         bytes?.length ?? 0,
+        upload?.id ?? 0,
+        prepared.bodyStreamLength ?? -1,
         nativeBufferTransfer?.descriptor.cast() ?? nullptr,
         nativeTransfer?.descriptor.cast() ?? nullptr,
         prepared.nativeBody?.contentLength ?? -1,
@@ -213,6 +219,7 @@ final class NativeHttpClientTransport
         responseMode,
       );
       if (requestId <= 0) {
+        await upload?.close();
         nativeBufferTransfer?.close();
         nativeTransfer?.close();
         throw const NativeHttpClientException('The native HTTP request was rejected.');
@@ -221,17 +228,34 @@ final class NativeHttpClientTransport
       nativeTransfer?.markAdopted();
       final completer = Completer<_NativeResponseData>();
       _pending[requestId] = completer;
+      final responseFuture = completer.future;
+      final uploadFuture = upload == null
+          ? Future<void>.value()
+          : _pumpRequestBody(uploadIterator!, upload, expectedLength: prepared.bodyStreamLength);
       final abortTrigger = request.abortTrigger;
       if (abortTrigger != null) {
         unawaited(
           abortTrigger.then<void>((_) {
+            unawaited(upload?.close());
             if (_pending.containsKey(requestId)) {
               native.dart_http_native_client_cancel(_clientId, requestId);
             }
           }, onError: (Object _, StackTrace _) {}),
         );
       }
-      final response = await completer.future;
+      late final _NativeResponseData response;
+      try {
+        final completed = await Future.wait<Object?>(<Future<Object?>>[
+          responseFuture,
+          uploadFuture,
+        ], eagerError: true);
+        response = completed.first! as _NativeResponseData;
+      } on Object {
+        native.dart_http_native_client_cancel(_clientId, requestId);
+        await uploadIterator?.cancel();
+        await upload?.close();
+        rethrow;
+      }
       if (abortTrigger != null) {
         unawaited(
           abortTrigger.then<void>((_) {
@@ -243,6 +267,8 @@ final class NativeHttpClientTransport
       }
       return response;
     } finally {
+      await uploadIterator?.cancel();
+      await upload?.close();
       calloc
         ..free(method)
         ..free(url)
@@ -290,6 +316,7 @@ final class NativeHttpClientTransport
       contentType: response.contentType,
       headers: response.headers,
       bodyStream: reader.leases(),
+      closeBody: reader.close,
     );
   }
 
@@ -320,7 +347,7 @@ final class NativeHttpClientTransport
     _completionPort.close();
   }
 
-  Future<_PreparedRequest> _prepareRequest(DartHttpClientRequest request) async {
+  _PreparedRequest _prepareRequest(DartHttpClientRequest request) {
     final nativeBody = request.nativeBody;
     if (nativeBody != null && nativeBody is! NativeHttpRequestBody) {
       throw ArgumentError.value(
@@ -330,11 +357,11 @@ final class NativeHttpClientTransport
       );
     }
     if (request.bodyStream case final bodyStream?) {
-      final builder = BytesBuilder(copy: false);
-      await for (final chunk in bodyStream) {
-        builder.add(chunk);
+      final length = request.bodyStreamLength;
+      if (length != null && length < 0) {
+        throw RangeError.value(length, 'request.bodyStreamLength', 'Length must not be negative.');
       }
-      return _PreparedRequest(bytes: builder.takeBytes());
+      return _PreparedRequest(bodyStream: bodyStream, bodyStreamLength: length);
     }
     if (request.bodyLease case final bodyLease?) {
       if (bodyLease is TransferableNativeByteLease) {
@@ -398,11 +425,20 @@ final class NativeHttpClientTransport
       final body = value.body_stream == nullptr
           ? null
           : NativeByteStreamHandle.fromDescriptor(value.body_stream.cast<NexByteStream>().ref);
-      final bodyBuffer = value.body_buffer == nullptr
-          ? null
-          : NativeBufferLease.fromDescriptor(value.body_buffer.cast<NexBuffer>().ref);
-      if (bodyBuffer != null) {
-        value.body_buffer = nullptr;
+      NativeBufferLease? bodyBuffer;
+      if (value.body_buffer != nullptr) {
+        final descriptor = calloc<NexBuffer>();
+        final transferred = native.dart_http_native_client_result_take_body_buffer(
+          result,
+          descriptor.cast(),
+        );
+        if (!transferred) {
+          calloc.free(descriptor);
+          throw const NativeHttpClientException(
+            'Native HTTP response body ownership could not be transferred.',
+          );
+        }
+        bodyBuffer = NativeBufferLease.fromPointer(descriptor);
       }
       final bodyReader = value.body_reader == nullptr
           ? null
@@ -438,11 +474,133 @@ final class NativeHttpClientTransport
 }
 
 final class _PreparedRequest {
-  const _PreparedRequest({this.bytes, this.nativeBuffer, this.nativeBody});
+  const _PreparedRequest({
+    this.bytes,
+    this.nativeBuffer,
+    this.nativeBody,
+    this.bodyStream,
+    this.bodyStreamLength,
+  });
 
   final Uint8List? bytes;
   final TransferableNativeByteLease? nativeBuffer;
   final NativeHttpRequestBody? nativeBody;
+  final Stream<List<int>>? bodyStream;
+  final int? bodyStreamLength;
+}
+
+final class _NativeRequestBodyUpload {
+  _NativeRequestBodyUpload._(this.clientId, this.id, this._completionPort) {
+    _subscription = _completionPort.listen(_handleCompletion);
+  }
+
+  factory _NativeRequestBodyUpload.open(int clientId) {
+    final completionPort = ReceivePort();
+    final id = native.dart_http_native_client_upload_create(
+      clientId,
+      completionPort.sendPort.nativePort,
+      1,
+    );
+    if (id <= 0) {
+      completionPort.close();
+      throw const NativeHttpClientException('Could not create a native streaming upload.');
+    }
+    return _NativeRequestBodyUpload._(clientId, id, completionPort);
+  }
+
+  final int clientId;
+  final int id;
+  final ReceivePort _completionPort;
+  late final StreamSubscription<Object?> _subscription;
+  final Map<int, Completer<void>> _pending = <int, Completer<void>>{};
+  var _nextWriteId = 1;
+  Future<void>? _closeFuture;
+
+  Future<void>? write(List<int> chunk) {
+    if (_closeFuture != null) {
+      throw const NativeHttpClientException('Native streaming upload is closed.');
+    }
+    if (chunk.isEmpty) return null;
+    final pointer = native.dart_http_native_client_upload_chunk_allocate(chunk.length);
+    if (pointer == nullptr) {
+      throw const NativeHttpClientException('Could not allocate a native streaming upload chunk.');
+    }
+    pointer.asTypedList(chunk.length).setAll(0, chunk);
+    final writeId = _nextWriteId++;
+    final status = native.dart_http_native_client_upload_write(
+      clientId,
+      id,
+      writeId,
+      pointer,
+      chunk.length,
+    );
+    if (status < 0) {
+      throw const NativeHttpClientException('Native streaming upload rejected a chunk.');
+    }
+    if (status > 0) return null;
+    final completion = Completer<void>();
+    _pending[writeId] = completion;
+    return completion.future;
+  }
+
+  Future<void> close() => _closeFuture ??= _close();
+
+  Future<void> _close() async {
+    native.dart_http_native_client_upload_close(clientId, id);
+    for (final completion in _pending.values) {
+      if (!completion.isCompleted) {
+        completion.completeError(
+          const NativeHttpClientException('Native streaming upload closed.'),
+        );
+      }
+    }
+    _pending.clear();
+    await _subscription.cancel();
+    _completionPort.close();
+  }
+
+  void _handleCompletion(Object? message) {
+    if (message is! int || message == 0) return;
+    final completion = _pending.remove(message.abs());
+    if (completion == null || completion.isCompleted) return;
+    if (message > 0) {
+      completion.complete();
+    } else {
+      completion.completeError(
+        const NativeHttpClientException('Native streaming upload receiver closed.'),
+      );
+    }
+  }
+}
+
+Future<void> _pumpRequestBody(
+  StreamIterator<List<int>> iterator,
+  _NativeRequestBodyUpload upload, {
+  required int? expectedLength,
+}) async {
+  var sent = 0;
+  try {
+    while (await iterator.moveNext()) {
+      final chunk = iterator.current;
+      if (expectedLength != null && sent + chunk.length > expectedLength) {
+        throw StateError(
+          'Request body stream exceeded its declared length of '
+          '$expectedLength bytes.',
+        );
+      }
+      final backpressure = upload.write(chunk);
+      if (backpressure != null) await backpressure;
+      sent += chunk.length;
+    }
+    if (expectedLength != null && sent != expectedLength) {
+      throw StateError(
+        'Request body stream produced $sent bytes, but declared '
+        '$expectedLength bytes.',
+      );
+    }
+  } finally {
+    await upload.close();
+  }
 }
 
 final class _NativeResponseData {

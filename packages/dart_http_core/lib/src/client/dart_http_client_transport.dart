@@ -383,6 +383,10 @@ abstract interface class DartHttpClientNativeWebSocketByteStream {
   /// Pauses pulls and completes after previously accepted chunks are flushed.
   Future<DartHttpClientNativeWebSocketByteStreamStats> pauseAndFlush();
 
+  /// Keeps pulling until the producer reaches EOF, then completes after every
+  /// accepted chunk has been flushed to the WebSocket writer.
+  Future<DartHttpClientNativeWebSocketByteStreamStats> drainAndFlush();
+
   /// Cancels and releases the adopted producer stream natively.
   void close();
 }
@@ -395,6 +399,10 @@ abstract interface class DartHttpClientNativeWebSocketBase64TextStream {
 
   /// Pauses pulls and completes after previously accepted chunks are flushed.
   Future<DartHttpClientNativeWebSocketByteStreamStats> pauseAndFlush();
+
+  /// Keeps pulling until the producer reaches EOF, then completes after every
+  /// accepted chunk has been flushed to the WebSocket writer.
+  Future<DartHttpClientNativeWebSocketByteStreamStats> drainAndFlush();
 
   /// Cancels and releases the adopted producer stream natively.
   void close();

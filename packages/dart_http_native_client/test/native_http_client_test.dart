@@ -43,6 +43,132 @@ void main() {
     expect(jsonDecode(response.body), {'received': 'native request'});
   });
 
+  test('streams a Dart request body before its source completes', () async {
+    final firstChunkReceived = Completer<void>();
+    final releaseSecondChunk = Completer<void>();
+    server.listen((request) async {
+      final received = <int>[];
+      await for (final chunk in request) {
+        received.addAll(chunk);
+        if (!firstChunkReceived.isCompleted) firstChunkReceived.complete();
+      }
+      request.response.add(received);
+      await request.response.close();
+    });
+
+    final responseFuture = transport.send(
+      DartHttpClientRequest(
+        method: HttpMethod.post,
+        uri: Uri.parse('http://${server.address.host}:${server.port}/stream-upload'),
+        bodyStream: () async* {
+          yield const <int>[1, 2, 3];
+          await releaseSecondChunk.future;
+          yield const <int>[4, 5, 6];
+        }(),
+        bodyStreamLength: 6,
+      ),
+    );
+
+    await firstChunkReceived.future.timeout(const Duration(seconds: 5));
+    releaseSecondChunk.complete();
+    final response = await responseFuture.timeout(const Duration(seconds: 5));
+    expect(response.bodyBytes, const <int>[1, 2, 3, 4, 5, 6]);
+  });
+
+  test('streams a Dart request body with unknown content length', () async {
+    server.listen((request) async {
+      final received = await request.fold<int>(0, (count, chunk) => count + chunk.length);
+      request.response.write(received);
+      await request.response.close();
+    });
+
+    final response = await transport.send(
+      DartHttpClientRequest(
+        method: HttpMethod.post,
+        uri: Uri.parse('http://${server.address.host}:${server.port}/chunked-upload'),
+        bodyStream: Stream<List<int>>.fromIterable(const <List<int>>[
+          <int>[1, 2],
+          <int>[3, 4, 5],
+        ]),
+      ),
+    );
+
+    expect(response.body, '5');
+  });
+
+  test('rejects a Dart request body that exceeds its declared length', () async {
+    server.listen((request) async {
+      await request.drain<void>();
+      await request.response.close();
+    });
+
+    expect(
+      transport.send(
+        DartHttpClientRequest(
+          method: HttpMethod.post,
+          uri: Uri.parse('http://${server.address.host}:${server.port}/invalid-upload'),
+          bodyStream: Stream<List<int>>.value(const <int>[1, 2, 3]),
+          bodyStreamLength: 2,
+        ),
+      ),
+      throwsA(
+        isA<StateError>().having(
+          (error) => error.message,
+          'message',
+          contains('exceeded its declared length'),
+        ),
+      ),
+    );
+  });
+
+  test('cancels a streaming upload when its Dart source fails', () async {
+    server.listen((request) async {
+      await request.drain<void>();
+      await request.response.close();
+    });
+    final source = StreamController<List<int>>();
+    final responseFuture = transport.send(
+      DartHttpClientRequest(
+        method: HttpMethod.post,
+        uri: Uri.parse('http://${server.address.host}:${server.port}/failed-upload'),
+        bodyStream: source.stream,
+      ),
+    );
+    source
+      ..add(const <int>[1, 2, 3])
+      ..addError(StateError('source failed'));
+    await source.close();
+
+    await expectLater(
+      responseFuture,
+      throwsA(isA<StateError>().having((error) => error.message, 'message', 'source failed')),
+    );
+  });
+
+  test('cancels a dormant Dart body source when the request is aborted', () async {
+    server.listen((request) async {
+      await request.drain<void>();
+      await request.response.close();
+    });
+    final sourceCanceled = Completer<void>();
+    final source = StreamController<List<int>>(onCancel: () => sourceCanceled.complete());
+    final abort = Completer<void>();
+    final responseFuture = transport.send(
+      DartHttpClientRequest(
+        method: HttpMethod.post,
+        uri: Uri.parse('http://${server.address.host}:${server.port}/aborted-upload'),
+        bodyStream: source.stream,
+        abortTrigger: abort.future,
+      ),
+    );
+    source.add(const <int>[1, 2, 3]);
+    abort.complete();
+
+    await expectLater(responseFuture, throwsA(isA<NativeHttpClientException>()));
+    await sourceCanceled.future.timeout(const Duration(seconds: 5));
+    await source.close();
+  });
+
   test('prewarms idempotently and reuses the process-wide connection pool', () async {
     await Future.wait([NativeHttpClientRuntime.prewarm(), NativeHttpClientRuntime.prewarm()]);
     final remotePorts = <int>[];
@@ -286,6 +412,43 @@ void main() {
     expect(utf8.decode(second.bytesView), 'second');
     second.close();
     expect(await iterator.moveNext(), isFalse);
+  });
+
+  test('closes a leased stream before it is listened to', () async {
+    server.listen((request) async {
+      request.response.bufferOutput = false;
+      request.response.write('first');
+      await request.response.flush();
+      await Future<void>.delayed(const Duration(seconds: 30));
+    });
+
+    final response = await transport.sendLeasedStream(
+      DartHttpClientRequest(
+        method: HttpMethod.get,
+        uri: Uri.parse('http://${server.address.host}:${server.port}/abandoned-stream'),
+      ),
+    );
+
+    await response.close().timeout(const Duration(seconds: 5));
+    await response.close();
+    expect(response.bodyStream.listen(null).asFuture<void>(), completes);
+  });
+
+  test('closes an unconsumed native response idempotently', () async {
+    server.listen((request) async {
+      request.response.write('native body');
+      await request.response.close();
+    });
+
+    final response = await transport.sendNative(
+      DartHttpClientRequest(
+        method: HttpMethod.get,
+        uri: Uri.parse('http://${server.address.host}:${server.port}/native-close'),
+      ),
+    );
+
+    await response.close();
+    await response.close();
   });
 
   test('delivers a flushed SSE event before the response finishes', () async {
@@ -674,6 +837,7 @@ void main() {
     final sourceBytes = <int>[for (var index = 0; index < 256 * 1024; index++) index & 0xff];
     final receivedBytes = <int>[];
     final receivedAll = Completer<void>();
+    final allowSourceEof = Completer<void>();
     server.listen((request) async {
       if (WebSocketTransformer.isUpgradeRequest(request)) {
         final socket = await WebSocketTransformer.upgrade(request);
@@ -692,6 +856,7 @@ void main() {
         request.response.add(sourceBytes.sublist(offset, offset + 16 * 1024));
         await request.response.flush();
       }
+      await allowSourceEof.future;
       await request.response.close();
     });
     final socket = await transport.connect(
@@ -710,8 +875,15 @@ void main() {
     addTearDown(pump.close);
 
     pump.resume(prefix: '{"audio":"', suffix: '"}');
+    var drainCompleted = false;
+    final drain = pump.drainAndFlush().then((stats) {
+      drainCompleted = true;
+      return stats;
+    });
     await receivedAll.future.timeout(const Duration(seconds: 10));
-    final stats = await pump.pauseAndFlush().timeout(const Duration(seconds: 10));
+    expect(drainCompleted, isFalse);
+    allowSourceEof.complete();
+    final stats = await drain.timeout(const Duration(seconds: 10));
 
     expect(receivedBytes, sourceBytes);
     expect(stats.byteCount, sourceBytes.length);

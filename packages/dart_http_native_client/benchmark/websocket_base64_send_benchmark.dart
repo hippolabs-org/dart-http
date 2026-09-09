@@ -22,6 +22,7 @@ Future<void> main(List<String> arguments) async {
   stdout.writeln('\nNative producer → base64 WebSocket pump:');
   await _benchmarkPump(size: 960, iterations: iterations);
   await _benchmarkPump(size: 64 * 1024, iterations: iterations > 128 ? 128 : iterations);
+  await _benchmarkEofFence();
 }
 
 Future<void> _benchmarkSize({required int size, required int iterations}) async {
@@ -202,9 +203,72 @@ Future<Duration> _runPumpTrial({required int size, required int iterations}) asy
   try {
     final stopwatch = Stopwatch()..start();
     pump.resume(prefix: _prefix, suffix: _suffix);
+    await pump.drainAndFlush().timeout(const Duration(seconds: 20));
     await receivedAll.future.timeout(const Duration(seconds: 20));
-    await pump.pauseAndFlush().timeout(const Duration(seconds: 20));
     stopwatch.stop();
+    return stopwatch.elapsed;
+  } finally {
+    pump.close();
+    await socket.close();
+    transport.close();
+    await server.close(force: true);
+  }
+}
+
+Future<void> _benchmarkEofFence() async {
+  final samples = <Duration>[];
+  for (var sample = 0; sample < 21; sample++) {
+    final elapsed = await _runEofFenceTrial();
+    if (sample != 0) samples.add(elapsed);
+  }
+  samples.sort();
+  final median = samples[samples.length ~/ 2];
+  final p95 = samples[(samples.length * 0.95).ceil() - 1];
+  stdout.writeln(
+    'EOF + writer fence       median ${median.inMicroseconds} us  '
+    'p95 ${p95.inMicroseconds} us',
+  );
+}
+
+Future<Duration> _runEofFenceTrial() async {
+  final allowEof = Completer<void>();
+  final received = Completer<void>();
+  final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+  server.listen((request) async {
+    if (WebSocketTransformer.isUpgradeRequest(request)) {
+      final socket = await WebSocketTransformer.upgrade(request);
+      socket.listen((_) {
+        if (!received.isCompleted) received.complete();
+      }, onError: received.completeError);
+      return;
+    }
+    request.response.add(List<int>.filled(640, 1));
+    await request.response.flush();
+    await allowEof.future;
+    await request.response.close();
+  });
+
+  final transport = await NativeHttpClientTransport.open();
+  final socket = await transport.connect(
+    DartHttpClientWebSocketRequest(
+      uri: Uri.parse('ws://${server.address.host}:${server.port}/eof-fence'),
+    ),
+  );
+  final response = await transport.sendNative(
+    DartHttpClientRequest(
+      method: HttpMethod.get,
+      uri: Uri.parse('http://${server.address.host}:${server.port}/source'),
+    ),
+  );
+  final pump = (socket as DartHttpClientNativeStreamWebSocket).adoptBase64TextStream(response.body);
+  try {
+    pump.resume(prefix: _prefix, suffix: _suffix);
+    final stopwatch = Stopwatch()..start();
+    final drain = pump.drainAndFlush();
+    allowEof.complete();
+    await drain.timeout(const Duration(seconds: 5));
+    stopwatch.stop();
+    await received.future.timeout(const Duration(seconds: 5));
     return stopwatch.elapsed;
   } finally {
     pump.close();

@@ -696,6 +696,21 @@ abstract base class _NativeHttpWebSocketAdoptedStream {
         _socket._socketId,
       ),
     );
+    return _stats();
+  }
+
+  Future<DartHttpClientNativeWebSocketByteStreamStats> drainAndFlush() async {
+    _ensureOpen();
+    await _socket._scheduleOperation(
+      () => native.dart_http_native_client_websocket_drain_byte_stream(
+        _socket._transport._clientId,
+        _socket._socketId,
+      ),
+    );
+    return _stats();
+  }
+
+  DartHttpClientNativeWebSocketByteStreamStats _stats() {
     final chunkCount = calloc<Uint64>();
     final byteCount = calloc<Uint64>();
     try {

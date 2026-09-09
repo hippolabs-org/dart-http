@@ -47,6 +47,8 @@ int64_t dart_http_native_client_start(
     intptr_t header_count,
     const uint8_t* body,
     intptr_t body_length,
+    int64_t dart_upload_id,
+    int64_t dart_upload_length,
     void* native_buffer,
     void* native_body,
     int64_t native_body_length,
@@ -55,10 +57,27 @@ int64_t dart_http_native_client_start(
     const uint8_t* native_suffix,
     intptr_t native_suffix_length,
     int32_t response_mode);
+int64_t dart_http_native_client_upload_create(
+    int64_t client_id,
+    int64_t completion_port,
+    intptr_t capacity);
+uint8_t* dart_http_native_client_upload_chunk_allocate(intptr_t length);
+int32_t dart_http_native_client_upload_write(
+    int64_t client_id,
+    int64_t upload_id,
+    int64_t write_id,
+    uint8_t* bytes,
+    intptr_t length);
+bool dart_http_native_client_upload_close(
+    int64_t client_id,
+    int64_t upload_id);
 bool dart_http_native_client_cancel(int64_t client_id, int64_t request_id);
 NativeHttpResult* dart_http_native_client_take_result(
     int64_t client_id,
     int64_t request_id);
+bool dart_http_native_client_result_take_body_buffer(
+    NativeHttpResult* result,
+    void* out_buffer);
 void dart_http_native_client_free_result(NativeHttpResult* result);
 int32_t dart_http_native_client_response_reader_request_next(
     void* reader,
@@ -143,6 +162,9 @@ bool dart_http_native_client_websocket_resume_base64_text_stream(
     const uint8_t* suffix,
     intptr_t suffix_length);
 int64_t dart_http_native_client_websocket_pause_byte_stream(
+    int64_t client_id,
+    int64_t socket_id);
+int64_t dart_http_native_client_websocket_drain_byte_stream(
     int64_t client_id,
     int64_t socket_id);
 bool dart_http_native_client_websocket_byte_stream_stats(

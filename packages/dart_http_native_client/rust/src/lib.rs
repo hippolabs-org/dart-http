@@ -37,7 +37,7 @@ use tokio_tungstenite::tungstenite::protocol::{
 use tokio_tungstenite::{Connector, connect_async_tls_with_config};
 use tokio_util::sync::CancellationToken;
 
-const ABI_VERSION: i32 = 10;
+const ABI_VERSION: i32 = 13;
 const RESPONSE_MODE_NATIVE_STREAM: i32 = 0;
 const RESPONSE_MODE_BUFFERED: i32 = 1;
 const RESPONSE_MODE_DIRECT_STREAM: i32 = 2;
@@ -105,8 +105,10 @@ struct ClientState {
     next_request_id: AtomicI64,
     next_socket_id: AtomicI64,
     next_response_reader_id: AtomicI64,
+    next_upload_id: AtomicI64,
     tasks: Mutex<HashMap<i64, RequestTask>>,
     results: Mutex<HashMap<i64, Result<ResponseData, String>>>,
+    uploads: Mutex<HashMap<i64, Arc<DartUploadState>>>,
     web_sockets: Mutex<HashMap<i64, Arc<WebSocketState>>>,
     closed: AtomicBool,
 }
@@ -114,6 +116,14 @@ struct ClientState {
 struct RequestTask {
     cancellation: CancellationToken,
     native_body_cancel: Option<RequestStreamCancel>,
+}
+
+type DartUploadItem = Result<Bytes, io::Error>;
+
+struct DartUploadState {
+    sender: mpsc::Sender<DartUploadItem>,
+    receiver: Mutex<Option<mpsc::Receiver<DartUploadItem>>>,
+    completion_port: NativeCompletionPort,
 }
 
 struct WebSocketState {
@@ -165,6 +175,7 @@ impl Drop for WebSocketByteStreamPump {
 enum WebSocketByteStreamControl {
     Resume(WebSocketByteStreamFraming),
     Pause { operation_id: i64 },
+    Drain { operation_id: i64 },
     Stop,
 }
 
@@ -506,8 +517,10 @@ pub extern "C" fn dart_http_native_client_create(
         next_request_id: AtomicI64::new(1),
         next_socket_id: AtomicI64::new(1),
         next_response_reader_id: AtomicI64::new(1),
+        next_upload_id: AtomicI64::new(1),
         tasks: Mutex::new(HashMap::new()),
         results: Mutex::new(HashMap::new()),
+        uploads: Mutex::new(HashMap::new()),
         web_sockets: Mutex::new(HashMap::new()),
         closed: AtomicBool::new(false),
     });
@@ -541,6 +554,9 @@ pub extern "C" fn dart_http_native_client_close(client_id: i64) {
     if let Ok(mut results) = state.results.lock() {
         results.clear();
     }
+    if let Ok(mut uploads) = state.uploads.lock() {
+        uploads.clear();
+    }
     if let Ok(mut sockets) = state.web_sockets.lock() {
         for (_, socket) in sockets.drain() {
             socket.cancellation.cancel();
@@ -565,6 +581,8 @@ pub unsafe extern "C" fn dart_http_native_client_start(
     header_count: isize,
     body: *const u8,
     body_length: isize,
+    dart_upload_id: i64,
+    dart_upload_length: i64,
     native_buffer: *mut c_void,
     native_body: *mut c_void,
     native_body_length: i64,
@@ -598,6 +616,8 @@ pub unsafe extern "C" fn dart_http_native_client_start(
             header_count,
             body,
             body_length,
+            dart_upload_id,
+            dart_upload_length,
             native_buffer,
             native_body,
             native_body_length,
@@ -644,6 +664,123 @@ pub unsafe extern "C" fn dart_http_native_client_start(
         complete_request(&task_state, request_id, result);
     });
     request_id
+}
+
+#[unsafe(no_mangle)]
+/// Creates a bounded upload whose receiver can be adopted by one HTTP request.
+pub extern "C" fn dart_http_native_client_upload_create(
+    client_id: i64,
+    completion_port: i64,
+    capacity: isize,
+) -> i64 {
+    let Some(state) = client_state(client_id) else {
+        return 0;
+    };
+    let Some(capacity) = bounded_capacity(capacity) else {
+        return 0;
+    };
+    if completion_port <= 0 || state.closed.load(Ordering::Acquire) {
+        return 0;
+    }
+    let upload_id = state.next_upload_id.fetch_add(1, Ordering::Relaxed);
+    let (sender, receiver) = mpsc::channel(capacity);
+    let upload = Arc::new(DartUploadState {
+        sender,
+        receiver: Mutex::new(Some(receiver)),
+        completion_port: NativeCompletionPort::new(completion_port),
+    });
+    match state.uploads.lock() {
+        Ok(mut uploads) => {
+            uploads.insert(upload_id, upload);
+            upload_id
+        }
+        Err(_) => 0,
+    }
+}
+
+#[unsafe(no_mangle)]
+/// Allocates one writable upload chunk using the Rust allocator.
+pub extern "C" fn dart_http_native_client_upload_chunk_allocate(length: isize) -> *mut u8 {
+    let Ok(length) = usize::try_from(length) else {
+        return ptr::null_mut();
+    };
+    if length == 0 {
+        return ptr::null_mut();
+    }
+    Box::into_raw(vec![0_u8; length].into_boxed_slice()).cast::<u8>()
+}
+
+#[unsafe(no_mangle)]
+/// Transfers one allocated chunk into a bounded asynchronous upload.
+///
+/// The allocation is consumed on every return path. Returns `1` when admitted
+/// immediately, `0` when Dart must await a completion, and `-1` on rejection.
+/// Deferred completion posts `write_id` for success and `-write_id` when the
+/// receiver has closed.
+///
+/// # Safety
+///
+/// `bytes` must be a pointer returned by
+/// `dart_http_native_client_upload_chunk_allocate` for exactly `length` bytes.
+pub unsafe extern "C" fn dart_http_native_client_upload_write(
+    client_id: i64,
+    upload_id: i64,
+    write_id: i64,
+    bytes: *mut u8,
+    length: isize,
+) -> i32 {
+    let Ok(length) = usize::try_from(length) else {
+        return -1;
+    };
+    if bytes.is_null() || length == 0 {
+        return -1;
+    }
+    let chunk = unsafe { Box::from_raw(ptr::slice_from_raw_parts_mut(bytes, length)) };
+    if write_id <= 0 {
+        return -1;
+    }
+    let Some(state) = client_state(client_id) else {
+        return -1;
+    };
+    let upload = state
+        .uploads
+        .lock()
+        .ok()
+        .and_then(|uploads| uploads.get(&upload_id).cloned());
+    let Some(upload) = upload else {
+        return -1;
+    };
+    let item = Ok(Bytes::from(chunk));
+    match upload.sender.try_send(item) {
+        Ok(()) => 1,
+        Err(mpsc::error::TrySendError::Full(item)) => {
+            let Ok(runtime) = shared_runtime() else {
+                return -1;
+            };
+            runtime.spawn(async move {
+                let sent = upload.sender.send(item).await.is_ok();
+                upload
+                    .completion_port
+                    .post(if sent { write_id } else { -write_id });
+            });
+            0
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => -1,
+    }
+}
+
+#[unsafe(no_mangle)]
+/// Finishes or cancels an upload and closes its HTTP body stream.
+pub extern "C" fn dart_http_native_client_upload_close(client_id: i64, upload_id: i64) -> bool {
+    client_state(client_id)
+        .and_then(|state| {
+            state
+                .uploads
+                .lock()
+                .ok()
+                .and_then(|mut uploads| uploads.remove(&upload_id))
+        })
+        .is_some()
 }
 
 #[unsafe(no_mangle)]
@@ -697,6 +834,33 @@ pub extern "C" fn dart_http_native_client_take_result(
         },
     };
     Box::into_raw(Box::new(result))
+}
+
+#[unsafe(no_mangle)]
+/// Moves an owning response buffer into caller-owned descriptor storage.
+///
+/// The payload ownership is transferred without copying its bytes. The
+/// descriptor storage originally owned by the result is released here.
+///
+/// # Safety
+///
+/// `result` must be a live result returned by
+/// `dart_http_native_client_take_result`. `out_buffer` must point to writable,
+/// properly aligned storage for one `NexBuffer`.
+pub unsafe extern "C" fn dart_http_native_client_result_take_body_buffer(
+    result: *mut NativeHttpResult,
+    out_buffer: *mut c_void,
+) -> bool {
+    let Some(result) = (unsafe { result.as_mut() }) else {
+        return false;
+    };
+    if out_buffer.is_null() || result.body_buffer.is_null() {
+        return false;
+    }
+    let descriptor = unsafe { Box::from_raw(result.body_buffer.cast::<NexBuffer>()) };
+    result.body_buffer = ptr::null_mut();
+    unsafe { out_buffer.cast::<NexBuffer>().write(*descriptor) };
+    true
 }
 
 #[unsafe(no_mangle)]
@@ -1327,6 +1491,32 @@ pub extern "C" fn dart_http_native_client_websocket_pause_byte_stream(
 }
 
 #[unsafe(no_mangle)]
+/// Keeps pulling the attached stream through producer EOF and returns an
+/// ordered writer-fence operation after every accepted chunk has flushed.
+pub extern "C" fn dart_http_native_client_websocket_drain_byte_stream(
+    client_id: i64,
+    socket_id: i64,
+) -> i64 {
+    let Some(socket) = web_socket_state(client_id, socket_id) else {
+        return 0;
+    };
+    let operation_id = socket.next_operation_id.fetch_add(1, Ordering::Relaxed);
+    let Ok(attached) = socket.byte_stream.lock() else {
+        return 0;
+    };
+    let Some(pump) = attached.as_ref() else {
+        return 0;
+    };
+    match pump
+        .controls
+        .send(WebSocketByteStreamControl::Drain { operation_id })
+    {
+        Ok(()) => operation_id,
+        Err(_) => 0,
+    }
+}
+
+#[unsafe(no_mangle)]
 /// Reads counters for the last segment after its pause fence has completed.
 ///
 /// # Safety
@@ -1554,6 +1744,8 @@ fn run_web_socket_byte_stream(
 ) {
     let mut framing: Option<WebSocketByteStreamFraming> = None;
     let mut pending: Option<Bytes> = None;
+    let mut drain_operation_ids = Vec::<i64>::new();
+    let mut source_done = false;
     loop {
         if framing.is_none() {
             match controls.recv() {
@@ -1568,6 +1760,19 @@ fn run_web_socket_byte_stream(
                         .is_err()
                     {
                         return;
+                    }
+                    continue;
+                }
+                Ok(WebSocketByteStreamControl::Drain { operation_id }) => {
+                    if source_done {
+                        if commands
+                            .send(WebSocketCommand::Fence { operation_id })
+                            .is_err()
+                        {
+                            return;
+                        }
+                    } else {
+                        drain_operation_ids.push(operation_id);
                     }
                     continue;
                 }
@@ -1591,6 +1796,9 @@ fn run_web_socket_byte_stream(
                         return;
                     }
                 }
+                WebSocketByteStreamControl::Drain { operation_id } => {
+                    drain_operation_ids.push(operation_id);
+                }
                 WebSocketByteStreamControl::Stop => return,
             }
         }
@@ -1605,7 +1813,16 @@ fn run_web_socket_byte_stream(
                 // Keep the control side alive after producer EOF so a segment
                 // commit can still enqueue its ordered pause fence.
                 Ok(RequestStreamRead::Done) => {
+                    source_done = true;
                     framing = None;
+                    for operation_id in drain_operation_ids.drain(..) {
+                        if commands
+                            .send(WebSocketCommand::Fence { operation_id })
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
                     continue;
                 }
                 Err(error) => {
@@ -1634,6 +1851,9 @@ fn run_web_socket_byte_stream(
                 stats.chunks.store(0, Ordering::Release);
                 stats.bytes.store(0, Ordering::Release);
                 framing = Some(value);
+            }
+            Ok(WebSocketByteStreamControl::Drain { operation_id }) => {
+                drain_operation_ids.push(operation_id);
             }
             Ok(WebSocketByteStreamControl::Stop) => return,
             Err(std_mpsc::TryRecvError::Disconnected) => return,
@@ -2091,6 +2311,8 @@ unsafe fn prepare_request(
     header_count: isize,
     body: *const u8,
     body_length: isize,
+    dart_upload_id: i64,
+    dart_upload_length: i64,
     native_buffer: *mut c_void,
     native_body: *mut c_void,
     native_body_length: i64,
@@ -2099,8 +2321,12 @@ unsafe fn prepare_request(
     native_suffix: *const u8,
     native_suffix_length: isize,
 ) -> Result<(reqwest::Request, Option<RequestStreamCancel>), String> {
-    if !native_buffer.is_null() && !native_body.is_null() {
-        return Err("A request cannot contain both a native buffer and native stream.".to_owned());
+    let body_source_count = usize::from(body_length > 0)
+        + usize::from(dart_upload_id > 0)
+        + usize::from(!native_buffer.is_null())
+        + usize::from(!native_body.is_null());
+    if body_source_count > 1 {
+        return Err("A request cannot contain multiple body sources.".to_owned());
     }
     let method = Method::from_bytes(unsafe { required_c_str(method, "method")? }.as_bytes())
         .map_err(|error| format!("Invalid HTTP method: {error}"))?;
@@ -2118,7 +2344,31 @@ unsafe fn prepare_request(
         .build()
         .map_err(|error| format!("Could not build HTTP request: {error}"))?;
     let mut body_cancel = None;
-    if !native_buffer.is_null() {
+    if dart_upload_id > 0 {
+        let upload = state
+            .uploads
+            .lock()
+            .map_err(|_| "Dart upload registry is unavailable.".to_owned())?
+            .get(&dart_upload_id)
+            .cloned()
+            .ok_or_else(|| "Dart upload is unavailable.".to_owned())?;
+        let receiver = upload
+            .receiver
+            .lock()
+            .map_err(|_| "Dart upload receiver is unavailable.".to_owned())?
+            .take()
+            .ok_or_else(|| "Dart upload has already been consumed.".to_owned())?;
+        *request.body_mut() = Some(Body::wrap_stream(ReceiverStream::new(receiver)));
+        if dart_upload_length >= 0 {
+            request.headers_mut().insert(
+                reqwest::header::CONTENT_LENGTH,
+                dart_upload_length
+                    .to_string()
+                    .parse()
+                    .expect("a non-negative integer is a valid header value"),
+            );
+        }
+    } else if !native_buffer.is_null() {
         let descriptor_pointer = native_buffer.cast::<NexBuffer>();
         let descriptor = unsafe { &*descriptor_pointer };
         if !descriptor.is_valid() || descriptor.capabilities & NEX_CAPABILITY_THREAD_SAFE == 0 {
