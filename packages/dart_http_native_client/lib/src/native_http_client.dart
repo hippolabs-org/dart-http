@@ -7,15 +7,18 @@ import 'dart:typed_data';
 import 'package:dart_http_core/dart_http_core.dart';
 import 'package:ffi/ffi.dart';
 import 'package:native_exchange/native_exchange_ffi.dart';
-import 'package:native_exchange_runtime/native_exchange_runtime.dart';
 
 import 'generated_bindings.dart' as native;
 import 'native_http_request_body.dart';
 import 'native_http_response.dart';
 
 part 'native_http_web_socket.dart';
+part 'native_http_response_reader.dart';
 
-const _nativeAbiVersion = 9;
+const _nativeAbiVersion = 10;
+const _responseModeNativeStream = 0;
+const _responseModeBuffered = 1;
+const _responseModeDirectStream = 2;
 
 /// Failure reported by the asynchronous native HTTP engine.
 final class NativeHttpClientException implements Exception {
@@ -109,11 +112,12 @@ final class NativeHttpClientTransport
   late final StreamSubscription<Object?> _subscription;
   final Map<int, Completer<_NativeResponseData>> _pending = {};
   final Map<int, NativeHttpWebSocket> _webSockets = {};
+  final Map<int, _NativeHttpResponseReader> _responseReaders = {};
   var _closed = false;
 
   /// Sends a request while preserving the response body as Native Exchange.
   Future<NativeHttpResponse> sendNative(DartHttpClientRequest request) async {
-    final response = await _send(request, bufferResponse: false);
+    final response = await _send(request, responseMode: _responseModeNativeStream);
     final body = response.body;
     if (body == null) {
       throw const NativeHttpClientException('Native HTTP response had no body stream.');
@@ -128,7 +132,7 @@ final class NativeHttpClientTransport
 
   /// Sends a buffered request while keeping its response body native-owned.
   Future<NativeHttpBufferedResponse> sendLeased(DartHttpClientRequest request) async {
-    final response = await _send(request, bufferResponse: true);
+    final response = await _send(request, responseMode: _responseModeBuffered);
     final body = response.bodyBuffer;
     if (body == null) {
       throw const NativeHttpClientException('Native HTTP response had no buffered body.');
@@ -143,7 +147,7 @@ final class NativeHttpClientTransport
 
   Future<_NativeResponseData> _send(
     DartHttpClientRequest request, {
-    required bool bufferResponse,
+    required int responseMode,
   }) async {
     _ensureOpen();
     final prepared = await _prepareRequest(request);
@@ -206,7 +210,7 @@ final class NativeHttpClientTransport
         nativePrefix?.length ?? 0,
         suffixPointer,
         nativeSuffix?.length ?? 0,
-        bufferResponse,
+        responseMode,
       );
       if (requestId <= 0) {
         nativeBufferTransfer?.close();
@@ -232,6 +236,7 @@ final class NativeHttpClientTransport
         unawaited(
           abortTrigger.then<void>((_) {
             response.body?.close();
+            response.bodyReader?.close();
             response.bodyBuffer?.close();
           }, onError: (Object _, StackTrace _) {}),
         );
@@ -264,13 +269,27 @@ final class NativeHttpClientTransport
 
   @override
   Future<DartHttpClientStreamedResponse> sendStream(DartHttpClientRequest request) async {
-    final response = await sendNative(request);
-    final reader = NativeStreamReader.adopt(response.body.takeNative());
+    final response = await sendLeasedStream(request);
     return DartHttpClientStreamedResponse(
       status: response.status,
       contentType: response.contentType,
       headers: response.headers,
-      bodyStream: reader.copies(),
+      bodyStream: _copyResponseLeases(response.bodyStream),
+    );
+  }
+
+  /// Sends a streamed request whose chunks remain native-owned until released.
+  Future<NativeHttpLeasedStreamedResponse> sendLeasedStream(DartHttpClientRequest request) async {
+    final response = await _send(request, responseMode: _responseModeDirectStream);
+    final reader = response.bodyReader;
+    if (reader == null) {
+      throw const NativeHttpClientException('Native HTTP response had no direct body reader.');
+    }
+    return NativeHttpLeasedStreamedResponse(
+      status: response.status,
+      contentType: response.contentType,
+      headers: response.headers,
+      bodyStream: reader.leases(),
     );
   }
 
@@ -292,6 +311,10 @@ final class NativeHttpClientTransport
       socket._transportClosed();
     }
     _webSockets.clear();
+    for (final reader in _responseReaders.values.toList()) {
+      reader._transportClosed();
+    }
+    _responseReaders.clear();
     native.dart_http_native_client_close(_clientId);
     unawaited(_subscription.cancel());
     _completionPort.close();
@@ -335,8 +358,12 @@ final class NativeHttpClientTransport
     if (message < 0) {
       final notification = -message;
       final kind = notification & 7;
-      final socketId = notification >> 3;
-      _webSockets[socketId]?._handleNotification(kind);
+      final resourceId = notification >> 3;
+      if (kind == _responseReaderEventReady) {
+        _responseReaders[resourceId]?._handleNotification();
+      } else {
+        _webSockets[resourceId]?._handleNotification(kind);
+      }
       return;
     }
     final completer = _pending.remove(message);
@@ -377,12 +404,24 @@ final class NativeHttpClientTransport
       if (bodyBuffer != null) {
         value.body_buffer = nullptr;
       }
+      final bodyReader = value.body_reader == nullptr
+          ? null
+          : _NativeHttpResponseReader.adopt(
+              transport: this,
+              readerId: value.body_reader_id,
+              reader: value.body_reader,
+            );
+      if (bodyReader != null) {
+        value.body_reader = nullptr;
+        _responseReaders[value.body_reader_id] = bodyReader;
+      }
       completer.complete(
         _NativeResponseData(
           status: value.status_code,
           contentType: headers['content-type'] ?? '',
           headers: Map.unmodifiable(headers),
           body: body,
+          bodyReader: bodyReader,
           bodyBuffer: bodyBuffer,
         ),
       );
@@ -412,6 +451,7 @@ final class _NativeResponseData {
     required this.contentType,
     required this.headers,
     required this.body,
+    required this.bodyReader,
     required this.bodyBuffer,
   });
 
@@ -419,7 +459,18 @@ final class _NativeResponseData {
   final String contentType;
   final Map<String, String> headers;
   final NativeByteStreamHandle? body;
+  final _NativeHttpResponseReader? bodyReader;
   final NativeBufferLease? bodyBuffer;
+}
+
+Stream<Uint8List> _copyResponseLeases(Stream<NativeBufferLease> leases) async* {
+  await for (final lease in leases) {
+    try {
+      yield lease.copyBytes();
+    } finally {
+      lease.close();
+    }
+  }
 }
 
 bool _nativeInitialized = false;

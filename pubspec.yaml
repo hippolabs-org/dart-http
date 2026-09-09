@@ -13,9 +13,6 @@ dev_dependencies:
     hosted: https://pub.hippolabs.org
     version: ^0.1.2
   melos: ^8.6.0
-  native_exchange_runtime:
-    hosted: https://pub.hippolabs.org
-    version: ^0.2.0
 
 workspace:
   - packages/*

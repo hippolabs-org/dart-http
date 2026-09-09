@@ -28,8 +28,23 @@ await for (final chunk in response.bodyStream) {
 transport.close();
 ```
 
-Use `sendNative` when the consumer can keep the response body in Native
-Exchange instead of materializing chunks in the Dart heap.
+Use `sendLeasedStream` when the consumer can process each response chunk as a
+zero-copy Native Exchange lease. Close every lease after consuming its native
+byte view; requesting the next chunk applies demand-driven backpressure:
+
+```dart
+final response = await transport.sendLeasedStream(request);
+await for (final lease in response.bodyStream) {
+  try {
+    consume(lease.bytesView);
+  } finally {
+    lease.close();
+  }
+}
+```
+
+`sendNative` remains available for transferring the complete response body as
+a generic Native Exchange byte-stream descriptor to another native consumer.
 
 Use `sendLeased` for a buffered native-owned body. The lease must be closed or
 transferred. Ordinary `send` wraps the same lease and creates Dart bytes only

@@ -250,6 +250,44 @@ void main() {
     expect(body, 'first-second');
   });
 
+  test('streams response chunks as zero-copy native leases', () async {
+    final releaseSecondChunk = Completer<void>();
+    addTearDown(() {
+      if (!releaseSecondChunk.isCompleted) releaseSecondChunk.complete();
+    });
+    server.listen((request) async {
+      request.response.bufferOutput = false;
+      request.response.write('first');
+      await request.response.flush();
+      await releaseSecondChunk.future;
+      request.response.write('second');
+      await request.response.close();
+    });
+
+    final response = await transport.sendLeasedStream(
+      DartHttpClientRequest(
+        method: HttpMethod.get,
+        uri: Uri.parse('http://${server.address.host}:${server.port}/leased-stream'),
+      ),
+    );
+    final iterator = StreamIterator(response.bodyStream);
+    addTearDown(iterator.cancel);
+
+    expect(await iterator.moveNext(), isTrue);
+    final first = iterator.current;
+    expect(utf8.decode(first.bytesView), 'first');
+    expect(first.isClosed, isFalse);
+    first.close();
+    expect(first.isClosed, isTrue);
+
+    releaseSecondChunk.complete();
+    expect(await iterator.moveNext(), isTrue);
+    final second = iterator.current;
+    expect(utf8.decode(second.bytesView), 'second');
+    second.close();
+    expect(await iterator.moveNext(), isFalse);
+  });
+
   test('delivers a flushed SSE event before the response finishes', () async {
     final releaseSecondEvent = Completer<void>();
     addTearDown(() {
@@ -291,6 +329,36 @@ void main() {
     releaseSecondEvent.complete();
     await subscription.asFuture<void>();
     expect(body.toString(), 'data: first\n\ndata: second\n\n');
+  });
+
+  test('cancels an idle direct response reader without hanging', () async {
+    final keepOpen = Completer<void>();
+    addTearDown(() {
+      if (!keepOpen.isCompleted) keepOpen.complete();
+    });
+    server.listen((request) async {
+      request.response.bufferOutput = false;
+      request.response.write('data: ready\n\n');
+      await request.response.flush();
+      await keepOpen.future;
+      await request.response.close();
+    });
+
+    final response = await transport.sendStream(
+      DartHttpClientRequest(
+        method: HttpMethod.get,
+        uri: Uri.parse('http://${server.address.host}:${server.port}/idle-events'),
+      ),
+    );
+    final firstEvent = Completer<void>();
+    final subscription = response.bodyStream.listen((chunk) {
+      if (utf8.decode(chunk).contains('ready') && !firstEvent.isCompleted) {
+        firstEvent.complete();
+      }
+    });
+
+    await firstEvent.future.timeout(const Duration(seconds: 1));
+    await subscription.cancel().timeout(const Duration(seconds: 1));
   });
 
   test('cancels an in-flight Tokio request', () async {

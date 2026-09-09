@@ -7,7 +7,6 @@ import 'dart:typed_data';
 import 'package:dart_http_client/dart_http_client.dart';
 import 'package:dart_http_core/dart_http_core.dart';
 import 'package:dart_http_native_client/dart_http_native_client.dart';
-import 'package:native_exchange_runtime/native_exchange_runtime.dart';
 
 const _smallRequestCount = 1000;
 const _largeRequestCount = 64;
@@ -157,8 +156,6 @@ Future<void> main(List<String> arguments) async {
     );
   }
   var streamChunkCount = 0;
-  var nativePullCount = 0;
-  NativeStreamReader? activeNativeReader;
   final streamingMeasurement = await _measure(
     operations: _streamRequestCount,
     bytes: _streamRequestCount * _streamBodyBytes,
@@ -170,18 +167,11 @@ Future<void> main(List<String> arguments) async {
           uri: baseUri.resolve('/stream'),
         );
         if (transport case final NativeHttpClientTransport nativeTransport) {
-          final response = await nativeTransport.sendNative(request);
-          final reader = NativeStreamReader.adopt(response.body.takeNative());
-          activeNativeReader = reader;
-          try {
-            await for (final lease in reader.leases()) {
-              received += lease.length;
-              streamChunkCount++;
-              lease.close();
-            }
-          } finally {
-            nativePullCount += reader.metrics.pullCount;
-            activeNativeReader = null;
+          final response = await nativeTransport.sendLeasedStream(request);
+          await for (final lease in response.bodyStream) {
+            received += lease.length;
+            streamChunkCount++;
+            lease.close();
           }
         } else {
           final response = await transport.sendStream(request);
@@ -198,15 +188,6 @@ Future<void> main(List<String> arguments) async {
   streamingMeasurement['averageChunkBytes'] = streamChunkCount == 0
       ? null
       : _streamRequestCount * _streamBodyBytes / streamChunkCount;
-  if (nativePullCount > 0) streamingMeasurement['nativePullCount'] = nativePullCount;
-  if (activeNativeReader case final reader?) {
-    final metrics = reader.metrics;
-    streamingMeasurement['stalledReader'] = {
-      'pullCount': metrics.pullCount,
-      'chunkCount': metrics.chunkCount,
-      'byteCount': metrics.byteCount,
-    };
-  }
   measurements['sustainedStreaming'] = streamingMeasurement;
 
   totalStopwatch.stop();

@@ -44,7 +44,7 @@ external void dart_http_native_client_close(int client_id);
     ffi.IntPtr,
     ffi.Pointer<ffi.Uint8>,
     ffi.IntPtr,
-    ffi.Bool,
+    ffi.Int32,
   )
 >()
 external int dart_http_native_client_start(
@@ -62,7 +62,7 @@ external int dart_http_native_client_start(
   int native_prefix_length,
   ffi.Pointer<ffi.Uint8> native_suffix,
   int native_suffix_length,
-  bool buffer_response,
+  int response_mode,
 );
 
 @ffi.Native<ffi.Bool Function(ffi.Int64, ffi.Int64)>()
@@ -76,6 +76,25 @@ external ffi.Pointer<NativeHttpResult> dart_http_native_client_take_result(
 
 @ffi.Native<ffi.Void Function(ffi.Pointer<NativeHttpResult>)>()
 external void dart_http_native_client_free_result(ffi.Pointer<NativeHttpResult> result);
+
+@ffi.Native<ffi.Int32 Function(ffi.Pointer<ffi.Void>, ffi.Int64)>()
+external int dart_http_native_client_response_reader_request_next(
+  ffi.Pointer<ffi.Void> reader,
+  int request_id,
+);
+
+@ffi.Native<ffi.Int32 Function(ffi.Pointer<ffi.Void>, ffi.Int64, ffi.Pointer<ffi.Void>)>()
+external int dart_http_native_client_response_reader_take(
+  ffi.Pointer<ffi.Void> reader,
+  int request_id,
+  ffi.Pointer<ffi.Void> out_buffer,
+);
+
+@ffi.Native<ffi.Void Function(ffi.Pointer<ffi.Void>)>()
+external void dart_http_native_client_response_reader_cancel(ffi.Pointer<ffi.Void> reader);
+
+@ffi.Native<ffi.Void Function(ffi.Pointer<ffi.Void>)>()
+external void dart_http_native_client_response_reader_release(ffi.Pointer<ffi.Void> reader);
 
 @ffi.Native<
   ffi.Int64 Function(
@@ -311,6 +330,11 @@ final class NativeHttpResult extends ffi.Struct {
   external int header_count;
 
   external ffi.Pointer<ffi.Void> body_stream;
+
+  external ffi.Pointer<ffi.Void> body_reader;
+
+  @ffi.Int64()
+  external int body_reader_id;
 
   external ffi.Pointer<ffi.Void> body_buffer;
 

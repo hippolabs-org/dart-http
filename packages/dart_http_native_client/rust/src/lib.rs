@@ -37,7 +37,10 @@ use tokio_tungstenite::tungstenite::protocol::{
 use tokio_tungstenite::{Connector, connect_async_tls_with_config};
 use tokio_util::sync::CancellationToken;
 
-const ABI_VERSION: i32 = 9;
+const ABI_VERSION: i32 = 10;
+const RESPONSE_MODE_NATIVE_STREAM: i32 = 0;
+const RESPONSE_MODE_BUFFERED: i32 = 1;
+const RESPONSE_MODE_DIRECT_STREAM: i32 = 2;
 const REQUEST_CANCELED: &str = "Native HTTP request canceled.";
 const WEBSOCKET_EVENT_OPENED: i32 = 1;
 const WEBSOCKET_EVENT_TEXT: i32 = 2;
@@ -45,6 +48,7 @@ const WEBSOCKET_EVENT_BINARY: i32 = 3;
 const WEBSOCKET_EVENT_CLOSED: i32 = 4;
 const WEBSOCKET_EVENT_ERROR: i32 = 5;
 const WEBSOCKET_EVENT_SENT: i32 = 6;
+const RESPONSE_READER_EVENT_READY: i32 = 7;
 const SHARED_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const SHARED_HTTP_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 const SHARED_HTTP_MAX_IDLE_PER_HOST: usize = 8;
@@ -75,6 +79,8 @@ pub struct NativeHttpResult {
     headers: *mut NativeHttpHeader,
     header_count: isize,
     body_stream: *mut c_void,
+    body_reader: *mut c_void,
+    body_reader_id: i64,
     body_buffer: *mut c_void,
     error: *mut c_char,
 }
@@ -98,6 +104,7 @@ struct ClientState {
     completion_port: NativeCompletionPort,
     next_request_id: AtomicI64,
     next_socket_id: AtomicI64,
+    next_response_reader_id: AtomicI64,
     tasks: Mutex<HashMap<i64, RequestTask>>,
     results: Mutex<HashMap<i64, Result<ResponseData, String>>>,
     web_sockets: Mutex<HashMap<i64, Arc<WebSocketState>>>,
@@ -351,6 +358,8 @@ struct ResponseData {
     status: i32,
     headers: Vec<(String, String)>,
     body_stream: Option<usize>,
+    body_reader: Option<usize>,
+    body_reader_id: i64,
     body_buffer: Option<Bytes>,
 }
 
@@ -381,6 +390,8 @@ impl ResponseData {
             headers,
             header_count,
             body_stream: self.body_stream.take().unwrap_or_default() as *mut c_void,
+            body_reader: self.body_reader.take().unwrap_or_default() as *mut c_void,
+            body_reader_id: self.body_reader_id,
             body_buffer,
             error: ptr::null_mut(),
         }
@@ -389,10 +400,12 @@ impl ResponseData {
 
 impl Drop for ResponseData {
     fn drop(&mut self) {
-        let Some(address) = self.body_stream.take() else {
-            return;
-        };
-        unsafe { release_stream_pointer(address as *mut NexByteStream) };
+        if let Some(address) = self.body_stream.take() {
+            unsafe { release_stream_pointer(address as *mut NexByteStream) };
+        }
+        if let Some(address) = self.body_reader.take() {
+            unsafe { dart_http_native_client_response_reader_release(address as *mut c_void) };
+        }
     }
 }
 
@@ -492,6 +505,7 @@ pub extern "C" fn dart_http_native_client_create(
         completion_port: NativeCompletionPort::new(completion_port),
         next_request_id: AtomicI64::new(1),
         next_socket_id: AtomicI64::new(1),
+        next_response_reader_id: AtomicI64::new(1),
         tasks: Mutex::new(HashMap::new()),
         results: Mutex::new(HashMap::new()),
         web_sockets: Mutex::new(HashMap::new()),
@@ -558,12 +572,18 @@ pub unsafe extern "C" fn dart_http_native_client_start(
     native_prefix_length: isize,
     native_suffix: *const u8,
     native_suffix_length: isize,
-    buffer_response: bool,
+    response_mode: i32,
 ) -> i64 {
     let Some(state) = client_state(client_id) else {
         return 0;
     };
     if state.closed.load(Ordering::Acquire) {
+        return 0;
+    }
+    if !matches!(
+        response_mode,
+        RESPONSE_MODE_NATIVE_STREAM | RESPONSE_MODE_BUFFERED | RESPONSE_MODE_DIRECT_STREAM
+    ) {
         return 0;
     }
     let Ok(runtime) = shared_runtime() else {
@@ -614,10 +634,10 @@ pub unsafe extern "C" fn dart_http_native_client_start(
                     .await
                     .map_err(|_| "Native HTTP worker infrastructure closed.".to_owned())?;
                 send_request(
-                    task_state.client.clone(),
+                    Arc::clone(&task_state),
                     request,
                     cancellation.clone(),
-                    buffer_response,
+                    response_mode,
                 ).await
             } => result,
         };
@@ -670,6 +690,8 @@ pub extern "C" fn dart_http_native_client_take_result(
             headers: ptr::null_mut(),
             header_count: 0,
             body_stream: ptr::null_mut(),
+            body_reader: ptr::null_mut(),
+            body_reader_id: 0,
             body_buffer: ptr::null_mut(),
             error: c_string(error),
         },
@@ -703,6 +725,9 @@ pub unsafe extern "C" fn dart_http_native_client_free_result(result: *mut Native
         }
         if !result.body_stream.is_null() {
             drop(Box::from_raw(result.body_stream.cast::<NexByteStream>()));
+        }
+        if !result.body_reader.is_null() {
+            dart_http_native_client_response_reader_release(result.body_reader);
         }
         if !result.body_buffer.is_null() {
             release_buffer_pointer(result.body_buffer.cast::<NexBuffer>());
@@ -2172,12 +2197,13 @@ fn native_request_body(stream: AdoptedRequestStream, prefix: Vec<u8>, suffix: Ve
 }
 
 async fn send_request(
-    client: Client,
+    state: Arc<ClientState>,
     request: reqwest::Request,
     cancellation: CancellationToken,
-    buffer_response: bool,
+    response_mode: i32,
 ) -> Result<ResponseData, String> {
-    let response = client
+    let response = state
+        .client
         .execute(request)
         .await
         .map_err(|error| format!("Native HTTP request failed: {error}"))?;
@@ -2192,7 +2218,7 @@ async fn send_request(
             )
         })
         .collect::<Vec<_>>();
-    if buffer_response {
+    if response_mode == RESPONSE_MODE_BUFFERED {
         let body_bytes = response
             .bytes()
             .await
@@ -2201,7 +2227,28 @@ async fn send_request(
             status,
             headers,
             body_stream: None,
+            body_reader: None,
+            body_reader_id: 0,
             body_buffer: Some(body_bytes),
+        });
+    }
+    if response_mode == RESPONSE_MODE_DIRECT_STREAM {
+        let body_reader_id = state
+            .next_response_reader_id
+            .fetch_add(1, Ordering::Relaxed);
+        let body_reader = direct_response_reader(
+            response,
+            cancellation,
+            body_reader_id,
+            state.completion_port,
+        );
+        return Ok(ResponseData {
+            status,
+            headers,
+            body_stream: None,
+            body_reader: Some(Box::into_raw(Box::new(body_reader)) as usize),
+            body_reader_id,
+            body_buffer: None,
         });
     }
     let body_stream = response_stream(response, cancellation);
@@ -2209,6 +2256,8 @@ async fn send_request(
         status,
         headers,
         body_stream: Some(Box::into_raw(Box::new(body_stream)) as usize),
+        body_reader: None,
+        body_reader_id: 0,
         body_buffer: None,
     })
 }
@@ -2250,6 +2299,194 @@ fn response_stream(response: reqwest::Response, cancellation: CancellationToken)
         next: Some(response_stream_next),
         cancel: Some(response_stream_cancel),
         release: Some(response_stream_release),
+    }
+}
+
+struct DirectResponseReader {
+    commands: mpsc::UnboundedSender<DirectResponseCommand>,
+    shared: Arc<DirectResponseShared>,
+    cancellation: CancellationToken,
+}
+
+impl Drop for DirectResponseReader {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+    }
+}
+
+struct DirectResponseShared {
+    result: Mutex<Option<(i64, DirectResponseRead)>>,
+    pending: AtomicBool,
+}
+
+enum DirectResponseCommand {
+    Next { request_id: i64 },
+}
+
+enum DirectResponseRead {
+    Chunk(Bytes),
+    Done,
+    Error(String),
+    Canceled,
+}
+
+fn direct_response_reader(
+    response: reqwest::Response,
+    cancellation: CancellationToken,
+    reader_id: i64,
+    completion_port: NativeCompletionPort,
+) -> DirectResponseReader {
+    let (commands, mut command_receiver) = mpsc::unbounded_channel();
+    let shared = Arc::new(DirectResponseShared {
+        result: Mutex::new(None),
+        pending: AtomicBool::new(false),
+    });
+    let task_shared = Arc::clone(&shared);
+    let task_cancellation = cancellation.clone();
+    shared_runtime()
+        .expect("native HTTP engine was initialized before streaming a response")
+        .spawn(async move {
+            let mut body = response.bytes_stream();
+            while let Some(DirectResponseCommand::Next { request_id }) =
+                command_receiver.recv().await
+            {
+                let read = tokio::select! {
+                    () = task_cancellation.cancelled() => DirectResponseRead::Canceled,
+                    item = body.next() => match item {
+                        Some(Ok(bytes)) => DirectResponseRead::Chunk(bytes),
+                        Some(Err(error)) => DirectResponseRead::Error(
+                            format!("Native HTTP response failed: {error}"),
+                        ),
+                        None => DirectResponseRead::Done,
+                    },
+                };
+                let terminal = !matches!(read, DirectResponseRead::Chunk(_));
+                *task_shared
+                    .result
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = Some((request_id, read));
+                completion_port.post(-((reader_id << 3) | i64::from(RESPONSE_READER_EVENT_READY)));
+                if terminal {
+                    break;
+                }
+            }
+        });
+    DirectResponseReader {
+        commands,
+        shared,
+        cancellation,
+    }
+}
+
+#[unsafe(no_mangle)]
+/// Requests one asynchronous chunk from a direct Tokio response reader.
+///
+/// # Safety
+///
+/// `reader` must be a live handle returned in `NativeHttpResult.body_reader`.
+pub unsafe extern "C" fn dart_http_native_client_response_reader_request_next(
+    reader: *mut c_void,
+    request_id: i64,
+) -> i32 {
+    let Some(reader) = (unsafe { reader.cast::<DirectResponseReader>().as_ref() }) else {
+        return -1;
+    };
+    if request_id <= 0 {
+        return -1;
+    }
+    if reader
+        .shared
+        .pending
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return -4;
+    }
+    if reader
+        .commands
+        .send(DirectResponseCommand::Next { request_id })
+        .is_err()
+    {
+        reader.shared.pending.store(false, Ordering::Release);
+        return -5;
+    }
+    0
+}
+
+#[unsafe(no_mangle)]
+/// Takes a completed direct response chunk.
+///
+/// # Safety
+///
+/// `reader` must be live and `out_buffer` must point to writable `NexBuffer`
+/// storage when the returned status is chunk or error.
+pub unsafe extern "C" fn dart_http_native_client_response_reader_take(
+    reader: *mut c_void,
+    request_id: i64,
+    out_buffer: *mut c_void,
+) -> i32 {
+    let Some(reader) = (unsafe { reader.cast::<DirectResponseReader>().as_ref() }) else {
+        return -1;
+    };
+    let mut slot = reader
+        .shared
+        .result
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let Some((completed_id, _)) = slot.as_ref() else {
+        return -6;
+    };
+    if *completed_id != request_id {
+        return -6;
+    }
+    let (_, read) = slot.take().expect("direct response result was checked");
+    reader.shared.pending.store(false, Ordering::Release);
+    match read {
+        DirectResponseRead::Chunk(bytes) => {
+            if out_buffer.is_null() {
+                return -1;
+            }
+            unsafe { out_buffer.cast::<NexBuffer>().write(native_buffer(bytes)) };
+            NEX_STREAM_READ_CHUNK
+        }
+        DirectResponseRead::Done => NEX_STREAM_READ_DONE,
+        DirectResponseRead::Error(error) => {
+            if out_buffer.is_null() {
+                return -1;
+            }
+            unsafe {
+                out_buffer
+                    .cast::<NexBuffer>()
+                    .write(native_buffer(Bytes::from(error)))
+            };
+            NEX_STREAM_READ_ERROR
+        }
+        DirectResponseRead::Canceled => NEX_STREAM_READ_CANCELED,
+    }
+}
+
+#[unsafe(no_mangle)]
+/// Cancels a direct response reader without blocking the caller.
+///
+/// # Safety
+///
+/// `reader` may be null or must be a live direct response reader.
+pub unsafe extern "C" fn dart_http_native_client_response_reader_cancel(reader: *mut c_void) {
+    if let Some(reader) = unsafe { reader.cast::<DirectResponseReader>().as_ref() } {
+        reader.cancellation.cancel();
+    }
+}
+
+#[unsafe(no_mangle)]
+/// Releases a direct response reader.
+///
+/// # Safety
+///
+/// `reader` may be null or must be a live direct response reader that has not
+/// previously been released.
+pub unsafe extern "C" fn dart_http_native_client_response_reader_release(reader: *mut c_void) {
+    if !reader.is_null() {
+        unsafe { drop(Box::from_raw(reader.cast::<DirectResponseReader>())) };
     }
 }
 

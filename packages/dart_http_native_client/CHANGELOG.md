@@ -1,3 +1,14 @@
+## 0.2.16
+
+- Drive streamed Reqwest response bodies directly on Tokio with demand-based
+  backpressure, a shared completion port, and zero-copy Native Exchange chunk
+  leases, avoiding the intermediate payload channel and blocking worker.
+- Keep direct response readers strongly owned by their transport until normal
+  completion or cancellation so idle SSE streams cannot lose their Dart
+  completion target during garbage collection.
+- Add `sendLeasedStream` for consumers that can process native-owned response
+  chunks without materializing Dart byte arrays.
+
 ## 0.2.15
 
 - Share one process-wide Rustls trust policy and TLS session cache between

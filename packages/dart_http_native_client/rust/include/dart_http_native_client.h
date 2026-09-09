@@ -16,6 +16,8 @@ typedef struct NativeHttpResult {
   NativeHttpHeader* headers;
   intptr_t header_count;
   void* body_stream;
+  void* body_reader;
+  int64_t body_reader_id;
   void* body_buffer;
   char* error;
 } NativeHttpResult;
@@ -52,12 +54,21 @@ int64_t dart_http_native_client_start(
     intptr_t native_prefix_length,
     const uint8_t* native_suffix,
     intptr_t native_suffix_length,
-    bool buffer_response);
+    int32_t response_mode);
 bool dart_http_native_client_cancel(int64_t client_id, int64_t request_id);
 NativeHttpResult* dart_http_native_client_take_result(
     int64_t client_id,
     int64_t request_id);
 void dart_http_native_client_free_result(NativeHttpResult* result);
+int32_t dart_http_native_client_response_reader_request_next(
+    void* reader,
+    int64_t request_id);
+int32_t dart_http_native_client_response_reader_take(
+    void* reader,
+    int64_t request_id,
+    void* out_buffer);
+void dart_http_native_client_response_reader_cancel(void* reader);
+void dart_http_native_client_response_reader_release(void* reader);
 
 int64_t dart_http_native_client_websocket_connect(
     int64_t client_id,
