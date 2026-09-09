@@ -1,3 +1,11 @@
+## 0.2.11
+
+- Report WebSocket opening failures only through the connection future instead
+  of also enqueueing an error on a message stream that callers cannot yet
+  observe.
+- Retry transient native WebSocket transport failures within the original
+  connection deadline, while leaving TLS, protocol, and HTTP failures final.
+
 ## 0.2.10
 
 - Share one process-wide Tokio runtime, reqwest connection pool, and TLS client

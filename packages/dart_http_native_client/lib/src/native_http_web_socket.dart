@@ -567,8 +567,12 @@ final class NativeHttpWebSocket
           _finish();
         case _webSocketEventError:
           final error = NativeHttpClientException(text ?? 'Native WebSocket failed.');
-          if (!_connected.isCompleted) _connected.completeError(error);
-          if (!_controller.isClosed) _controller.addError(error);
+          final failedWhileConnecting = !_connected.isCompleted;
+          if (failedWhileConnecting) {
+            _connected.completeError(error);
+          } else if (!_controller.isClosed) {
+            _controller.addError(error);
+          }
           _finish(error);
         case _webSocketEventSent:
           _pendingOperations.remove(value.operation_id)?.complete();
@@ -576,8 +580,12 @@ final class NativeHttpWebSocket
           throw NativeHttpClientException('Unknown native WebSocket event kind ${value.kind}.');
       }
     } catch (error, stackTrace) {
-      if (!_connected.isCompleted) _connected.completeError(error, stackTrace);
-      if (!_controller.isClosed) _controller.addError(error, stackTrace);
+      final failedWhileConnecting = !_connected.isCompleted;
+      if (failedWhileConnecting) {
+        _connected.completeError(error, stackTrace);
+      } else if (!_controller.isClosed) {
+        _controller.addError(error, stackTrace);
+      }
       _finish(error, stackTrace);
     } finally {
       native.dart_http_native_client_websocket_free_event(event);
@@ -634,8 +642,12 @@ final class NativeHttpWebSocket
 
   void _transportClosed() {
     final error = const NativeHttpClientException('Native HTTP client closed.');
-    if (!_connected.isCompleted) _connected.completeError(error);
-    if (!_controller.isClosed) _controller.addError(error);
+    final failedWhileConnecting = !_connected.isCompleted;
+    if (failedWhileConnecting) {
+      _connected.completeError(error);
+    } else if (!_controller.isClosed) {
+      _controller.addError(error);
+    }
     _finish(error);
   }
 

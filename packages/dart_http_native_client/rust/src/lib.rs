@@ -24,8 +24,8 @@ use tokio::runtime::{Builder, Runtime};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::error::ProtocolError;
 use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
 use tokio_tungstenite::tungstenite::protocol::{
     CloseFrame,
@@ -34,6 +34,7 @@ use tokio_tungstenite::tungstenite::protocol::{
         coding::{CloseCode, Data, OpCode},
     },
 };
+use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message};
 use tokio_util::sync::CancellationToken;
 
 const ABI_VERSION: i32 = 9;
@@ -45,6 +46,9 @@ const WEBSOCKET_EVENT_CLOSED: i32 = 4;
 const WEBSOCKET_EVENT_ERROR: i32 = 5;
 const WEBSOCKET_EVENT_SENT: i32 = 6;
 const SHARED_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const WEBSOCKET_CONNECT_ATTEMPTS: usize = 3;
+const WEBSOCKET_CONNECT_RETRY_DELAYS: [Duration; WEBSOCKET_CONNECT_ATTEMPTS - 1] =
+    [Duration::from_millis(50), Duration::from_millis(150)];
 
 struct NativeHttpEngine {
     runtime: Runtime,
@@ -1688,38 +1692,31 @@ async fn run_web_socket(
     control_events: mpsc::UnboundedSender<WebSocketEventData>,
     cancellation: CancellationToken,
 ) {
-    let request = prepare_web_socket_request(&url, headers, protocols);
-    let request = match request {
-        Ok(request) => request,
-        Err(error) => {
-            let _ = send_web_socket_event(
-                &state,
-                socket_id,
-                &events,
-                &control_events,
-                WebSocketEventData::Error(error),
-                &cancellation,
-            )
-            .await;
-            return;
-        }
-    };
-    let connected = tokio::time::timeout(state.connect_timeout, connect_async(request)).await;
-    let (socket, response) = match connected {
-        Ok(Ok(value)) => value,
-        Ok(Err(error)) => {
-            let _ = send_web_socket_event(
-                &state,
-                socket_id,
-                &events,
-                &control_events,
-                WebSocketEventData::Error(format!("Native WebSocket connection failed: {error}")),
-                &cancellation,
-            )
-            .await;
-            return;
-        }
-        Err(_) => {
+    let connect_deadline = tokio::time::Instant::now() + state.connect_timeout;
+    let mut attempt = 0;
+    let (socket, response) = loop {
+        attempt += 1;
+        let request = match prepare_web_socket_request(
+            &url,
+            headers.iter().cloned(),
+            protocols.iter().cloned(),
+        ) {
+            Ok(request) => request,
+            Err(error) => {
+                let _ = send_web_socket_event(
+                    &state,
+                    socket_id,
+                    &events,
+                    &control_events,
+                    WebSocketEventData::Error(error),
+                    &cancellation,
+                )
+                .await;
+                return;
+            }
+        };
+        let remaining = connect_deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
             let _ = send_web_socket_event(
                 &state,
                 socket_id,
@@ -1730,6 +1727,56 @@ async fn run_web_socket(
             )
             .await;
             return;
+        }
+        let connected = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return,
+            result = tokio::time::timeout(remaining, connect_async(request)) => result,
+        };
+        match connected {
+            Ok(Ok(value)) => break value,
+            Ok(Err(error))
+                if attempt < WEBSOCKET_CONNECT_ATTEMPTS
+                    && retryable_web_socket_connect_error(&error) =>
+            {
+                let delay = WEBSOCKET_CONNECT_RETRY_DELAYS[attempt - 1];
+                tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => return,
+                    () = tokio::time::sleep(delay) => {}
+                }
+            }
+            Ok(Err(error)) => {
+                let attempts = if attempt == 1 {
+                    String::new()
+                } else {
+                    format!(" after {attempt} attempts")
+                };
+                let _ = send_web_socket_event(
+                    &state,
+                    socket_id,
+                    &events,
+                    &control_events,
+                    WebSocketEventData::Error(format!(
+                        "Native WebSocket connection failed{attempts}: {error}"
+                    )),
+                    &cancellation,
+                )
+                .await;
+                return;
+            }
+            Err(_) => {
+                let _ = send_web_socket_event(
+                    &state,
+                    socket_id,
+                    &events,
+                    &control_events,
+                    WebSocketEventData::Error("Native WebSocket connection timed out.".to_owned()),
+                    &cancellation,
+                )
+                .await;
+                return;
+            }
         }
     };
     let protocol = response
@@ -1882,8 +1929,8 @@ async fn run_web_socket(
 
 fn prepare_web_socket_request(
     url: &str,
-    headers: Vec<(String, String)>,
-    protocols: Vec<String>,
+    headers: impl IntoIterator<Item = (String, String)>,
+    protocols: impl IntoIterator<Item = String>,
 ) -> Result<tokio_tungstenite::tungstenite::http::Request<()>, String> {
     let mut request = url
         .into_client_request()
@@ -1895,6 +1942,7 @@ fn prepare_web_socket_request(
             .map_err(|error| format!("Invalid WebSocket header value: {error}"))?;
         request.headers_mut().insert(name, value);
     }
+    let protocols = protocols.into_iter().collect::<Vec<_>>();
     if !protocols.is_empty() {
         request.headers_mut().insert(
             "sec-websocket-protocol",
@@ -1903,6 +1951,24 @@ fn prepare_web_socket_request(
         );
     }
     Ok(request)
+}
+
+fn retryable_web_socket_connect_error(error: &WebSocketError) -> bool {
+    match error {
+        WebSocketError::Io(error) => matches!(
+            error.kind(),
+            io::ErrorKind::BrokenPipe
+                | io::ErrorKind::ConnectionAborted
+                | io::ErrorKind::ConnectionRefused
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::Interrupted
+                | io::ErrorKind::NotConnected
+                | io::ErrorKind::TimedOut
+                | io::ErrorKind::UnexpectedEof
+        ),
+        WebSocketError::Protocol(ProtocolError::HandshakeIncomplete) => true,
+        _ => false,
+    }
 }
 
 async fn send_web_socket_event(
