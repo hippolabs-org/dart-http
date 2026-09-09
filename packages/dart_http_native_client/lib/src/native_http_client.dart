@@ -15,7 +15,7 @@ import 'native_http_response.dart';
 part 'native_http_web_socket.dart';
 part 'native_http_response_reader.dart';
 
-const _nativeAbiVersion = 13;
+const _nativeAbiVersion = 14;
 const _responseModeNativeStream = 0;
 const _responseModeBuffered = 1;
 const _responseModeDirectStream = 2;
@@ -61,6 +61,10 @@ final class NativeHttpClientTransport
   }
 
   /// Opens a reusable native connection pool.
+  ///
+  /// HTTP requests have no total deadline unless [requestTimeout] is supplied.
+  /// Connection establishment remains bounded by
+  /// [NativeHttpClientRuntime.connectTimeout].
   static Future<NativeHttpClientTransport> open({
     Duration? webSocketConnectTimeout,
     @Deprecated(
@@ -68,7 +72,7 @@ final class NativeHttpClientTransport
       'Use webSocketConnectTimeout for per-transport WebSocket connections.',
     )
     Duration? connectTimeout,
-    Duration requestTimeout = const Duration(minutes: 2),
+    Duration? requestTimeout,
     int webSocketIncomingCapacity = 16,
     int webSocketOutgoingCapacity = 8,
   }) async {
@@ -77,7 +81,8 @@ final class NativeHttpClientTransport
     }
     final resolvedWebSocketConnectTimeout =
         webSocketConnectTimeout ?? connectTimeout ?? NativeHttpClientRuntime.connectTimeout;
-    if (resolvedWebSocketConnectTimeout <= Duration.zero || requestTimeout <= Duration.zero) {
+    if (resolvedWebSocketConnectTimeout <= Duration.zero ||
+        (requestTimeout != null && requestTimeout <= Duration.zero)) {
       throw ArgumentError('Native HTTP timeouts must be positive.');
     }
     if (webSocketIncomingCapacity < 1 ||
@@ -91,7 +96,7 @@ final class NativeHttpClientTransport
     final clientId = native.dart_http_native_client_create(
       completionPort.sendPort.nativePort,
       resolvedWebSocketConnectTimeout.inMilliseconds,
-      requestTimeout.inMilliseconds,
+      requestTimeout?.inMilliseconds ?? 0,
     );
     if (clientId <= 0) {
       completionPort.close();
@@ -216,6 +221,7 @@ final class NativeHttpClientTransport
         nativePrefix?.length ?? 0,
         suffixPointer,
         nativeSuffix?.length ?? 0,
+        request.redirectPolicy.index,
         responseMode,
       );
       if (requestId <= 0) {

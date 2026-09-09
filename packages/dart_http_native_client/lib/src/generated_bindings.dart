@@ -47,6 +47,7 @@ external void dart_http_native_client_close(int client_id);
     ffi.Pointer<ffi.Uint8>,
     ffi.IntPtr,
     ffi.Int32,
+    ffi.Int32,
   )
 >()
 external int dart_http_native_client_start(
@@ -66,6 +67,7 @@ external int dart_http_native_client_start(
   int native_prefix_length,
   ffi.Pointer<ffi.Uint8> native_suffix,
   int native_suffix_length,
+  int redirect_policy,
   int response_mode,
 );
 

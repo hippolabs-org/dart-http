@@ -1,3 +1,10 @@
+## 0.2.20
+
+- Remove the default two-minute total HTTP request deadline so long-lived
+  streamed responses remain open until completion, cancellation, or transport
+  failure. Callers can still opt into a total deadline with `requestTimeout`.
+- Honor each request's redirect policy in the native transport.
+
 ## 0.2.19
 
 - Stream ordinary Dart request bodies through a bounded Dart-to-Tokio upload

@@ -1,3 +1,7 @@
+## 0.1.12
+
+- Honor the per-request redirect policy in the `package:http` transport.
+
 ## 0.1.11
 
 - Consume single-owner request-body leases through the portable HTTP client.

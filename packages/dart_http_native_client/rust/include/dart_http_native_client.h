@@ -56,6 +56,7 @@ int64_t dart_http_native_client_start(
     intptr_t native_prefix_length,
     const uint8_t* native_suffix,
     intptr_t native_suffix_length,
+    int32_t redirect_policy,
     int32_t response_mode);
 int64_t dart_http_native_client_upload_create(
     int64_t client_id,

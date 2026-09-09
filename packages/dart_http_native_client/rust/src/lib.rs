@@ -19,7 +19,7 @@ use native_exchange_abi::{
     NexBuffer, NexByteStream, NexUtf8View,
 };
 use once_cell::sync::Lazy;
-use reqwest::{Body, Client, Method, Url};
+use reqwest::{Body, Client, Method, Url, redirect::Policy};
 use rustls::{ClientConfig, RootCertStore};
 use tokio::runtime::{Builder, Runtime};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
@@ -37,10 +37,12 @@ use tokio_tungstenite::tungstenite::protocol::{
 use tokio_tungstenite::{Connector, connect_async_tls_with_config};
 use tokio_util::sync::CancellationToken;
 
-const ABI_VERSION: i32 = 13;
+const ABI_VERSION: i32 = 14;
 const RESPONSE_MODE_NATIVE_STREAM: i32 = 0;
 const RESPONSE_MODE_BUFFERED: i32 = 1;
 const RESPONSE_MODE_DIRECT_STREAM: i32 = 2;
+const REDIRECT_POLICY_FOLLOW: i32 = 0;
+const REDIRECT_POLICY_NONE: i32 = 1;
 const REQUEST_CANCELED: &str = "Native HTTP request canceled.";
 const WEBSOCKET_EVENT_OPENED: i32 = 1;
 const WEBSOCKET_EVENT_TEXT: i32 = 2;
@@ -57,6 +59,7 @@ const SHARED_HTTP_MAX_IN_FLIGHT: usize = 12;
 struct NativeHttpEngine {
     runtime: Runtime,
     client: Client,
+    no_redirect_client: Client,
     web_socket_tls: Arc<ClientConfig>,
     http_slots: Arc<Semaphore>,
 }
@@ -97,10 +100,11 @@ pub struct NativeWebSocketEvent {
 
 struct ClientState {
     client: Client,
+    no_redirect_client: Client,
     web_socket_tls: Arc<ClientConfig>,
     http_slots: Arc<Semaphore>,
     connect_timeout: Duration,
-    request_timeout: Duration,
+    request_timeout: Option<Duration>,
     completion_port: NativeCompletionPort,
     next_request_id: AtomicI64,
     next_socket_id: AtomicI64,
@@ -435,6 +439,7 @@ fn shared_engine() -> Result<&'static NativeHttpEngine, String> {
                 .with_no_client_auth();
             let mut http_tls = base_tls.clone();
             http_tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+            let no_redirect_http_tls = http_tls.clone();
             let mut web_socket_tls = base_tls;
             web_socket_tls.alpn_protocols = vec![b"http/1.1".to_vec()];
             let web_socket_tls = Arc::new(web_socket_tls);
@@ -446,9 +451,21 @@ fn shared_engine() -> Result<&'static NativeHttpEngine, String> {
                 .tcp_nodelay(true)
                 .build()
                 .map_err(|error| format!("Could not initialize native HTTP client: {error}"))?;
+            let no_redirect_client = Client::builder()
+                .use_preconfigured_tls(no_redirect_http_tls)
+                .redirect(Policy::none())
+                .connect_timeout(SHARED_HTTP_CONNECT_TIMEOUT)
+                .pool_idle_timeout(SHARED_HTTP_IDLE_TIMEOUT)
+                .pool_max_idle_per_host(SHARED_HTTP_MAX_IDLE_PER_HOST)
+                .tcp_nodelay(true)
+                .build()
+                .map_err(|error| {
+                    format!("Could not initialize no-redirect native HTTP client: {error}")
+                })?;
             Ok(NativeHttpEngine {
                 runtime,
                 client,
+                no_redirect_client,
                 web_socket_tls,
                 http_slots: Arc::new(Semaphore::new(SHARED_HTTP_MAX_IN_FLIGHT)),
             })
@@ -496,19 +513,26 @@ pub extern "C" fn dart_http_native_client_create(
     let Some(connect_timeout) = positive_duration(websocket_connect_timeout_ms) else {
         return 0;
     };
-    let Some(request_timeout) = positive_duration(request_timeout_ms) else {
-        return 0;
+    let request_timeout = if request_timeout_ms == 0 {
+        None
+    } else {
+        let Some(request_timeout) = positive_duration(request_timeout_ms) else {
+            return 0;
+        };
+        Some(request_timeout)
     };
     let engine = match shared_engine() {
         Ok(engine) => engine,
         Err(_) => return 0,
     };
     let client = engine.client.clone();
+    let no_redirect_client = engine.no_redirect_client.clone();
     let web_socket_tls = Arc::clone(&engine.web_socket_tls);
     let http_slots = Arc::clone(&engine.http_slots);
     let id = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
     let state = Arc::new(ClientState {
         client,
+        no_redirect_client,
         web_socket_tls,
         http_slots,
         connect_timeout,
@@ -590,6 +614,7 @@ pub unsafe extern "C" fn dart_http_native_client_start(
     native_prefix_length: isize,
     native_suffix: *const u8,
     native_suffix_length: isize,
+    redirect_policy: i32,
     response_mode: i32,
 ) -> i64 {
     let Some(state) = client_state(client_id) else {
@@ -601,6 +626,12 @@ pub unsafe extern "C" fn dart_http_native_client_start(
     if !matches!(
         response_mode,
         RESPONSE_MODE_NATIVE_STREAM | RESPONSE_MODE_BUFFERED | RESPONSE_MODE_DIRECT_STREAM
+    ) {
+        return 0;
+    }
+    if !matches!(
+        redirect_policy,
+        REDIRECT_POLICY_FOLLOW | REDIRECT_POLICY_NONE
     ) {
         return 0;
     }
@@ -657,6 +688,7 @@ pub unsafe extern "C" fn dart_http_native_client_start(
                     Arc::clone(&task_state),
                     request,
                     cancellation.clone(),
+                    redirect_policy,
                     response_mode,
                 ).await
             } => result,
@@ -2332,10 +2364,10 @@ unsafe fn prepare_request(
         .map_err(|error| format!("Invalid HTTP method: {error}"))?;
     let url = Url::parse(&unsafe { required_c_str(url, "URL")? })
         .map_err(|error| format!("Invalid HTTP URL: {error}"))?;
-    let mut builder = state
-        .client
-        .request(method, url)
-        .timeout(state.request_timeout);
+    let mut builder = state.client.request(method, url);
+    if let Some(request_timeout) = state.request_timeout {
+        builder = builder.timeout(request_timeout);
+    }
     for (name, value) in unsafe { read_headers(headers, header_count)? } {
         builder = builder.header(name, value);
     }
@@ -2450,10 +2482,15 @@ async fn send_request(
     state: Arc<ClientState>,
     request: reqwest::Request,
     cancellation: CancellationToken,
+    redirect_policy: i32,
     response_mode: i32,
 ) -> Result<ResponseData, String> {
-    let response = state
-        .client
+    let client = if redirect_policy == REDIRECT_POLICY_NONE {
+        &state.no_redirect_client
+    } else {
+        &state.client
+    };
+    let response = client
         .execute(request)
         .await
         .map_err(|error| format!("Native HTTP request failed: {error}"))?;

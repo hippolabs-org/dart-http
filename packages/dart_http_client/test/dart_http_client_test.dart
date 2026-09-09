@@ -58,6 +58,25 @@ void main() {
       expect(response.status, 204);
     });
 
+    test('maps the request redirect policy to package:http', () async {
+      final transport = DartHttpClientTransport(
+        client: MockClient.streaming((request, _) async {
+          expect(request.followRedirects, isFalse);
+          return http.StreamedResponse(const Stream<List<int>>.empty(), 302);
+        }),
+      );
+
+      final response = await transport.send(
+        DartHttpClientRequest(
+          method: HttpMethod.get,
+          uri: Uri.parse('https://api.example.test/redirect'),
+          redirectPolicy: DartHttpClientRedirectPolicy.none,
+        ),
+      );
+
+      expect(response.status, 302);
+    });
+
     test('consumes leased request bytes through package:http', () async {
       final lease = DartByteLease(Uint8List.fromList([3, 1, 4]));
       final transport = DartHttpClientTransport(

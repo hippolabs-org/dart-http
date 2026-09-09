@@ -15,6 +15,10 @@ await NativeHttpClientRuntime.prewarm();
 final transport = await NativeHttpClientTransport.open();
 ```
 
+HTTP requests have no total deadline by default, matching `package:http`.
+Callers that need one can pass `requestTimeout` when opening the transport;
+the connection phase remains bounded independently.
+
 The package ships native assets for Android (arm, arm64, and x64), iOS devices
 and simulators, Linux, macOS, and Windows. It requires `dart:ffi` and therefore
 does not support web builds.

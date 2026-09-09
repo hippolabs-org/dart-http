@@ -494,6 +494,78 @@ void main() {
     expect(body.toString(), 'data: first\n\ndata: second\n\n');
   });
 
+  test('applies a total request timeout only when explicitly configured', () async {
+    transport.close();
+    transport = await NativeHttpClientTransport.open(
+      requestTimeout: const Duration(milliseconds: 50),
+    );
+    server.listen((request) async {
+      request.response.bufferOutput = false;
+      request.response.write('data: first\n\n');
+      await request.response.flush();
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+      await request.response.close();
+    });
+
+    final response = await transport.sendStream(
+      DartHttpClientRequest(
+        method: HttpMethod.get,
+        uri: Uri.parse('http://${server.address.host}:${server.port}/timed-events'),
+      ),
+    );
+
+    await expectLater(response.bodyStream.drain<void>(), throwsA(isA<NativeHttpClientException>()));
+  });
+
+  test('returns redirects when following is disabled', () async {
+    var redirectedRequestReceived = false;
+    server.listen((request) async {
+      if (request.uri.path == '/redirected') {
+        redirectedRequestReceived = true;
+        request.response.write('redirected');
+      } else {
+        request.response
+          ..statusCode = HttpStatus.found
+          ..headers.set(HttpHeaders.locationHeader, '/redirected');
+      }
+      await request.response.close();
+    });
+
+    final response = await transport.send(
+      DartHttpClientRequest(
+        method: HttpMethod.get,
+        uri: Uri.parse('http://${server.address.host}:${server.port}/redirect'),
+        redirectPolicy: DartHttpClientRedirectPolicy.none,
+      ),
+    );
+
+    expect(response.status, HttpStatus.found);
+    expect(redirectedRequestReceived, isFalse);
+  });
+
+  test('follows redirects by default', () async {
+    server.listen((request) async {
+      if (request.uri.path == '/redirected') {
+        request.response.write('redirected');
+      } else {
+        request.response
+          ..statusCode = HttpStatus.found
+          ..headers.set(HttpHeaders.locationHeader, '/redirected');
+      }
+      await request.response.close();
+    });
+
+    final response = await transport.send(
+      DartHttpClientRequest(
+        method: HttpMethod.get,
+        uri: Uri.parse('http://${server.address.host}:${server.port}/redirect'),
+      ),
+    );
+
+    expect(response.status, HttpStatus.ok);
+    expect(response.body, 'redirected');
+  });
+
   test('cancels an idle direct response reader without hanging', () async {
     final keepOpen = Completer<void>();
     addTearDown(() {

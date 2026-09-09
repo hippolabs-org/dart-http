@@ -110,6 +110,7 @@ final class DartHttpClientTransport implements HttpClientTransport {
       }
       httpRequest = bufferedRequest;
     }
+    httpRequest.followRedirects = request.redirectPolicy == DartHttpClientRedirectPolicy.follow;
     return httpRequest;
   }
 

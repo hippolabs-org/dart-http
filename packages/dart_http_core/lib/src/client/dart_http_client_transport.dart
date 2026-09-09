@@ -34,6 +34,15 @@ enum DartHttpClientResponseMode {
   serverSentEvents,
 }
 
+/// Controls whether an HTTP transport follows redirect responses.
+enum DartHttpClientRedirectPolicy {
+  /// Follows redirects according to the transport's bounded default policy.
+  follow,
+
+  /// Returns redirect responses to the caller without following them.
+  none,
+}
+
 /// One outbound request emitted by a generated client.
 final class DartHttpClientRequest {
   const DartHttpClientRequest({
@@ -48,6 +57,7 @@ final class DartHttpClientRequest {
     this.nativeBody,
     this.abortTrigger,
     this.responseMode = DartHttpClientResponseMode.buffered,
+    this.redirectPolicy = DartHttpClientRedirectPolicy.follow,
   }) : assert(
          bodyStream == null || (body == null && bodyBytes == null && bodyLease == null),
          'bodyStream cannot be combined with another request body.',
@@ -78,6 +88,9 @@ final class DartHttpClientRequest {
   /// Expected response delivery semantics.
   final DartHttpClientResponseMode responseMode;
 
+  /// Redirect behavior for this request.
+  final DartHttpClientRedirectPolicy redirectPolicy;
+
   DartHttpClientRequest copyWith({
     HttpMethod? method,
     Uri? uri,
@@ -90,6 +103,7 @@ final class DartHttpClientRequest {
     DartHttpClientNativeBody? nativeBody,
     Future<void>? abortTrigger,
     DartHttpClientResponseMode? responseMode,
+    DartHttpClientRedirectPolicy? redirectPolicy,
   }) {
     return DartHttpClientRequest(
       method: method ?? this.method,
@@ -103,6 +117,7 @@ final class DartHttpClientRequest {
       nativeBody: nativeBody ?? this.nativeBody,
       abortTrigger: abortTrigger ?? this.abortTrigger,
       responseMode: responseMode ?? this.responseMode,
+      redirectPolicy: redirectPolicy ?? this.redirectPolicy,
     );
   }
 }

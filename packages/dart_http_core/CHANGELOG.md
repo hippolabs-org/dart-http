@@ -1,3 +1,7 @@
+## 0.3.59
+
+- Add a per-request redirect policy to `DartHttpClientRequest`.
+
 ## 0.3.58
 
 - Add an EOF-aware drain-and-flush boundary for native WebSocket byte streams.
