@@ -1,3 +1,10 @@
+## 0.2.12
+
+- Enable `TCP_NODELAY` explicitly for pooled HTTP connections and native
+  WebSockets so latency-sensitive SSE events and control frames are not held
+  for packet coalescing.
+- Cover incremental SSE delivery before response completion.
+
 ## 0.2.11
 
 - Report WebSocket opening failures only through the connection future instead

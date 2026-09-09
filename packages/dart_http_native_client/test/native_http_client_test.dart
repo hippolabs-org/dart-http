@@ -214,6 +214,49 @@ void main() {
     expect(body, 'first-second');
   });
 
+  test('delivers a flushed SSE event before the response finishes', () async {
+    final releaseSecondEvent = Completer<void>();
+    addTearDown(() {
+      if (!releaseSecondEvent.isCompleted) releaseSecondEvent.complete();
+    });
+    server.listen((request) async {
+      request.response.bufferOutput = false;
+      request.response.headers
+        ..contentType = ContentType('text', 'event-stream', charset: 'utf-8')
+        ..set(HttpHeaders.cacheControlHeader, 'no-cache');
+      request.response.write('data: first\n\n');
+      await request.response.flush();
+      await releaseSecondEvent.future;
+      request.response.write('data: second\n\n');
+      await request.response.close();
+    });
+
+    final response = await transport.sendStream(
+      DartHttpClientRequest(
+        method: HttpMethod.get,
+        uri: Uri.parse('http://${server.address.host}:${server.port}/events'),
+        headers: const {'accept': 'text/event-stream'},
+      ),
+    );
+    final firstEvent = Completer<String>();
+    final body = StringBuffer();
+    final subscription = utf8.decoder.bind(response.bodyStream).listen((chunk) {
+      body.write(chunk);
+      if (!firstEvent.isCompleted && body.toString().contains('\n\n')) {
+        firstEvent.complete(body.toString());
+      }
+    });
+    addTearDown(subscription.cancel);
+
+    expect(
+      await firstEvent.future.timeout(const Duration(seconds: 1)),
+      contains('data: first\n\n'),
+    );
+    releaseSecondEvent.complete();
+    await subscription.asFuture<void>();
+    expect(body.toString(), 'data: first\n\ndata: second\n\n');
+  });
+
   test('cancels an in-flight Tokio request', () async {
     final requestStarted = Completer<void>();
     server.listen((request) async {

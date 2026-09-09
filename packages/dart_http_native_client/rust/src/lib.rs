@@ -402,6 +402,7 @@ fn shared_engine() -> Result<&'static NativeHttpEngine, String> {
                 .map_err(|error| format!("Could not initialize native HTTP runtime: {error}"))?;
             let client = Client::builder()
                 .connect_timeout(SHARED_HTTP_CONNECT_TIMEOUT)
+                .tcp_nodelay(true)
                 .build()
                 .map_err(|error| format!("Could not initialize native HTTP client: {error}"))?;
             Ok(NativeHttpEngine { runtime, client })
@@ -1779,6 +1780,20 @@ async fn run_web_socket(
             }
         }
     };
+    if let Err(error) = socket.get_ref().get_ref().set_nodelay(true) {
+        let _ = send_web_socket_event(
+            &state,
+            socket_id,
+            &events,
+            &control_events,
+            WebSocketEventData::Error(format!(
+                "Could not enable TCP_NODELAY for native WebSocket: {error}"
+            )),
+            &cancellation,
+        )
+        .await;
+        return;
+    }
     let protocol = response
         .headers()
         .get("sec-websocket-protocol")
