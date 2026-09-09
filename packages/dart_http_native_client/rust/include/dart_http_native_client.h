@@ -78,6 +78,33 @@ int64_t dart_http_native_client_websocket_send_binary_native_prefixed(
     const uint8_t* prefix,
     intptr_t prefix_length,
     void* native_buffer);
+int32_t dart_http_native_client_websocket_enqueue_binary_native_prefixed(
+    int64_t client_id,
+    int64_t socket_id,
+    const uint8_t* prefix,
+    intptr_t prefix_length,
+    void* native_buffer);
+int64_t dart_http_native_client_websocket_flush(
+    int64_t client_id,
+    int64_t socket_id);
+int32_t dart_http_native_client_websocket_adopt_byte_stream(
+    int64_t client_id,
+    int64_t socket_id,
+    void* native_stream);
+bool dart_http_native_client_websocket_resume_byte_stream(
+    int64_t client_id,
+    int64_t socket_id,
+    const uint8_t* prefix,
+    intptr_t prefix_length,
+    intptr_t sequence_offset,
+    intptr_t payload_unit_count_offset,
+    intptr_t bytes_per_payload_unit);
+int64_t dart_http_native_client_websocket_pause_byte_stream(
+    int64_t client_id,
+    int64_t socket_id);
+bool dart_http_native_client_websocket_close_byte_stream(
+    int64_t client_id,
+    int64_t socket_id);
 int64_t dart_http_native_client_websocket_close(
     int64_t client_id,
     int64_t socket_id,

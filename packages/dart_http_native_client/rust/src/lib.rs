@@ -4,7 +4,9 @@ use std::io;
 use std::mem::size_of;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::thread;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -17,7 +19,7 @@ use native_exchange_abi::{
 use once_cell::sync::Lazy;
 use reqwest::{Body, Client, Method, Url};
 use tokio::runtime::{Builder, Runtime};
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
@@ -32,7 +34,7 @@ use tokio_tungstenite::tungstenite::protocol::{
 };
 use tokio_util::sync::CancellationToken;
 
-const ABI_VERSION: i32 = 4;
+const ABI_VERSION: i32 = 5;
 const REQUEST_CANCELED: &str = "Native HTTP request canceled.";
 const WEBSOCKET_EVENT_OPENED: i32 = 1;
 const WEBSOCKET_EVENT_TEXT: i32 = 2;
@@ -95,23 +97,56 @@ struct RequestTask {
 }
 
 struct WebSocketState {
-    commands: mpsc::Sender<WebSocketCommand>,
+    commands: mpsc::UnboundedSender<WebSocketCommand>,
+    outgoing_slots: Arc<Semaphore>,
     events: Mutex<mpsc::Receiver<WebSocketEventData>>,
     control_events: Mutex<mpsc::UnboundedReceiver<WebSocketEventData>>,
     cancellation: CancellationToken,
     next_operation_id: AtomicI64,
+    byte_stream: Mutex<Option<WebSocketByteStreamPump>>,
 }
 
 enum WebSocketCommand {
     Send {
-        operation_id: i64,
+        operation_id: Option<i64>,
         messages: Vec<Message>,
+        permit: OwnedSemaphorePermit,
+    },
+    Fence {
+        operation_id: i64,
     },
     Close {
         operation_id: i64,
         code: Option<u16>,
         reason: String,
     },
+    PumpError(String),
+}
+
+struct WebSocketByteStreamPump {
+    controls: std_mpsc::Sender<WebSocketByteStreamControl>,
+    cancel: RequestStreamCancel,
+}
+
+impl Drop for WebSocketByteStreamPump {
+    fn drop(&mut self) {
+        let _ = self.controls.send(WebSocketByteStreamControl::Stop);
+        self.cancel.cancel();
+    }
+}
+
+enum WebSocketByteStreamControl {
+    Resume(WebSocketByteStreamFraming),
+    Pause { operation_id: i64 },
+    Stop,
+}
+
+struct WebSocketByteStreamFraming {
+    prefix: Vec<u8>,
+    sequence_offset: Option<usize>,
+    payload_unit_count_offset: Option<usize>,
+    bytes_per_payload_unit: usize,
+    sequence: u64,
 }
 
 enum WebSocketEventData {
@@ -589,16 +624,18 @@ pub unsafe extern "C" fn dart_http_native_client_websocket_connect(
         Err(_) => return 0,
     };
     let socket_id = state.next_socket_id.fetch_add(1, Ordering::Relaxed);
-    let (command_tx, command_rx) = mpsc::channel(outgoing_capacity);
+    let (command_tx, command_rx) = mpsc::unbounded_channel();
     let (event_tx, event_rx) = mpsc::channel(incoming_capacity);
     let (control_event_tx, control_event_rx) = mpsc::unbounded_channel();
     let cancellation = CancellationToken::new();
     let socket = Arc::new(WebSocketState {
         commands: command_tx,
+        outgoing_slots: Arc::new(Semaphore::new(outgoing_capacity)),
         events: Mutex::new(event_rx),
         control_events: Mutex::new(control_event_rx),
         cancellation: cancellation.clone(),
         next_operation_id: AtomicI64::new(1),
+        byte_stream: Mutex::new(None),
     });
     let inserted = match state.web_sockets.lock() {
         Ok(mut sockets) => sockets.insert(socket_id, socket).is_none(),
@@ -712,6 +749,222 @@ pub unsafe extern "C" fn dart_http_native_client_websocket_send_binary_native_pr
 }
 
 #[unsafe(no_mangle)]
+/// Enqueues one adopted Native Exchange buffer without requesting a per-send
+/// completion event. Returns `1` after ownership enters the bounded native
+/// FIFO, `-1` when no payload slot is available, `-2` when the socket closed
+/// while accepting the adopted descriptor, and `0` for invalid input. The
+/// descriptor is adopted when this function returns `1` or `-2`.
+///
+/// # Safety
+///
+/// `native_buffer` must point to a live `NexBuffer` descriptor until this call
+/// returns. The buffer must support release from a foreign thread.
+pub unsafe extern "C" fn dart_http_native_client_websocket_enqueue_binary_native_prefixed(
+    client_id: i64,
+    socket_id: i64,
+    prefix: *const u8,
+    prefix_length: isize,
+    native_buffer: *mut c_void,
+) -> i32 {
+    if native_buffer.is_null() {
+        return 0;
+    }
+    let descriptor_pointer = native_buffer.cast::<NexBuffer>();
+    let descriptor = unsafe { &*descriptor_pointer };
+    if !descriptor.is_valid() || descriptor.capabilities & NEX_CAPABILITY_THREAD_SAFE == 0 {
+        return 0;
+    }
+    let Some(socket) = web_socket_state(client_id, socket_id) else {
+        return 0;
+    };
+    let Ok(permit) = Arc::clone(&socket.outgoing_slots).try_acquire_owned() else {
+        return -1;
+    };
+    let prefix = match unsafe { copy_optional_bytes(prefix, prefix_length) } {
+        Ok(value) => value,
+        Err(_) => return 0,
+    };
+    let descriptor = unsafe { ptr::read(descriptor_pointer) };
+    let bytes = Bytes::from_owner(AdoptedBufferOwner(Some(descriptor)));
+    let messages = if prefix.is_empty() {
+        vec![Message::Binary(bytes)]
+    } else {
+        vec![
+            Message::Frame(Frame::message(prefix, OpCode::Data(Data::Binary), false)),
+            Message::Frame(Frame::message(bytes, OpCode::Data(Data::Continue), true)),
+        ]
+    };
+    match socket.commands.send(WebSocketCommand::Send {
+        operation_id: None,
+        messages,
+        permit,
+    }) {
+        Ok(()) => 1,
+        Err(_) => -2,
+    }
+}
+
+#[unsafe(no_mangle)]
+/// Enqueues an ordered zero-payload fence and returns its operation ID.
+pub extern "C" fn dart_http_native_client_websocket_flush(client_id: i64, socket_id: i64) -> i64 {
+    let Some(socket) = web_socket_state(client_id, socket_id) else {
+        return 0;
+    };
+    let operation_id = socket.next_operation_id.fetch_add(1, Ordering::Relaxed);
+    match socket
+        .commands
+        .send(WebSocketCommand::Fence { operation_id })
+    {
+        Ok(()) => operation_id,
+        Err(_) => 0,
+    }
+}
+
+#[unsafe(no_mangle)]
+/// Adopts one concurrent-cancelable Native Exchange byte stream into a paused
+/// WebSocket pump. Returns `1` when adopted, `-1` if a stream is already
+/// attached, and `0` for invalid input. The descriptor is adopted only on `1`.
+///
+/// # Safety
+///
+/// `native_stream` must point to a live, exclusively owned `NexByteStream`.
+pub unsafe extern "C" fn dart_http_native_client_websocket_adopt_byte_stream(
+    client_id: i64,
+    socket_id: i64,
+    native_stream: *mut c_void,
+) -> i32 {
+    if native_stream.is_null() {
+        return 0;
+    }
+    let Some(socket) = web_socket_state(client_id, socket_id) else {
+        return 0;
+    };
+    let descriptor_pointer = native_stream.cast::<NexByteStream>();
+    let descriptor = unsafe { &*descriptor_pointer };
+    if !descriptor.is_valid()
+        || descriptor.capabilities & NEX_CAPABILITY_THREAD_SAFE == 0
+        || descriptor.capabilities & NEX_CAPABILITY_CONCURRENT_CANCEL == 0
+        || descriptor.cancel.is_none()
+    {
+        return 0;
+    }
+    let Ok(mut attached) = socket.byte_stream.lock() else {
+        return 0;
+    };
+    if attached.is_some() {
+        return -1;
+    }
+    let stream = AdoptedRequestStream::adopt(unsafe { ptr::read(descriptor_pointer) })
+        .expect("the Native Exchange stream was validated before adoption");
+    let reader = stream.reader();
+    let cancel = stream
+        .cancel_handle()
+        .expect("concurrent cancellation was validated before adoption");
+    let (control_tx, control_rx) = std_mpsc::channel();
+    let commands = socket.commands.clone();
+    let outgoing_slots = Arc::clone(&socket.outgoing_slots);
+    thread::Builder::new()
+        .name("dart-http-ws-stream".to_owned())
+        .spawn(move || run_web_socket_byte_stream(reader, control_rx, commands, outgoing_slots))
+        .expect("native WebSocket byte-stream worker must start");
+    *attached = Some(WebSocketByteStreamPump {
+        controls: control_tx,
+        cancel,
+    });
+    1
+}
+
+#[unsafe(no_mangle)]
+/// Resumes the attached stream with a copied per-chunk prefix template.
+///
+/// # Safety
+///
+/// `prefix` may be null only when `prefix_length` is zero.
+pub unsafe extern "C" fn dart_http_native_client_websocket_resume_byte_stream(
+    client_id: i64,
+    socket_id: i64,
+    prefix: *const u8,
+    prefix_length: isize,
+    sequence_offset: isize,
+    payload_unit_count_offset: isize,
+    bytes_per_payload_unit: isize,
+) -> bool {
+    let Some(socket) = web_socket_state(client_id, socket_id) else {
+        return false;
+    };
+    let prefix = match unsafe { copy_optional_bytes(prefix, prefix_length) } {
+        Ok(value) => value.to_vec(),
+        Err(_) => return false,
+    };
+    let sequence_offset = optional_patch_offset(sequence_offset, 8, prefix.len());
+    let payload_unit_count_offset =
+        optional_patch_offset(payload_unit_count_offset, 4, prefix.len());
+    if sequence_offset.is_err() || payload_unit_count_offset.is_err() || bytes_per_payload_unit <= 0
+    {
+        return false;
+    }
+    let Ok(attached) = socket.byte_stream.lock() else {
+        return false;
+    };
+    let Some(pump) = attached.as_ref() else {
+        return false;
+    };
+    pump.controls
+        .send(WebSocketByteStreamControl::Resume(
+            WebSocketByteStreamFraming {
+                prefix,
+                sequence_offset: sequence_offset.ok().flatten(),
+                payload_unit_count_offset: payload_unit_count_offset.ok().flatten(),
+                bytes_per_payload_unit: bytes_per_payload_unit as usize,
+                sequence: 0,
+            },
+        ))
+        .is_ok()
+}
+
+#[unsafe(no_mangle)]
+/// Pauses the attached stream and returns an ordered writer-fence operation.
+pub extern "C" fn dart_http_native_client_websocket_pause_byte_stream(
+    client_id: i64,
+    socket_id: i64,
+) -> i64 {
+    let Some(socket) = web_socket_state(client_id, socket_id) else {
+        return 0;
+    };
+    let operation_id = socket.next_operation_id.fetch_add(1, Ordering::Relaxed);
+    let Ok(attached) = socket.byte_stream.lock() else {
+        return 0;
+    };
+    let Some(pump) = attached.as_ref() else {
+        return 0;
+    };
+    match pump
+        .controls
+        .send(WebSocketByteStreamControl::Pause { operation_id })
+    {
+        Ok(()) => operation_id,
+        Err(_) => 0,
+    }
+}
+
+#[unsafe(no_mangle)]
+/// Cancels and releases the attached native byte stream.
+pub extern "C" fn dart_http_native_client_websocket_close_byte_stream(
+    client_id: i64,
+    socket_id: i64,
+) -> bool {
+    let Some(socket) = web_socket_state(client_id, socket_id) else {
+        return false;
+    };
+    socket
+        .byte_stream
+        .lock()
+        .ok()
+        .and_then(|mut attached| attached.take())
+        .is_some()
+}
+
+#[unsafe(no_mangle)]
 /// Enqueues a graceful WebSocket close frame.
 ///
 /// # Safety
@@ -744,7 +997,7 @@ pub unsafe extern "C" fn dart_http_native_client_websocket_close(
         }
     };
     let operation_id = socket.next_operation_id.fetch_add(1, Ordering::Relaxed);
-    match socket.commands.try_send(WebSocketCommand::Close {
+    match socket.commands.send(WebSocketCommand::Close {
         operation_id,
         code,
         reason,
@@ -850,13 +1103,160 @@ fn enqueue_web_socket_messages(client_id: i64, socket_id: i64, messages: Vec<Mes
     let Some(socket) = web_socket_state(client_id, socket_id) else {
         return 0;
     };
+    let Ok(permit) = Arc::clone(&socket.outgoing_slots).try_acquire_owned() else {
+        return 0;
+    };
     let operation_id = socket.next_operation_id.fetch_add(1, Ordering::Relaxed);
-    match socket.commands.try_send(WebSocketCommand::Send {
-        operation_id,
+    match socket.commands.send(WebSocketCommand::Send {
+        operation_id: Some(operation_id),
         messages,
+        permit,
     }) {
         Ok(()) => operation_id,
         Err(_) => 0,
+    }
+}
+
+fn optional_patch_offset(
+    offset: isize,
+    width: usize,
+    prefix_length: usize,
+) -> Result<Option<usize>, ()> {
+    if offset < 0 {
+        return Ok(None);
+    }
+    let offset = offset as usize;
+    if offset
+        .checked_add(width)
+        .is_none_or(|end| end > prefix_length)
+    {
+        return Err(());
+    }
+    Ok(Some(offset))
+}
+
+fn run_web_socket_byte_stream(
+    reader: RequestStreamReader,
+    controls: std_mpsc::Receiver<WebSocketByteStreamControl>,
+    commands: mpsc::UnboundedSender<WebSocketCommand>,
+    outgoing_slots: Arc<Semaphore>,
+) {
+    let mut framing: Option<WebSocketByteStreamFraming> = None;
+    let mut pending: Option<Bytes> = None;
+    loop {
+        if framing.is_none() {
+            match controls.recv() {
+                Ok(WebSocketByteStreamControl::Resume(value)) => framing = Some(value),
+                Ok(WebSocketByteStreamControl::Pause { operation_id }) => {
+                    if commands
+                        .send(WebSocketCommand::Fence { operation_id })
+                        .is_err()
+                    {
+                        return;
+                    }
+                    continue;
+                }
+                Ok(WebSocketByteStreamControl::Stop) | Err(_) => return,
+            }
+        }
+
+        while let Ok(control) = controls.try_recv() {
+            match control {
+                WebSocketByteStreamControl::Resume(value) => framing = Some(value),
+                WebSocketByteStreamControl::Pause { operation_id } => {
+                    framing = None;
+                    if commands
+                        .send(WebSocketCommand::Fence { operation_id })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                WebSocketByteStreamControl::Stop => return,
+            }
+        }
+        if framing.is_none() {
+            continue;
+        }
+
+        let bytes = match pending.take() {
+            Some(value) => value,
+            None => match reader.read_next() {
+                Ok(RequestStreamRead::Chunk(value)) => value,
+                Ok(RequestStreamRead::Done) => return,
+                Err(error) => {
+                    let _ = commands.send(WebSocketCommand::PumpError(error));
+                    return;
+                }
+            },
+        };
+
+        // A boundary may arrive while the producer's blocking `next` callback
+        // is waiting. Hold that newly returned chunk for the next resume so it
+        // cannot cross the pause fence under the previous framing.
+        match controls.try_recv() {
+            Ok(WebSocketByteStreamControl::Pause { operation_id }) => {
+                pending = Some(bytes);
+                framing = None;
+                if commands
+                    .send(WebSocketCommand::Fence { operation_id })
+                    .is_err()
+                {
+                    return;
+                }
+                continue;
+            }
+            Ok(WebSocketByteStreamControl::Resume(value)) => framing = Some(value),
+            Ok(WebSocketByteStreamControl::Stop) => return,
+            Err(std_mpsc::TryRecvError::Disconnected) => return,
+            Err(std_mpsc::TryRecvError::Empty) => {}
+        }
+        let Some(active_framing) = framing.as_mut() else {
+            pending = Some(bytes);
+            continue;
+        };
+        if bytes.len() % active_framing.bytes_per_payload_unit != 0 {
+            let _ = commands.send(WebSocketCommand::PumpError(
+                "Native WebSocket stream chunk is not aligned to its payload unit size.".to_owned(),
+            ));
+            return;
+        }
+        let mut prefix = active_framing.prefix.clone();
+        if let Some(offset) = active_framing.sequence_offset {
+            prefix[offset..offset + 8].copy_from_slice(&active_framing.sequence.to_be_bytes());
+        }
+        if let Some(offset) = active_framing.payload_unit_count_offset {
+            let count = bytes.len() / active_framing.bytes_per_payload_unit;
+            let Ok(count) = u32::try_from(count) else {
+                let _ = commands.send(WebSocketCommand::PumpError(
+                    "Native WebSocket stream chunk payload unit count exceeds u32.".to_owned(),
+                ));
+                return;
+            };
+            prefix[offset..offset + 4].copy_from_slice(&count.to_be_bytes());
+        }
+        let messages = if prefix.is_empty() {
+            vec![Message::Binary(bytes)]
+        } else {
+            vec![
+                Message::Frame(Frame::message(prefix, OpCode::Data(Data::Binary), false)),
+                Message::Frame(Frame::message(bytes, OpCode::Data(Data::Continue), true)),
+            ]
+        };
+        let Ok(permit) = RUNTIME.block_on(Arc::clone(&outgoing_slots).acquire_owned()) else {
+            return;
+        };
+        if commands
+            .send(WebSocketCommand::Send {
+                operation_id: None,
+                messages,
+                permit,
+            })
+            .is_err()
+        {
+            return;
+        }
+        active_framing.sequence += 1;
     }
 }
 
@@ -877,7 +1277,7 @@ async fn run_web_socket(
     url: String,
     headers: Vec<(String, String)>,
     protocols: Vec<String>,
-    mut commands: mpsc::Receiver<WebSocketCommand>,
+    mut commands: mpsc::UnboundedReceiver<WebSocketCommand>,
     events: mpsc::Sender<WebSocketEventData>,
     control_events: mpsc::UnboundedSender<WebSocketEventData>,
     cancellation: CancellationToken,
@@ -956,8 +1356,13 @@ async fn run_web_socket(
                     let _ = writer.close().await;
                     return;
                 };
-                let (operation_id, messages) = match command {
-                    WebSocketCommand::Send { operation_id, messages } => (operation_id, messages),
+                let (operation_id, messages, _permit) = match command {
+                    WebSocketCommand::Send { operation_id, messages, permit } => {
+                        (operation_id, messages, Some(permit))
+                    }
+                    WebSocketCommand::Fence { operation_id } => {
+                        (Some(operation_id), Vec::new(), None)
+                    }
                     WebSocketCommand::Close { operation_id, code, reason } => {
                         let frame = match (code, reason.is_empty()) {
                             (None, true) => None,
@@ -966,7 +1371,18 @@ async fn run_web_socket(
                                 reason: reason.into(),
                             }),
                         };
-                        (operation_id, vec![Message::Close(frame)])
+                        (Some(operation_id), vec![Message::Close(frame)], None)
+                    }
+                    WebSocketCommand::PumpError(message) => {
+                        let _ = send_web_socket_event(
+                            &state,
+                            socket_id,
+                            &events,
+                            &control_events,
+                            WebSocketEventData::Error(message),
+                            &cancellation,
+                        ).await;
+                        return;
                     }
                 };
                 for message in messages {
@@ -982,15 +1398,17 @@ async fn run_web_socket(
                         return;
                     }
                 }
-                if !send_web_socket_event(
-                    &state,
-                    socket_id,
-                    &events,
-                    &control_events,
-                    WebSocketEventData::Sent { operation_id },
-                    &cancellation,
-                ).await {
-                    return;
+                if let Some(operation_id) = operation_id {
+                    if !send_web_socket_event(
+                        &state,
+                        socket_id,
+                        &events,
+                        &control_events,
+                        WebSocketEventData::Sent { operation_id },
+                        &cancellation,
+                    ).await {
+                        return;
+                    }
                 }
             }
             incoming = reader.next() => {

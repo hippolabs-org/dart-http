@@ -1,3 +1,11 @@
+## 0.2.5
+
+- Add a bounded, synchronous native WebSocket lease enqueue that transfers
+  buffer ownership without a Dart completion round trip per message.
+- Add an ordered WebSocket flush fence for segment-boundary synchronization.
+- Add a native byte-stream pump that frames and sends every producer chunk
+  without per-chunk Dart objects or completion callbacks.
+
 ## 0.2.4
 
 - Publish native assets for Android arm, arm64, and x64; iOS arm64 devices and

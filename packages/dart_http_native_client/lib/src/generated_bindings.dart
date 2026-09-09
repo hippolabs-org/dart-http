@@ -125,6 +125,60 @@ external int dart_http_native_client_websocket_send_binary_native_prefixed(
   ffi.Pointer<ffi.Void> native_buffer,
 );
 
+@ffi.Native<
+  ffi.Int32 Function(
+    ffi.Int64,
+    ffi.Int64,
+    ffi.Pointer<ffi.Uint8>,
+    ffi.IntPtr,
+    ffi.Pointer<ffi.Void>,
+  )
+>()
+external int dart_http_native_client_websocket_enqueue_binary_native_prefixed(
+  int client_id,
+  int socket_id,
+  ffi.Pointer<ffi.Uint8> prefix,
+  int prefix_length,
+  ffi.Pointer<ffi.Void> native_buffer,
+);
+
+@ffi.Native<ffi.Int64 Function(ffi.Int64, ffi.Int64)>()
+external int dart_http_native_client_websocket_flush(int client_id, int socket_id);
+
+@ffi.Native<ffi.Int32 Function(ffi.Int64, ffi.Int64, ffi.Pointer<ffi.Void>)>()
+external int dart_http_native_client_websocket_adopt_byte_stream(
+  int client_id,
+  int socket_id,
+  ffi.Pointer<ffi.Void> native_stream,
+);
+
+@ffi.Native<
+  ffi.Bool Function(
+    ffi.Int64,
+    ffi.Int64,
+    ffi.Pointer<ffi.Uint8>,
+    ffi.IntPtr,
+    ffi.IntPtr,
+    ffi.IntPtr,
+    ffi.IntPtr,
+  )
+>()
+external bool dart_http_native_client_websocket_resume_byte_stream(
+  int client_id,
+  int socket_id,
+  ffi.Pointer<ffi.Uint8> prefix,
+  int prefix_length,
+  int sequence_offset,
+  int payload_unit_count_offset,
+  int bytes_per_payload_unit,
+);
+
+@ffi.Native<ffi.Int64 Function(ffi.Int64, ffi.Int64)>()
+external int dart_http_native_client_websocket_pause_byte_stream(int client_id, int socket_id);
+
+@ffi.Native<ffi.Bool Function(ffi.Int64, ffi.Int64)>()
+external bool dart_http_native_client_websocket_close_byte_stream(int client_id, int socket_id);
+
 @ffi.Native<ffi.Int64 Function(ffi.Int64, ffi.Int64, ffi.Int32, ffi.Pointer<ffi.Char>)>()
 external int dart_http_native_client_websocket_close(
   int client_id,

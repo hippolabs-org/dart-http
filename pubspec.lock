@@ -421,10 +421,10 @@ packages:
     dependency: transitive
     description:
       name: native_exchange
-      sha256: "573808786007d2e8c2516892ea12f3c96a7f0fde6d85000e9df28d444245faef"
+      sha256: "0cd6d6f71fb2bb9770eff6cecfac068a480e5eb31440d5ffe9d4e1ea307bf9af"
       url: "https://pub.hippolabs.org"
     source: hosted
-    version: "0.3.0"
+    version: "0.3.1"
   native_exchange_runtime:
     dependency: transitive
     description:

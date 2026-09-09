@@ -1,3 +1,10 @@
+## 0.3.52
+
+- Add `DartHttpClientQueuedWebSocket` for synchronous, bounded ownership
+  transfer and ordered outbound flush fences.
+- Add session-level Native Exchange byte-stream adoption with native pause,
+  resume framing, and ordered boundary fences.
+
 ## 0.3.51
 
 - Add ownership-transferring outbound WebSocket binary sends, including a

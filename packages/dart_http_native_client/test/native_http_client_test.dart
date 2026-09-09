@@ -183,6 +183,45 @@ void main() {
     await completed.future.timeout(const Duration(seconds: 10));
   });
 
+  test('enqueues native leases and flushes one ordered fence', () async {
+    server.listen((request) async {
+      final socket = await WebSocketTransformer.upgrade(request);
+      socket.listen(socket.add);
+    });
+    final socket = await transport.connect(
+      DartHttpClientWebSocketRequest(
+        uri: Uri.parse('ws://${server.address.host}:${server.port}/queued'),
+      ),
+    );
+    addTearDown(socket.close);
+    final queued = socket as DartHttpClientQueuedWebSocket;
+
+    final received = Completer<WebSocketMessage>();
+    final forwarded = Completer<WebSocketMessage>();
+    final subscription = socket.messages.listen((message) {
+      if (!received.isCompleted) {
+        received.complete(message);
+      } else {
+        forwarded.complete(message);
+      }
+    });
+    addTearDown(subscription.cancel);
+    await socket.sendBinary(const <int>[1, 2, 3, 4]);
+    final source = (await received.future).takeBinaryLease();
+    final byteLease = switch (source) {
+      NativeExchangeBinaryPayloadLease(lease: final value) => value,
+      _ => throw StateError('Expected a Native Exchange lease.'),
+    };
+
+    queued.enqueueByteLease(byteLease, prefix: const <int>[9, 8]);
+    expect(source.isClosed, isTrue);
+    await queued.flush();
+
+    final result = (await forwarded.future).takeBinaryLease();
+    expect(result.bytesView, const <int>[9, 8, 1, 2, 3, 4]);
+    result.close();
+  });
+
   test('rejects sends beyond the configured bounded queue', () async {
     transport.close();
     transport = await NativeHttpClientTransport.open(webSocketOutgoingCapacity: 1);

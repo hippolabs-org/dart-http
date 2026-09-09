@@ -2,6 +2,8 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 
+import 'package:native_exchange/native_exchange.dart';
+
 import '../http.dart';
 import '../web_socket.dart';
 import '../web_transport.dart';
@@ -195,6 +197,60 @@ abstract interface class DartHttpClientOwnedWebSocket implements DartHttpClientW
   /// transferred without concatenating it into another Dart buffer. [prefix]
   /// must remain unchanged until the returned future completes.
   Future<void> sendBinaryLease(BinaryPayloadLease lease, {List<int> prefix = const <int>[]});
+}
+
+/// Optional native WebSocket capability for bounded, synchronous lease enqueueing.
+///
+/// [enqueueBinaryLease] transfers payload ownership into the transport without
+/// waiting for a socket write. [flush] is an ordered fence: it completes after
+/// every message enqueued before it has been flushed by the transport. Neither
+/// operation implies peer receipt or acknowledgement.
+abstract interface class DartHttpClientQueuedWebSocket implements DartHttpClientOwnedWebSocket {
+  /// Enqueues an existing Native Exchange [lease] without an adapter object.
+  ///
+  /// The lease is consumed on both success and failure. Implementations must
+  /// throw synchronously when their bounded outbound payload queue is full.
+  void enqueueByteLease(ByteLease lease, {List<int> prefix = const <int>[]});
+
+  /// Enqueues [prefix] and [lease] as one logical binary message.
+  ///
+  /// The lease is consumed on both success and failure. Implementations must
+  /// throw synchronously when their bounded outbound payload queue is full.
+  void enqueueBinaryLease(BinaryPayloadLease lease, {List<int> prefix = const <int>[]});
+
+  /// Waits until all messages enqueued before this call have been flushed.
+  Future<void> flush();
+}
+
+/// A native byte stream drained by a WebSocket without a Dart object or
+/// native-to-Dart completion for each chunk.
+abstract interface class DartHttpClientNativeWebSocketByteStream {
+  /// Starts routing chunks with [prefix]. The native sender writes a
+  /// zero-based chunk sequence and payload unit count into the prefix when the
+  /// corresponding offsets are non-negative.
+  ///
+  /// Both fields use big-endian encoding. Sequence occupies eight bytes and
+  /// payload unit count occupies four. [bytesPerPayloadUnit] lets callers
+  /// express samples or frames instead of raw bytes.
+  void resume({
+    List<int> prefix = const <int>[],
+    int sequenceOffset = -1,
+    int payloadUnitCountOffset = -1,
+    int bytesPerPayloadUnit = 1,
+  });
+
+  /// Pauses pulls and completes after previously accepted chunks are flushed.
+  Future<void> pauseAndFlush();
+
+  /// Cancels and releases the adopted producer stream natively.
+  void close();
+}
+
+/// WebSocket capability for adopting one Native Exchange byte stream.
+abstract interface class DartHttpClientNativeStreamWebSocket
+    implements DartHttpClientQueuedWebSocket {
+  /// Transfers [stream] into a paused native WebSocket pump.
+  DartHttpClientNativeWebSocketByteStream adoptByteStream(ByteStreamLease stream);
 }
 
 /// Ownership-aware binary sending for every client WebSocket.
