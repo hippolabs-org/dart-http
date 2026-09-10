@@ -168,6 +168,11 @@ int64_t dart_http_native_client_websocket_pause_byte_stream(
 int64_t dart_http_native_client_websocket_drain_byte_stream(
     int64_t client_id,
     int64_t socket_id);
+int64_t dart_http_native_client_websocket_drain_and_send_binary(
+    int64_t client_id,
+    int64_t socket_id,
+    const uint8_t* message,
+    intptr_t message_length);
 bool dart_http_native_client_websocket_byte_stream_stats(
     int64_t client_id,
     int64_t socket_id,

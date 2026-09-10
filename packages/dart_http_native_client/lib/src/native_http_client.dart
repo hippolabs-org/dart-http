@@ -15,7 +15,7 @@ import 'native_http_response.dart';
 part 'native_http_web_socket.dart';
 part 'native_http_response_reader.dart';
 
-const _nativeAbiVersion = 14;
+const _nativeAbiVersion = 15;
 const _responseModeNativeStream = 0;
 const _responseModeBuffered = 1;
 const _responseModeDirectStream = 2;

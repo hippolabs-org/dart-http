@@ -37,7 +37,7 @@ use tokio_tungstenite::tungstenite::protocol::{
 use tokio_tungstenite::{Connector, connect_async_tls_with_config};
 use tokio_util::sync::CancellationToken;
 
-const ABI_VERSION: i32 = 14;
+const ABI_VERSION: i32 = 15;
 const RESPONSE_MODE_NATIVE_STREAM: i32 = 0;
 const RESPONSE_MODE_BUFFERED: i32 = 1;
 const RESPONSE_MODE_DIRECT_STREAM: i32 = 2;
@@ -180,6 +180,7 @@ enum WebSocketByteStreamControl {
     Resume(WebSocketByteStreamFraming),
     Pause { operation_id: i64 },
     Drain { operation_id: i64 },
+    DrainAndSendBinary { operation_id: i64, message: Bytes },
     Stop,
 }
 
@@ -1549,6 +1550,46 @@ pub extern "C" fn dart_http_native_client_websocket_drain_byte_stream(
 }
 
 #[unsafe(no_mangle)]
+/// Drains the attached stream and sends one ordered trailing binary frame.
+///
+/// # Safety
+///
+/// The message pointer must remain readable for this call. Its bytes are
+/// copied before the function returns.
+pub unsafe extern "C" fn dart_http_native_client_websocket_drain_and_send_binary(
+    client_id: i64,
+    socket_id: i64,
+    message: *const u8,
+    message_length: isize,
+) -> i64 {
+    let Ok(message) = (unsafe { copy_optional_bytes(message, message_length) }) else {
+        return 0;
+    };
+    if message.is_empty() {
+        return 0;
+    }
+    let Some(socket) = web_socket_state(client_id, socket_id) else {
+        return 0;
+    };
+    let operation_id = socket.next_operation_id.fetch_add(1, Ordering::Relaxed);
+    let Ok(attached) = socket.byte_stream.lock() else {
+        return 0;
+    };
+    let Some(pump) = attached.as_ref() else {
+        return 0;
+    };
+    match pump
+        .controls
+        .send(WebSocketByteStreamControl::DrainAndSendBinary {
+            operation_id,
+            message: Bytes::from(message),
+        }) {
+        Ok(()) => operation_id,
+        Err(_) => 0,
+    }
+}
+
+#[unsafe(no_mangle)]
 /// Reads counters for the last segment after its pause fence has completed.
 ///
 /// # Safety
@@ -1776,7 +1817,7 @@ fn run_web_socket_byte_stream(
 ) {
     let mut framing: Option<WebSocketByteStreamFraming> = None;
     let mut pending: Option<Bytes> = None;
-    let mut drain_operation_ids = Vec::<i64>::new();
+    let mut drain_boundaries = Vec::<(i64, Option<Bytes>)>::new();
     let mut source_done = false;
     loop {
         if framing.is_none() {
@@ -1797,14 +1838,34 @@ fn run_web_socket_byte_stream(
                 }
                 Ok(WebSocketByteStreamControl::Drain { operation_id }) => {
                     if source_done {
-                        if commands
-                            .send(WebSocketCommand::Fence { operation_id })
-                            .is_err()
-                        {
+                        if !enqueue_byte_stream_boundary(
+                            &commands,
+                            &outgoing_slots,
+                            operation_id,
+                            None,
+                        ) {
                             return;
                         }
                     } else {
-                        drain_operation_ids.push(operation_id);
+                        drain_boundaries.push((operation_id, None));
+                    }
+                    continue;
+                }
+                Ok(WebSocketByteStreamControl::DrainAndSendBinary {
+                    operation_id,
+                    message,
+                }) => {
+                    if source_done {
+                        if !enqueue_byte_stream_boundary(
+                            &commands,
+                            &outgoing_slots,
+                            operation_id,
+                            Some(message),
+                        ) {
+                            return;
+                        }
+                    } else {
+                        drain_boundaries.push((operation_id, Some(message)));
                     }
                     continue;
                 }
@@ -1829,7 +1890,13 @@ fn run_web_socket_byte_stream(
                     }
                 }
                 WebSocketByteStreamControl::Drain { operation_id } => {
-                    drain_operation_ids.push(operation_id);
+                    drain_boundaries.push((operation_id, None));
+                }
+                WebSocketByteStreamControl::DrainAndSendBinary {
+                    operation_id,
+                    message,
+                } => {
+                    drain_boundaries.push((operation_id, Some(message)));
                 }
                 WebSocketByteStreamControl::Stop => return,
             }
@@ -1847,11 +1914,13 @@ fn run_web_socket_byte_stream(
                 Ok(RequestStreamRead::Done) => {
                     source_done = true;
                     framing = None;
-                    for operation_id in drain_operation_ids.drain(..) {
-                        if commands
-                            .send(WebSocketCommand::Fence { operation_id })
-                            .is_err()
-                        {
+                    for (operation_id, message) in drain_boundaries.drain(..) {
+                        if !enqueue_byte_stream_boundary(
+                            &commands,
+                            &outgoing_slots,
+                            operation_id,
+                            message,
+                        ) {
                             return;
                         }
                     }
@@ -1885,7 +1954,13 @@ fn run_web_socket_byte_stream(
                 framing = Some(value);
             }
             Ok(WebSocketByteStreamControl::Drain { operation_id }) => {
-                drain_operation_ids.push(operation_id);
+                drain_boundaries.push((operation_id, None));
+            }
+            Ok(WebSocketByteStreamControl::DrainAndSendBinary {
+                operation_id,
+                message,
+            }) => {
+                drain_boundaries.push((operation_id, Some(message)));
             }
             Ok(WebSocketByteStreamControl::Stop) => return,
             Err(std_mpsc::TryRecvError::Disconnected) => return,
@@ -1979,6 +2054,32 @@ fn run_web_socket_byte_stream(
         stats.chunks.fetch_add(1, Ordering::Release);
         stats.bytes.fetch_add(byte_count, Ordering::Release);
     }
+}
+
+fn enqueue_byte_stream_boundary(
+    commands: &mpsc::UnboundedSender<WebSocketCommand>,
+    outgoing_slots: &Arc<Semaphore>,
+    operation_id: i64,
+    message: Option<Bytes>,
+) -> bool {
+    let Some(message) = message else {
+        return commands
+            .send(WebSocketCommand::Fence { operation_id })
+            .is_ok();
+    };
+    let Ok(runtime) = shared_runtime() else {
+        return false;
+    };
+    let Ok(permit) = runtime.block_on(Arc::clone(outgoing_slots).acquire_owned()) else {
+        return false;
+    };
+    commands
+        .send(WebSocketCommand::Send {
+            operation_id: Some(operation_id),
+            messages: vec![Message::Binary(message)],
+            permit,
+        })
+        .is_ok()
 }
 
 fn web_socket_state(client_id: i64, socket_id: i64) -> Option<Arc<WebSocketState>> {

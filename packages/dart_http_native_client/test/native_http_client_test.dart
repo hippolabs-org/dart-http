@@ -936,6 +936,53 @@ void main() {
     expect((await second.future).text, '{"audio":"${base64Encode(const <int>[1, 2, 3, 4])}"}');
   });
 
+  test('drains a native byte stream before one trailing binary frame', () async {
+    final allowSourceEof = Completer<void>();
+    final received = <List<int>>[];
+    final receivedBoundary = Completer<void>();
+    server.listen((request) async {
+      if (WebSocketTransformer.isUpgradeRequest(request)) {
+        final socket = await WebSocketTransformer.upgrade(request);
+        socket.listen((message) {
+          received.add((message as List<int>).toList(growable: false));
+          if (received.last case [9, 9, 9]) receivedBoundary.complete();
+        });
+        return;
+      }
+      request.response.add(const <int>[1, 2, 3, 4]);
+      await request.response.flush();
+      await allowSourceEof.future;
+      await request.response.close();
+    });
+    final socket = await transport.connect(
+      DartHttpClientWebSocketRequest(
+        uri: Uri.parse('ws://${server.address.host}:${server.port}/drain-boundary'),
+      ),
+    );
+    addTearDown(socket.close);
+    final source = await transport.sendNative(
+      DartHttpClientRequest(
+        method: HttpMethod.get,
+        uri: Uri.parse('http://${server.address.host}:${server.port}/source'),
+      ),
+    );
+    final pump = (socket as DartHttpClientNativeStreamWebSocket).adoptByteStream(source.body);
+    addTearDown(pump.close);
+
+    pump.resume();
+    final drain = pump.drainAndSendBinary(const <int>[9, 9, 9]);
+    allowSourceEof.complete();
+    final stats = await drain.timeout(const Duration(seconds: 5));
+    await receivedBoundary.future.timeout(const Duration(seconds: 5));
+
+    expect(received, <List<int>>[
+      <int>[1, 2, 3, 4],
+      <int>[9, 9, 9],
+    ]);
+    expect(stats.chunkCount, 1);
+    expect(stats.byteCount, 4);
+  });
+
   test('pumps a native byte stream into base64 text frames', () async {
     final sourceBytes = <int>[for (var index = 0; index < 256 * 1024; index++) index & 0xff];
     final receivedBytes = <int>[];

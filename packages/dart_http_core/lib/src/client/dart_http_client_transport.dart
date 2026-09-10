@@ -402,6 +402,12 @@ abstract interface class DartHttpClientNativeWebSocketByteStream {
   /// accepted chunk has been flushed to the WebSocket writer.
   Future<DartHttpClientNativeWebSocketByteStreamStats> drainAndFlush();
 
+  /// Keeps pulling through producer EOF, then sends [trailingMessage] as the
+  /// next ordered binary frame before completing.
+  Future<DartHttpClientNativeWebSocketByteStreamStats> drainAndSendBinary(
+    List<int> trailingMessage,
+  );
+
   /// Cancels and releases the adopted producer stream natively.
   void close();
 }

@@ -310,6 +310,14 @@ external int dart_http_native_client_websocket_pause_byte_stream(int client_id, 
 @ffi.Native<ffi.Int64 Function(ffi.Int64, ffi.Int64)>()
 external int dart_http_native_client_websocket_drain_byte_stream(int client_id, int socket_id);
 
+@ffi.Native<ffi.Int64 Function(ffi.Int64, ffi.Int64, ffi.Pointer<ffi.Uint8>, ffi.IntPtr)>()
+external int dart_http_native_client_websocket_drain_and_send_binary(
+  int client_id,
+  int socket_id,
+  ffi.Pointer<ffi.Uint8> message,
+  int message_length,
+);
+
 @ffi.Native<
   ffi.Bool Function(ffi.Int64, ffi.Int64, ffi.Pointer<ffi.Uint64>, ffi.Pointer<ffi.Uint64>)
 >()

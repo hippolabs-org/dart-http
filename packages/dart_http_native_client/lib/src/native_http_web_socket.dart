@@ -710,6 +710,30 @@ abstract base class _NativeHttpWebSocketAdoptedStream {
     return _stats();
   }
 
+  Future<DartHttpClientNativeWebSocketByteStreamStats> drainAndSendBinary(
+    List<int> trailingMessage,
+  ) async {
+    _ensureOpen();
+    if (trailingMessage.isEmpty) {
+      throw ArgumentError.value(trailingMessage, 'trailingMessage', 'Must not be empty.');
+    }
+    final pointer = calloc<Uint8>(trailingMessage.length);
+    try {
+      pointer.asTypedList(trailingMessage.length).setAll(0, trailingMessage);
+      await _socket._scheduleOperation(
+        () => native.dart_http_native_client_websocket_drain_and_send_binary(
+          _socket._transport._clientId,
+          _socket._socketId,
+          pointer,
+          trailingMessage.length,
+        ),
+      );
+    } finally {
+      calloc.free(pointer);
+    }
+    return _stats();
+  }
+
   DartHttpClientNativeWebSocketByteStreamStats _stats() {
     final chunkCount = calloc<Uint64>();
     final byteCount = calloc<Uint64>();

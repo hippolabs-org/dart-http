@@ -1,3 +1,8 @@
+## 0.3.60
+
+- Add an ordered native WebSocket byte-stream drain with a trailing binary
+  boundary frame.
+
 ## 0.3.59
 
 - Add a per-request redirect policy to `DartHttpClientRequest`.

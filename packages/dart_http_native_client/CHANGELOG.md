@@ -1,3 +1,10 @@
+## 0.2.22
+
+- Add an ordered native byte-stream drain that sends a trailing binary frame
+  immediately after producer EOF, enabling protocol-level end markers without
+  a Dart fence round trip.
+- Advance the native ABI to version 15.
+
 ## 0.2.21
 
 - Drive native WebSocket reads and writes independently so a backpressured

@@ -1,6 +1,6 @@
 name: dart_http_core
 description: Transport-agnostic core contracts for Dart HTTP.
-version: 0.3.59
+version: 0.3.60
 publish_to: "https://pub.hippolabs.org"
 repository: https://github.com/hippolabs-org/dart-http/tree/main/packages/dart_http_core
 
