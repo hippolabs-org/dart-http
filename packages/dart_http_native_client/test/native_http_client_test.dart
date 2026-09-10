@@ -809,6 +809,37 @@ void main() {
     await completed.future.timeout(const Duration(seconds: 10));
   });
 
+  test('keeps sending while the native receive queue is backpressured', () async {
+    transport.close();
+    transport = await NativeHttpClientTransport.open(
+      webSocketIncomingCapacity: 1,
+      webSocketOutgoingCapacity: 1,
+    );
+    final receivedByServer = Completer<String>();
+    server.listen((request) async {
+      final socket = await WebSocketTransformer.upgrade(request);
+      socket.listen((message) {
+        if (!receivedByServer.isCompleted) receivedByServer.complete(message as String);
+      });
+      socket
+        ..add('first')
+        ..add('second');
+    });
+    final socket = await transport.connect(
+      DartHttpClientWebSocketRequest(
+        uri: Uri.parse('ws://${server.address.host}:${server.port}/independent-writer'),
+      ),
+    );
+    addTearDown(socket.close);
+
+    // Leave the message stream unobserved so the one-slot native receive queue
+    // fills and backpressures the socket reader.
+    await Future<void>.delayed(const Duration(milliseconds: 100));
+    await socket.sendText('outgoing').timeout(const Duration(seconds: 2));
+
+    expect(await receivedByServer.future.timeout(const Duration(seconds: 2)), 'outgoing');
+  });
+
   test('delivers buffered frames before an immediate peer close', () async {
     server.listen((request) async {
       final socket = await WebSocketTransformer.upgrade(request);

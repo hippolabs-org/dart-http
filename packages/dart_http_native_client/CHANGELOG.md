@@ -1,3 +1,8 @@
+## 0.2.21
+
+- Drive native WebSocket reads and writes independently so a backpressured
+  incoming Dart message stream cannot stall outgoing audio or control frames.
+
 ## 0.2.20
 
 - Remove the default two-minute total HTTP request deadline so long-lived

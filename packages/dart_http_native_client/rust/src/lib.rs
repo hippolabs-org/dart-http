@@ -2090,17 +2090,88 @@ async fn run_web_socket(
         return;
     }
     let (mut writer, mut reader) = socket.split();
+    let (pong_tx, mut pong_rx) = mpsc::unbounded_channel();
+    let reader_state = Arc::clone(&state);
+    let reader_events = events.clone();
+    let reader_control_events = control_events.clone();
+    let reader_cancellation = cancellation.clone();
+    let reader_task = tokio::spawn(async move {
+        loop {
+            let incoming = tokio::select! {
+                biased;
+                () = reader_cancellation.cancelled() => return,
+                incoming = reader.next() => incoming,
+            };
+            let event = match incoming {
+                Some(Ok(Message::Text(value))) => WebSocketEventData::Text(value.to_string()),
+                Some(Ok(Message::Binary(value))) => WebSocketEventData::Binary(value),
+                Some(Ok(Message::Close(frame))) => {
+                    let (code, reason) = frame
+                        .map(|frame| (Some(u16::from(frame.code)), frame.reason.to_string()))
+                        .unwrap_or((None, String::new()));
+                    WebSocketEventData::Closed { code, reason }
+                }
+                Some(Ok(Message::Ping(value))) => {
+                    if pong_tx.send(value).is_err() {
+                        return;
+                    }
+                    continue;
+                }
+                Some(Ok(Message::Pong(_))) | Some(Ok(Message::Frame(_))) => continue,
+                Some(Err(error)) => {
+                    WebSocketEventData::Error(format!("Native WebSocket receive failed: {error}"))
+                }
+                None => WebSocketEventData::Closed {
+                    code: None,
+                    reason: String::new(),
+                },
+            };
+            let terminal = matches!(
+                event,
+                WebSocketEventData::Closed { .. } | WebSocketEventData::Error(_)
+            );
+            if !send_web_socket_event(
+                &reader_state,
+                socket_id,
+                &reader_events,
+                &reader_control_events,
+                event,
+                &reader_cancellation,
+            )
+            .await
+                || terminal
+            {
+                reader_cancellation.cancel();
+                return;
+            }
+        }
+    });
     loop {
         tokio::select! {
             biased;
             () = cancellation.cancelled() => {
                 let _ = writer.close().await;
-                return;
+                break;
+            }
+            Some(value) = pong_rx.recv() => {
+                if let Err(error) = writer.send(Message::Pong(value)).await {
+                    let _ = send_web_socket_event(
+                        &state,
+                        socket_id,
+                        &events,
+                        &control_events,
+                        WebSocketEventData::Error(format!(
+                            "Native WebSocket pong failed: {error}"
+                        )),
+                        &cancellation,
+                    ).await;
+                    break;
+                }
             }
             command = commands.recv() => {
                 let Some(command) = command else {
                     let _ = writer.close().await;
-                    return;
+                    break;
                 };
                 let (operation_id, messages, _permit) = match command {
                     WebSocketCommand::Send { operation_id, messages, permit } => {
@@ -2128,7 +2199,7 @@ async fn run_web_socket(
                             WebSocketEventData::Error(message),
                             &cancellation,
                         ).await;
-                        return;
+                        break;
                     }
                 };
                 for message in messages {
@@ -2141,7 +2212,7 @@ async fn run_web_socket(
                             WebSocketEventData::Error(format!("Native WebSocket send failed: {error}")),
                             &cancellation,
                         ).await;
-                        return;
+                        break;
                     }
                 }
                 if let Some(operation_id) = operation_id
@@ -2155,69 +2226,13 @@ async fn run_web_socket(
                     )
                     .await
                 {
-                    return;
-                }
-            }
-            incoming = reader.next() => {
-                let event = match incoming {
-                    Some(Ok(Message::Text(value))) => WebSocketEventData::Text(value.to_string()),
-                    Some(Ok(Message::Binary(value))) => WebSocketEventData::Binary(value),
-                    Some(Ok(Message::Close(frame))) => {
-                        let (code, reason) = frame
-                            .map(|frame| (Some(u16::from(frame.code)), frame.reason.to_string()))
-                            .unwrap_or((None, String::new()));
-                        let _ = send_web_socket_event(
-                            &state,
-                            socket_id,
-                            &events,
-                            &control_events,
-                            WebSocketEventData::Closed { code, reason },
-                            &cancellation,
-                        ).await;
-                        return;
-                    }
-                    Some(Ok(Message::Ping(value))) => {
-                        if let Err(error) = writer.send(Message::Pong(value)).await {
-                            let _ = send_web_socket_event(
-                                &state,
-                                socket_id,
-                                &events,
-                                &control_events,
-                                WebSocketEventData::Error(format!(
-                                    "Native WebSocket pong failed: {error}"
-                                )),
-                                &cancellation,
-                            ).await;
-                            return;
-                        }
-                        continue;
-                    }
-                    Some(Ok(Message::Pong(_))) | Some(Ok(Message::Frame(_))) => continue,
-                    Some(Err(error)) => WebSocketEventData::Error(format!(
-                        "Native WebSocket receive failed: {error}"
-                    )),
-                    None => WebSocketEventData::Closed {
-                        code: None,
-                        reason: String::new(),
-                    },
-                };
-                let terminal = matches!(
-                    event,
-                    WebSocketEventData::Closed { .. } | WebSocketEventData::Error(_)
-                );
-                if !send_web_socket_event(
-                    &state,
-                    socket_id,
-                    &events,
-                    &control_events,
-                    event,
-                    &cancellation,
-                ).await || terminal {
-                    return;
+                    break;
                 }
             }
         }
     }
+    cancellation.cancel();
+    let _ = reader_task.await;
 }
 
 fn prepare_web_socket_request(
