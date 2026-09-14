@@ -149,10 +149,10 @@ packages:
     dependency: transitive
     description:
       name: code_assets
-      sha256: bf394f466ba9205f1812a0433b392d6af280f155f56651eda7c18cc32ed493b8
+      sha256: cfd4f5f575a49c5f10ca856e9846073f1e6c3ee94912377eea5f6cefc5272941
       url: "https://pub.dev"
     source: hosted
-    version: "1.2.1"
+    version: "2.0.0"
   code_builder:
     dependency: transitive
     description:
@@ -293,10 +293,10 @@ packages:
     dependency: transitive
     description:
       name: hippolabs_native_assets
-      sha256: "79bc5a53aa30b441ca1e843ef4f807aff5aa0150c1a9bda060edda3ad19c791f"
+      sha256: "98d6cb7f45ae11351a11f4081119de70a8bbfca50cd2b28a2ac5b523ab96fda9"
       url: "https://pub.hippolabs.org"
     source: hosted
-    version: "0.1.2"
+    version: "0.2.0"
   hooks:
     dependency: transitive
     description:
@@ -429,10 +429,10 @@ packages:
     dependency: transitive
     description:
       name: native_toolchain_rust
-      sha256: "8469a0e32a47a5c84b7fd300de9fd0e8082aac76c37922986324f5082a58350d"
-      url: "https://pub.dev"
+      sha256: "2ef110bd8b5cea4f1cf16b85df56c652414dcec09e9c31b354d451ba4c3e69ac"
+      url: "https://pub.hippolabs.org"
     source: hosted
-    version: "1.0.6"
+    version: "1.0.8"
   node_preamble:
     dependency: transitive
     description:

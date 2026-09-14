@@ -1,3 +1,7 @@
+## 0.3.48
+
+- Upgrade to `hippolabs_native_assets` 0.2.0 for corrected Apple deployment-target propagation and `code_assets` 2.0.
+
 ## 0.3.47
 
 - Decode `application/x-www-form-urlencoded` request bodies for typed route handlers.

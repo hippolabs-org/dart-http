@@ -1,3 +1,7 @@
+## 0.2.23
+
+- Upgrade to `hippolabs_native_assets` 0.2.0 for corrected Apple deployment-target propagation and `code_assets` 2.0.
+
 ## 0.2.22
 
 - Add an ordered native byte-stream drain that sends a trailing binary frame
