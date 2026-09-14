@@ -1,3 +1,8 @@
+## 0.3.49
+
+- Declare Android and iOS Rust targets for source builds under the validated
+  Code Assets 2 toolchain.
+
 ## 0.3.48
 
 - Upgrade to `hippolabs_native_assets` 0.2.0 for corrected Apple deployment-target propagation and `code_assets` 2.0.
