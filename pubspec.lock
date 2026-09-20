@@ -209,6 +209,15 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "1.0.2"
+  dart_mcp:
+    dependency: "direct overridden"
+    description:
+      path: "pkgs/dart_mcp"
+      ref: "47f4e3146bec18651d6a950ca041f95c0ed7d70d"
+      resolved-ref: "47f4e3146bec18651d6a950ca041f95c0ed7d70d"
+      url: "https://github.com/dart-lang/ai.git"
+    source: git
+    version: "0.6.0-wip"
   dart_style:
     dependency: transitive
     description:
@@ -353,6 +362,14 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "4.12.0"
+  json_rpc_2:
+    dependency: transitive
+    description:
+      name: json_rpc_2
+      sha256: "82dfd37d3b2e5030ae4729e1d7f5538cbc45eb1c73d618b9272931facac3bec1"
+      url: "https://pub.dev"
+    source: hosted
+    version: "4.1.0"
   json_schema:
     dependency: transitive
     description:

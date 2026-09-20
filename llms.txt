@@ -12,6 +12,8 @@ for Dart maintained by Hippolabs.
   payloads directly.
 - `packages/dart_http_resumable_upload`: resumable upload protocol, client,
   routes, and storage contracts.
+- `packages/dart_http_mcp`: mounts `dart_mcp` Streamable HTTP servers on
+  `dart_http_server` routers while preserving Dart HTTP guards and streaming.
 - `packages/dart_http_server_runtime`: Rust-backed runtime with Native
   Exchange body ownership.
 

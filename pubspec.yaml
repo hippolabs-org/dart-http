@@ -8,6 +8,7 @@ environment:
 dev_dependencies:
   dart_http_client: any
   dart_http_core: any
+  dart_http_mcp: any
   dart_http_native_client: any
   hippo_analysis:
     hosted: https://pub.hippolabs.org
@@ -19,6 +20,11 @@ workspace:
 
 dependency_overrides:
   cli_util: ^0.5.1
+  dart_mcp:
+    git:
+      url: https://github.com/dart-lang/ai.git
+      ref: 47f4e3146bec18651d6a950ca041f95c0ed7d70d
+      path: pkgs/dart_mcp
 
 hooks:
   user_defines:
