@@ -1,0 +1,31 @@
+name: dart_http_jaspr
+description: Jaspr rendering and app mounting helpers for Dart HTTP.
+version: 0.1.0
+homepage: https://hippolabs.org
+repository: https://github.com/hippolabs-org/dart-http/tree/main/packages/dart_http_jaspr
+publish_to: "https://pub.hippolabs.org"
+resolution: workspace
+
+environment:
+  sdk: ">=3.13.0 <4.0.0"
+
+dependencies:
+  dart_http_core:
+    hosted: "https://pub.hippolabs.org"
+    version: ^0.3.60
+  dart_http_shelf:
+    hosted: "https://pub.hippolabs.org"
+    version: ^0.1.0
+  jaspr: ^0.23.3
+
+dev_dependencies:
+  dart_http_server:
+    hosted: "https://pub.hippolabs.org"
+    version: ^0.3.26
+  hippo_analysis:
+    hosted: https://pub.hippolabs.org
+    version: ^0.1.2
+  test: ^1.30.0
+
+jaspr:
+  mode: server

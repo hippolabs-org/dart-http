@@ -22,12 +22,14 @@ contract documented in [`docs/realtime-stream-contract.md`](docs/realtime-stream
 | [`sse_helpers`](packages/sse_helpers) | Bounded, incremental Server-Sent Events encoding and decoding. |
 | `dart_http_core` | Transport-neutral HTTP, routing, WebSocket, and WebTransport contracts. |
 | `dart_http_client` | HTTP and WebSocket transports for generated clients. |
+| [`dart_http_jaspr`](packages/dart_http_jaspr) | Jaspr rendering and app mounting on Dart HTTP routers. |
 | [`dart_http_mcp`](packages/dart_http_mcp) | Mounts `dart_mcp` Streamable HTTP servers on Dart HTTP routers. |
 | `dart_http_native_client` | Tokio/reqwest HTTP transport with cancellation and Native Exchange request/response streams. |
 | [`dart_http_resumable_upload`](packages/dart_http_resumable_upload) | Client and server primitives for interoperable, resumable HTTP uploads. |
 | `dart_http_server` | App-facing HTTP server and helpers. |
 | `dart_http_server_codegen` | Route, schema, and client generation. |
 | `dart_http_server_runtime` | Rust-backed native HTTP runtime. |
+| [`dart_http_shelf`](packages/dart_http_shelf) | Mounts Shelf handlers while preserving Dart HTTP routing and streaming. |
 
 The existing package names are retained during extraction so applications can
 migrate repository ownership without an immediate API rename.

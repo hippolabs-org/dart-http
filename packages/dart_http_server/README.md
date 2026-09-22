@@ -15,10 +15,10 @@ from `dart_http_server_runtime`, and app-facing helpers in one import.
   route definitions
 - `OpenApiHelpers` for mounting helper endpoints alongside your app
 - WebSocket handlers with text, JSON, binary, and mixed-frame streams
-- `dart_http_shelf` and `dart_http_jaspr` helpers for mounting Shelf and Jaspr
-  apps
-- `dart_http_jaspr_helpers` components for reusable Jaspr-backed page and email
-  scaffolds
+
+Companion packages provide `dart_http_shelf` and `dart_http_jaspr` helpers for
+mounting existing Shelf handlers and Jaspr applications without coupling those
+framework dependencies to the core server package.
 
 ## Quick Start
 

@@ -12,6 +12,10 @@ for Dart maintained by Hippolabs.
   payloads directly.
 - `packages/dart_http_resumable_upload`: resumable upload protocol, client,
   routes, and storage contracts.
+- `packages/dart_http_shelf`: adapts Shelf handlers to Dart HTTP routes while
+  preserving request metadata and streaming response bodies.
+- `packages/dart_http_jaspr`: mounts Jaspr applications through the Shelf
+  adapter and renders Jaspr components to HTML strings.
 - `packages/dart_http_mcp`: mounts `dart_mcp` Streamable HTTP servers on
   `dart_http_server` routers while preserving Dart HTTP guards and streaming.
 - `packages/dart_http_server_runtime`: Rust-backed runtime with Native

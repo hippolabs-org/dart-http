@@ -23,9 +23,9 @@ app.mountMcp(
 );
 ```
 
-The current prerelease follows `dart_mcp` `0.6.0-wip`. Until that package is
-published, workspace users must override `dart_mcp` to a compatible Git commit.
-The Dart HTTP workspace pins the commit used for validation.
+This release follows `dart_mcp` `0.6.0-wip`. Until that package is published,
+workspace users must override `dart_mcp` to a compatible Git commit. The Dart
+HTTP workspace pins the commit used for validation.
 
 Authentication remains an application concern. Attach normal Dart HTTP guards
 to the mounted endpoint and pass only deployment-approved origins.

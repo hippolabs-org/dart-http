@@ -1,8 +1,8 @@
-name: dart_http_mcp
-description: Streamable HTTP adapter for mounting dart_mcp servers on Dart HTTP.
+name: dart_http_shelf
+description: Shelf handler integration for Dart HTTP routers.
 version: 0.1.0
 homepage: https://hippolabs.org
-repository: https://github.com/hippolabs-org/dart-http/tree/main/packages/dart_http_mcp
+repository: https://github.com/hippolabs-org/dart-http/tree/main/packages/dart_http_shelf
 publish_to: "https://pub.hippolabs.org"
 resolution: workspace
 
@@ -13,7 +13,7 @@ dependencies:
   dart_http_server:
     hosted: "https://pub.hippolabs.org"
     version: ^0.3.26
-  dart_mcp: ^0.6.0-wip
+  shelf: ^1.4.2
 
 dev_dependencies:
   hippo_analysis:
