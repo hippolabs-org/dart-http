@@ -1,0 +1,4 @@
+include: package:hippo_analysis/dart.yaml
+
+formatter:
+  page_width: 100

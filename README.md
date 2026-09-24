@@ -30,6 +30,7 @@ contract documented in [`docs/realtime-stream-contract.md`](docs/realtime-stream
 | `dart_http_server_codegen` | Route, schema, and client generation. |
 | `dart_http_server_runtime` | Rust-backed native HTTP runtime. |
 | [`dart_http_shelf`](packages/dart_http_shelf) | Mounts Shelf handlers while preserving Dart HTTP routing and streaming. |
+| [`dart_http_web_artifact`](packages/dart_http_web_artifact) | Secure streamed hosting for prebuilt web applications and SPAs. |
 
 The existing package names are retained during extraction so applications can
 migrate repository ownership without an immediate API rename.
