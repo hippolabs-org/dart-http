@@ -23,9 +23,9 @@ app.mountMcp(
 );
 ```
 
-This release follows `dart_mcp` `0.6.0-wip`. Until that package is published,
-workspace users must override `dart_mcp` to a compatible Git commit. The Dart
-HTTP workspace pins the commit used for validation.
+The package pins the `dart_mcp` Git revision it uses. The custom HippoLabs
+package registry allows Git dependencies, so consumers resolve the same MCP
+API without a workspace override.
 
 Authentication remains an application concern. Attach normal Dart HTTP guards
 to the mounted endpoint and pass only deployment-approved origins.
