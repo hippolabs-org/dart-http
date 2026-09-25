@@ -1,0 +1,6 @@
+include: package:hippo_analysis/dart.yaml
+
+analyzer:
+  errors:
+    # This package is published to a custom registry, which permits Git dependencies.
+    invalid_dependency: ignore

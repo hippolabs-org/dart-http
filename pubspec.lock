@@ -210,7 +210,7 @@ packages:
     source: hosted
     version: "1.0.2"
   dart_mcp:
-    dependency: "direct overridden"
+    dependency: transitive
     description:
       path: "pkgs/dart_mcp"
       ref: "47f4e3146bec18651d6a950ca041f95c0ed7d70d"

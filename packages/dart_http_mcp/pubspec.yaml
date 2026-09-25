@@ -1,6 +1,6 @@
 name: dart_http_mcp
 description: Streamable HTTP adapter for mounting dart_mcp servers on Dart HTTP.
-version: 0.1.0
+version: 0.1.1
 homepage: https://hippolabs.org
 repository: https://github.com/hippolabs-org/dart-http/tree/main/packages/dart_http_mcp
 publish_to: "https://pub.hippolabs.org"
@@ -13,7 +13,11 @@ dependencies:
   dart_http_server:
     hosted: "https://pub.hippolabs.org"
     version: ^0.3.26
-  dart_mcp: ^0.6.0-wip
+  dart_mcp:
+    git:
+      url: https://github.com/dart-lang/ai.git
+      ref: 47f4e3146bec18651d6a950ca041f95c0ed7d70d
+      path: pkgs/dart_mcp
 
 dev_dependencies:
   hippo_analysis:
