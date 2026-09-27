@@ -250,6 +250,8 @@ class DartHttp<TServices> extends Router<TServices> {
           await _handleWebTransportHandshake(requestId, requestLease, compiledRoutes);
           return;
       }
+    } on RequestDecodingException {
+      _respondBadRequest(requestId);
     } catch (error, stackTrace) {
       stderr.writeln(
         'dart_http_server_runtime request handling failed for '
@@ -1001,6 +1003,17 @@ class DartHttp<TServices> extends Router<TServices> {
 
   void _respondServerError(int requestId) {
     final response = encodeServerError();
+    DartHttpNative.tryRespond(
+      requestId,
+      status: response.status,
+      contentType: response.contentType,
+      body: response.bodyBytes,
+      headers: response.headers,
+    );
+  }
+
+  void _respondBadRequest(int requestId) {
+    final response = encodeBadRequest();
     DartHttpNative.tryRespond(
       requestId,
       status: response.status,

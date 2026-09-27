@@ -11,6 +11,54 @@ import 'package:json_schema/json_schema.dart';
 import 'package:test/test.dart';
 
 void main() {
+  test('classifies malformed query values as client decoding errors', () async {
+    await expectLater(
+      decodeRequestInput(
+        TransportRequest(routeId: 'route_0', pathParams: {}, query: {'limit': 'abc'}, headers: {}),
+        codecs: DartHttpCodecRegistry.empty,
+        paramsSchemaId: null,
+        querySchemaId: null,
+        headersSchemaId: null,
+        queryDecoder: (_) => throw const FormatException('Invalid limit.'),
+        body: null,
+      ),
+      throwsA(isA<RequestDecodingException>()),
+    );
+  });
+
+  test('invokes the query decoder for an empty query', () async {
+    await expectLater(
+      decodeRequestInput(
+        TransportRequest(routeId: 'route_0', pathParams: {}, query: {}, headers: {}),
+        codecs: DartHttpCodecRegistry.empty,
+        paramsSchemaId: null,
+        querySchemaId: null,
+        headersSchemaId: null,
+        queryDecoder: (values) {
+          expect(values, isEmpty);
+          throw const FormatException('Missing required query parameter.');
+        },
+        body: null,
+      ),
+      throwsA(isA<RequestDecodingException>()),
+    );
+  });
+
+  test('classifies generated model type errors as client decoding errors', () async {
+    await expectLater(
+      decodeRequestInput(
+        TransportRequest(routeId: 'route_0', pathParams: {}, query: {'limit': 'abc'}, headers: {}),
+        codecs: DartHttpCodecRegistry.empty,
+        paramsSchemaId: null,
+        querySchemaId: null,
+        headersSchemaId: null,
+        queryDecoder: (values) => values['limit'] as int,
+        body: null,
+      ),
+      throwsA(isA<RequestDecodingException>()),
+    );
+  });
+
   test('decodes typed path, query, header, and body values with runtime codecs', () async {
     final codecs = DartHttpCodecRegistry.empty
         .withCodec<UserPath>(

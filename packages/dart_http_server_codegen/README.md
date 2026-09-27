@@ -112,6 +112,24 @@ final class _$CreateUserInput {
 }
 ```
 
+## Schema Query Decoding
+
+Object models generated from `@FromHttpSchema` expose `decodeQuery` when every
+field is a string, integer, number, or boolean schema. Use it as a route's
+`queryDecoder` to convert URL strings before calling the generated JSON model
+decoder:
+
+```dart
+RouteOptions(
+  query: listQuerySchema,
+  queryDecoder: ListQuery.decodeQuery,
+);
+```
+
+Invalid scalar values and schema range violations produce HTTP 400. Array and
+object query parameters need a defined multi-value wire encoding and continue
+to use a route-specific decoder.
+
 ## Client Generation
 
 `dart_http_server_codegen` emits one typed operation object per HTTP,

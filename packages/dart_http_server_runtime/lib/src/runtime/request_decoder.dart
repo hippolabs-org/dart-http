@@ -7,7 +7,42 @@ import 'json_schema_route_id.dart';
 import 'native_request.dart';
 import 'transport_request.dart';
 
+/// A malformed HTTP request value rejected before route handling.
+final class RequestDecodingException implements Exception {
+  const RequestDecodingException();
+}
+
 Future<RequestInput> decodeRequestInput(
+  TransportRequest request, {
+  required DartHttpCodecRegistry codecs,
+  NativeRequest? nativeRequest,
+  required String? paramsSchemaId,
+  required String? querySchemaId,
+  required String? headersSchemaId,
+  RequestValueDecoder? paramsDecoder,
+  RequestValueDecoder? queryDecoder,
+  required RequestBody? body,
+}) async {
+  try {
+    return await _decodeRequestInput(
+      request,
+      codecs: codecs,
+      nativeRequest: nativeRequest,
+      paramsSchemaId: paramsSchemaId,
+      querySchemaId: querySchemaId,
+      headersSchemaId: headersSchemaId,
+      paramsDecoder: paramsDecoder,
+      queryDecoder: queryDecoder,
+      body: body,
+    );
+  } on FormatException {
+    throw const RequestDecodingException();
+  } on TypeError {
+    throw const RequestDecodingException();
+  }
+}
+
+Future<RequestInput> _decodeRequestInput(
   TransportRequest request, {
   required DartHttpCodecRegistry codecs,
   NativeRequest? nativeRequest,
@@ -52,7 +87,7 @@ Object? _decodeStringMap(
   RequestValueDecoder? decoder,
   required DartHttpCodecRegistry codecs,
 }) {
-  if (values.isEmpty) {
+  if (values.isEmpty && decoder == null) {
     return null;
   }
 

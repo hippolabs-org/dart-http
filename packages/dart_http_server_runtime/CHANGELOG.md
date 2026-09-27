@@ -1,3 +1,7 @@
+## 0.3.50
+
+- Return HTTP 400 for malformed request values rejected during decoding.
+
 ## 0.3.49
 
 - Declare Android and iOS Rust targets for source builds under the validated

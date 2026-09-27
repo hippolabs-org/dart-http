@@ -98,6 +98,14 @@ EncodedResponse encodeServerError() {
   );
 }
 
+EncodedResponse encodeBadRequest() {
+  return EncodedResponse(
+    status: 400,
+    contentType: 'application/json; charset=utf-8',
+    bodyBytes: _textBytes('{"code":"INVALID_REQUEST"}'),
+  );
+}
+
 Uint8List _encodedBodyBytes(Object? body) {
   return switch (body) {
     null => Uint8List(0),

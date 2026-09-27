@@ -3,7 +3,8 @@ import 'package:json_schema/json_schema.dart';
 /// Generates a Dart HTTP JSON request and response model from a JSON Schema.
 ///
 /// This is the HTTP-specific counterpart to the portable `@FromSchema`
-/// annotation. [responseStatus] controls the generated `ResponseSpec`.
+/// annotation. Scalar object schemas also get a `decodeQuery` method for URL
+/// query parameters. [responseStatus] controls the generated `ResponseSpec`.
 final class FromHttpSchema {
   const FromHttpSchema(
     this.schema, {

@@ -35,12 +35,35 @@ void main() {
 
       expect(defaultOutput, contains('static const RequestBody requestBody = RequestBody.json(\n'));
       expect(
+        defaultOutput,
+        contains('static PatientDeleteBody decodeQuery(Map<String, String> values)'),
+      );
+      expect(defaultOutput, contains('fromJson(decodeSchemaQueryValues(schema, values))'));
+      expect(
         wideOutput,
         contains(
           'static const RequestBody requestBody = '
           'RequestBody.json(schema: schema, decoder: decode);',
         ),
       );
+    });
+
+    test('omits query decoding for object models with array fields', () {
+      const model = FromSchemaModelSpec(
+        publicName: 'ListItemsBody',
+        backingClassName: r'_$ListItemsBody',
+        schema: JsonSchema.object(
+          properties: {'ids': JsonSchema.array(items: JsonSchema.string())},
+        ),
+        schemaId: 'ListItemsBody',
+        refModels: <String, SchemaRefModelSpec>{},
+        typeParameters: <TypeParameterSpec>[],
+        schemasById: <String, JsonSchema>{},
+        responseStatus: 200,
+        source: FromSchemaModelSource.json,
+      );
+
+      expect(generateFromSchemaModels(const [model]), isNot(contains('decodeQuery')));
     });
   });
 

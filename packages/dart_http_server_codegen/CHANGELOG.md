@@ -1,3 +1,8 @@
+## 0.4.3
+
+- Generate `decodeQuery` for schema-backed models with scalar query fields.
+- Require `dart_http_core` 0.3.61 for schema-aware query conversion.
+
 ## 0.4.2
 
 - Decode top-level JSON arrays item by item in generated clients, including
