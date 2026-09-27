@@ -1,3 +1,7 @@
+## 0.3.61
+
+- Decode scalar URL query values according to their declared JSON Schema.
+
 ## 0.3.60
 
 - Add an ordered native WebSocket byte-stream drain with a trailing binary

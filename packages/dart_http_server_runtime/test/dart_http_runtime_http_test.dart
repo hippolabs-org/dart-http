@@ -8,6 +8,28 @@ import 'package:dart_http_server_runtime/dart_http_server_runtime.dart';
 import 'package:test/test.dart';
 
 void main() {
+  test('returns 400 for malformed query values before route handling', () async {
+    final app = DartHttp<void>(services: () {});
+    app.get(
+      '/items',
+      options: RouteOptions(queryDecoder: (values) => int.parse(values['limit']!)),
+      handler: (_) => const {'ok': true},
+    );
+
+    final server = await app.listen(port: 0);
+    final client = HttpClient();
+    addTearDown(() async {
+      client.close(force: true);
+      await server.close();
+    });
+
+    final response = await (await client.getUrl(
+      Uri.http('127.0.0.1:${server.port}', '/items', {'limit': 'abc'}),
+    )).close();
+    expect(response.statusCode, HttpStatus.badRequest);
+    expect(jsonDecode(await utf8.decoder.bind(response).join()), {'code': 'INVALID_REQUEST'});
+  });
+
   test('serves requests without a services factory when TServices is void', () async {
     final app = DartHttp<void>();
     app.get('/hello', handler: (_) => 'Hello, World!');

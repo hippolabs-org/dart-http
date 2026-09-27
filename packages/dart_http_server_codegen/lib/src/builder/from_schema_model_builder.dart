@@ -307,10 +307,22 @@ Class _objectModel(FromSchemaModelSpec model) {
             _objectFromMultipartMethod(model, fields)
           else ...[
             _decodeMethod(publicType, 'fromJson(readJsonObject(value))'),
+            if (_supportsQuerySchema(model.schema)) _objectDecodeQueryMethod(publicType),
             _objectFromJsonMethod(model, fields),
           ],
       ]);
   });
+}
+
+bool _supportsQuerySchema(JsonSchema schema) {
+  return schema is JsonObjectSchema &&
+      schema.properties.values.every(
+        (field) =>
+            field is JsonStringSchema ||
+            field is JsonIntegerSchema ||
+            field is JsonNumberSchema ||
+            field is JsonBooleanSchema,
+      );
 }
 
 Enum _stringEnumModel(FromSchemaModelSpec model) {
@@ -659,6 +671,17 @@ Method _decodeMethod(String publicName, String expression) {
       ..name = 'decode'
       ..requiredParameters.add(_typedParameter('value', refer('Object?')))
       ..body = Code('return $expression;');
+  });
+}
+
+Method _objectDecodeQueryMethod(String publicType) {
+  return Method((builder) {
+    builder
+      ..static = true
+      ..returns = refer(publicType)
+      ..name = 'decodeQuery'
+      ..requiredParameters.add(_typedParameter('values', refer('Map<String, String>')))
+      ..body = const Code('return fromJson(decodeSchemaQueryValues(schema, values));');
   });
 }
 
