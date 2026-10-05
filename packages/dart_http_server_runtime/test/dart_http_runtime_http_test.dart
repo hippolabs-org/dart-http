@@ -41,6 +41,8 @@ void main() {
       test('enforces body limit for ${streaming ? 'streamed' : 'buffered'} '
           '${declaredLength ? 'declared' : 'chunked'} uploads', () async {
         final app = DartHttp<void>(middlewares: [RustMiddleware.bodyLimit(maxBytes: 1024)]);
+        var bufferedCalls = 0;
+        app.get('/health', handler: (_) => {'ok': true});
         app.post(
           '/limited',
           options: RouteOptions(
@@ -55,6 +57,8 @@ void main() {
               );
               return response;
             }
+            bufferedCalls++;
+            expect(ctx.req.body<String>().length, lessThanOrEqualTo(1024));
             return {'length': ctx.req.body<String>().length};
           },
         );
@@ -89,7 +93,20 @@ void main() {
           request.headers.contentType = streaming ? ContentType.binary : ContentType.text;
           if (declaredLength) request.contentLength = length;
           request.add(List<int>.filled(length, 65));
-          final response = await request.close();
+          final HttpClientResponse response;
+          try {
+            response = await request.close();
+          } on HttpException {
+            // Early upload rejection can close the socket while the client
+            // is still writing. This is only acceptable for oversized input.
+            if (length <= 1024) rethrow;
+            final health = await (await client.getUrl(
+              Uri.http('127.0.0.1:${server.port}', '/health'),
+            )).close();
+            expect(health.statusCode, 200);
+            await health.drain<void>();
+            continue;
+          }
           // A streaming response may have sent its headers before the body
           // limit is encountered. It must then terminate with a stream error,
           // rather than transferring excess bytes.
@@ -100,6 +117,7 @@ void main() {
             await response.drain<void>();
           }
         }
+        if (!streaming) expect(bufferedCalls, 1);
       });
     }
   }
