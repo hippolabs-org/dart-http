@@ -9,6 +9,8 @@ import 'package:native_exchange/native_exchange_ffi.dart' show NativeByteLease;
 import 'package:json_schema/json_schema.dart';
 
 import '../native/dart_http_native.dart';
+import '../native/native_incoming_controller.dart';
+import '../native/native_binary_payload_lease.dart';
 import '../native/native_transport_web_socket.dart';
 import '../native/native_transport_web_transport.dart';
 import 'compiled_route.dart';
@@ -37,6 +39,7 @@ const _transportEventWebTransportStreamFinished = 11;
 const _transportEventWebTransportOperationReady = 12;
 const _transportEventBinaryStreamChunkCompleted = 13;
 const _transportEventBinaryStreamClosed = 14;
+const _transportEventWebSocketWriteCompleted = 15;
 const _binaryStreamChunkSize = 64 * 1024;
 
 /// Main application object for a Dart HTTP server.
@@ -72,6 +75,8 @@ class DartHttp<TServices> extends Router<TServices> {
   _RustTransportSession? _session;
   Duration _streamStallTimeout = const Duration(minutes: 1);
   final Map<int, Completer<bool>> _pendingBinaryChunks = {};
+  final Map<int, Completer<bool>> _pendingWebSocketWrites = {};
+  Duration _webSocketWriteStallTimeout = const Duration(seconds: 30);
   final Map<int, _BinaryResponseProgress> _activeBinaryResponses = {};
   final Map<int, RequestContext<TServices>> _pendingWebSocketContexts =
       <int, RequestContext<TServices>>{};
@@ -134,6 +139,9 @@ class DartHttp<TServices> extends Router<TServices> {
     int workers = 1,
     int nativeStreamWorkers = 64,
     Duration streamStallTimeout = const Duration(minutes: 1),
+    int webSocketMaxPendingMessages = 32,
+    int webSocketMaxPendingBytes = 8 * 1024 * 1024,
+    Duration webSocketWriteStallTimeout = const Duration(seconds: 30),
   }) async {
     final normalizedHost = host.trim();
     if (normalizedHost.isEmpty) {
@@ -151,6 +159,26 @@ class DartHttp<TServices> extends Router<TServices> {
       throw ArgumentError.value(streamStallTimeout, 'streamStallTimeout', 'Must be positive.');
     }
 
+    RangeError.checkValueInInterval(
+      webSocketMaxPendingMessages,
+      1,
+      1 << 20,
+      'webSocketMaxPendingMessages',
+    );
+    RangeError.checkValueInInterval(
+      webSocketMaxPendingBytes,
+      1,
+      1 << 40,
+      'webSocketMaxPendingBytes',
+    );
+    if (webSocketWriteStallTimeout.inMilliseconds <= 0) {
+      throw ArgumentError.value(
+        webSocketWriteStallTimeout,
+        'webSocketWriteStallTimeout',
+        'Must be positive.',
+      );
+    }
+    _webSocketWriteStallTimeout = webSocketWriteStallTimeout;
     final existingSession = _session;
     if (existingSession != null) {
       throw StateError(
@@ -167,6 +195,9 @@ class DartHttp<TServices> extends Router<TServices> {
       workers: workers,
       nativeStreamWorkers: nativeStreamWorkers,
       streamStallTimeout: streamStallTimeout,
+      webSocketMaxPendingMessages: webSocketMaxPendingMessages,
+      webSocketMaxPendingBytes: webSocketMaxPendingBytes,
+      webSocketWriteStallTimeout: webSocketWriteStallTimeout,
       routesJson: compiledRoutes.nativeManifestJson(schemaRegistry: _schemaRegistry),
       middlewaresJson: _middlewaresJson(middlewares),
       onTransportEvent: (eventKind, eventId) async {
@@ -191,10 +222,14 @@ class DartHttp<TServices> extends Router<TServices> {
           if (!chunk.isCompleted) chunk.complete(false);
         }
         _pendingBinaryChunks.clear();
+        for (final write in _pendingWebSocketWrites.values) {
+          if (!write.isCompleted) write.complete(false);
+        }
+        _pendingWebSocketWrites.clear();
         await currentSession.close();
         _pendingWebSocketContexts.clear();
         for (final session in _activeWebSocketSessions.values.toList()) {
-          await session.messages.close();
+          session.messages.dispose();
         }
         _activeWebSocketSessions.clear();
         _pendingWebTransportContexts.clear();
@@ -219,6 +254,9 @@ class DartHttp<TServices> extends Router<TServices> {
     CompiledRouteTable<TServices> compiledRoutes,
   ) async {
     switch (eventKind) {
+      case _transportEventWebSocketWriteCompleted:
+        _pendingWebSocketWrites.remove(eventId.abs())?.complete(eventId > 0);
+        return;
       case _transportEventBinaryStreamChunkCompleted:
         _pendingBinaryChunks.remove(eventId.abs())?.complete(eventId > 0);
         return;
@@ -287,6 +325,13 @@ class DartHttp<TServices> extends Router<TServices> {
           await _handleWebTransportHandshake(requestId, requestLease, compiledRoutes);
           return;
       }
+    } on RequestDecodeCapacityException {
+      DartHttpNative.tryRespond(
+        requestId,
+        status: 503,
+        contentType: 'application/json',
+        body: utf8.encode('{"code":"SERVER_BUSY"}'),
+      );
     } on RequestDecodingException {
       _respondBadRequest(requestId);
     } catch (error, stackTrace) {
@@ -418,6 +463,20 @@ class DartHttp<TServices> extends Router<TServices> {
     return wrapped();
   }
 
+  Future<void> _waitForWebSocketWrite(int operationId) async {
+    if (operationId <= 0) throw StateError('WebSocket closed or outgoing queue limit exceeded.');
+    final completion = Completer<bool>();
+    _pendingWebSocketWrites[operationId] = completion;
+    try {
+      final sent = await completion.future.timeout(
+        _webSocketWriteStallTimeout + const Duration(seconds: 1),
+      );
+      if (!sent) throw StateError('WebSocket write cancelled or stalled.');
+    } finally {
+      _pendingWebSocketWrites.remove(operationId);
+    }
+  }
+
   Future<void> _handleWebSocketHandshake(
     int requestId,
     NativeTransportRequestLease requestLease,
@@ -498,16 +557,32 @@ class DartHttp<TServices> extends Router<TServices> {
           ),
         );
 
-    final activeSession = _ActiveWebSocketSession(StreamController<WebSocketMessage>());
+    late final _ActiveWebSocketSession activeSession;
+    activeSession = _ActiveWebSocketSession(
+      NativeIncomingController<WebSocketMessage>(
+        take: () {
+          final message = DartHttpNative.takeWebSocketMessage(sessionId);
+          if (message == null) return null;
+          if (message.bodyLease case final lease?) activeSession.track(lease);
+          if (message.release case final release?) activeSession.messages.holdRelease(release);
+          return _decodeWebSocketMessage(message);
+        },
+        discard: (message) => message.close(),
+        cancel: () {
+          DartHttpNative.webSocketClose(sessionId);
+        },
+      ),
+    );
     _activeWebSocketSessions[sessionId] = activeSession;
 
     final socket = WebSocketContext<TServices>.fromRequest(
       request: requestContext,
       messages: IncomingWebSocketMessages(activeSession.messages.stream),
-      sendText: (value) => _sendWebSocketText(sessionId, value),
-      sendBinary: (value) => _sendWebSocketBinary(sessionId, value),
-      sendBinaryLease: (lease) => _sendWebSocketBinaryLease(sessionId, lease),
-      sendJson: (value) => _sendWebSocketJson(sessionId, value),
+      sendText: (value) => _sendWebSocketText(sessionId, value, _waitForWebSocketWrite),
+      sendBinary: (value) => _sendWebSocketBinary(sessionId, value, _waitForWebSocketWrite),
+      sendBinaryLease: (lease) =>
+          _sendWebSocketBinaryLease(sessionId, lease, _waitForWebSocketWrite),
+      sendJson: (value) => _sendWebSocketJson(sessionId, value, _waitForWebSocketWrite),
       close: ([code, reason]) async {
         DartHttpNative.webSocketClose(sessionId, code: code, reason: reason);
       },
@@ -522,32 +597,17 @@ class DartHttp<TServices> extends Router<TServices> {
           stderr.writeln(stackTrace);
         })
         .whenComplete(() async {
-          final session = _activeWebSocketSessions.remove(sessionId);
-          await session?.messages.close();
-          session?.closeLeases();
+          _activeWebSocketSessions.remove(sessionId);
+          activeSession.messages.dispose();
+          activeSession.closeLeases();
           DartHttpNative.webSocketClose(sessionId);
         });
 
     _drainWebSocketMessages(sessionId);
   }
 
-  void _drainWebSocketMessages(int sessionId) {
-    final session = _activeWebSocketSessions[sessionId];
-    if (session == null || session.messages.isClosed) {
-      return;
-    }
-
-    while (true) {
-      final message = DartHttpNative.takeWebSocketMessage(sessionId);
-      if (message == null) {
-        return;
-      }
-      if (message.bodyLease case final lease?) {
-        session.track(lease);
-      }
-      session.messages.add(_decodeWebSocketMessage(message));
-    }
-  }
+  void _drainWebSocketMessages(int sessionId) =>
+      _activeWebSocketSessions[sessionId]?.messages.wake();
 
   Future<void> _handleWebSocketClosed(int sessionId) async {
     try {
@@ -639,10 +699,38 @@ class DartHttp<TServices> extends Router<TServices> {
           ),
         );
 
-    final activeSession = _ActiveWebTransportSession(
+    late final _ActiveWebTransportSession activeSession;
+    activeSession = _ActiveWebTransportSession(
       sessionId,
-      StreamController<BinaryPayloadLease>(),
-      StreamController<BinaryPayloadLease>(),
+      NativeIncomingController<BinaryPayloadLease>(
+        take: () {
+          final value = DartHttpNative.takeWebTransportDatagram(sessionId);
+          if (value == null) return null;
+          activeSession.track(value.bodyLease);
+          return value.bodyLease;
+        },
+        discard: (lease) => lease.close(),
+        cancel: () {
+          DartHttpNative.webTransportClose(sessionId);
+        },
+      ),
+      NativeIncomingController<BinaryPayloadLease>(
+        take: () {
+          final value = DartHttpNative.takeWebTransportStream(sessionId);
+          if (value == null) return null;
+          activeSession.track(value.bodyLease);
+          return value.bodyLease;
+        },
+        onListen: () {
+          for (final stream in activeSession.persistentStreams.values) {
+            _selectWebTransportCompatibilityReceive(stream);
+          }
+        },
+        discard: (lease) => lease.close(),
+        cancel: () {
+          DartHttpNative.webTransportClose(sessionId);
+        },
+      ),
       StreamController<WebTransportReceiveStream>(),
       StreamController<WebTransportBidirectionalStream>(),
     );
@@ -676,9 +764,9 @@ class DartHttp<TServices> extends Router<TServices> {
           stderr.writeln(stackTrace);
         })
         .whenComplete(() async {
-          final session = _activeWebTransportSessions.remove(sessionId);
-          await session?.close();
-          session?.closeLeases();
+          _activeWebTransportSessions.remove(sessionId);
+          await activeSession.close();
+          activeSession.closeLeases();
           DartHttpNative.webTransportClose(sessionId);
         });
 
@@ -686,50 +774,23 @@ class DartHttp<TServices> extends Router<TServices> {
     _drainWebTransportStreams(sessionId);
   }
 
-  void _drainWebTransportDatagrams(int sessionId) {
-    final session = _activeWebTransportSessions[sessionId];
-    if (session == null || session.datagrams.isClosed) {
-      return;
-    }
-
-    while (true) {
-      final datagram = DartHttpNative.takeWebTransportDatagram(sessionId);
-      if (datagram == null) {
-        return;
-      }
-      session.track(datagram.bodyLease);
-      session.datagrams.add(datagram.bodyLease);
-    }
-  }
+  void _drainWebTransportDatagrams(int sessionId) =>
+      _activeWebTransportSessions[sessionId]?.datagrams.wake();
 
   Future<void> _handleWebTransportClosed(int sessionId) async {
     final session = _activeWebTransportSessions[sessionId];
-    await session?.datagrams.close();
-    await session?.streams.close();
-    await session?.unidirectional.close();
-    await session?.bidirectional.close();
-    if (session != null) {
-      for (final stream in session.persistentStreams.values) {
-        await stream.chunks.close();
-      }
+    if (session == null) return;
+    unawaited(session.datagrams.close());
+    unawaited(session.streams.close());
+    unawaited(session.unidirectional.close());
+    unawaited(session.bidirectional.close());
+    for (final stream in session.persistentStreams.values) {
+      unawaited(stream.chunks.close());
     }
   }
 
-  void _drainWebTransportStreams(int sessionId) {
-    final session = _activeWebTransportSessions[sessionId];
-    if (session == null || session.streams.isClosed) {
-      return;
-    }
-
-    while (true) {
-      final stream = DartHttpNative.takeWebTransportStream(sessionId);
-      if (stream == null) {
-        return;
-      }
-      session.track(stream.bodyLease);
-      session.streams.add(stream.bodyLease);
-    }
-  }
+  void _drainWebTransportStreams(int sessionId) =>
+      _activeWebTransportSessions[sessionId]?.streams.wake();
 
   void _handleWebTransportPersistentStreamOpened(int streamId) {
     final info = DartHttpNative.takeWebTransportStreamInfo(streamId);
@@ -737,6 +798,8 @@ class DartHttp<TServices> extends Router<TServices> {
     final session = _activeWebTransportSessions[info.sessionId];
     if (session == null) return;
     final stream = _registerWebTransportPersistentStream(session, info);
+    _selectWebTransportCompatibilityReceive(stream);
+    if (stream.compatibilityReceive) return;
     switch (info.kind) {
       case 1:
         session.unidirectional.add(stream.receive);
@@ -751,16 +814,8 @@ class DartHttp<TServices> extends Router<TServices> {
     _drainWebTransportStreamChunks(streamId);
   }
 
-  void _drainWebTransportStreamChunks(int streamId) {
-    final stream = _activeWebTransportStream(streamId);
-    if (stream == null || stream.chunks.isClosed) return;
-    while (true) {
-      final chunk = DartHttpNative.takeWebTransportStreamChunk(streamId);
-      if (chunk == null) return;
-      stream.session.track(chunk.bodyLease);
-      stream.chunks.add(chunk.bodyLease);
-    }
-  }
+  void _drainWebTransportStreamChunks(int streamId) =>
+      _activeWebTransportStream(streamId)?.chunks.wake();
 
   Future<void> _handleWebTransportStreamFinished(int streamId) async {
     final stream = _activeWebTransportStream(streamId);
@@ -770,7 +825,12 @@ class DartHttp<TServices> extends Router<TServices> {
     if (terminal.error.isNotEmpty && terminal.error != 'receive stopped locally') {
       stream.chunks.addError(StateError('WebTransport stream $streamId ended: ${terminal.error}'));
     }
-    await stream.chunks.close();
+    if (stream.compatibilityReceive) {
+      stream.chunks.dispose();
+    } else {
+      await stream.chunks.close();
+    }
+    stream.session.persistentStreams.remove(streamId);
   }
 
   void _handleWebTransportOperationReady(int operationId) {
@@ -841,6 +901,15 @@ class DartHttp<TServices> extends Router<TServices> {
     ),
   );
 
+  void _selectWebTransportCompatibilityReceive(_ActiveWebTransportStream stream) {
+    if (stream.kind != 1 || !stream.session.streams.hasListener || stream.chunks.hasListener) {
+      return;
+    }
+    if (DartHttpNative.webTransportStreamReceiveMode(stream.id, 2)) {
+      stream.compatibilityReceive = true;
+    }
+  }
+
   _ActiveWebTransportStream _registerWebTransportPersistentStream(
     _ActiveWebTransportSession session,
     NativeWebTransportStreamInfo info,
@@ -848,7 +917,32 @@ class DartHttp<TServices> extends Router<TServices> {
     final existing = session.persistentStreams[info.streamId];
     if (existing != null) return existing;
     late final _ActiveWebTransportStream stream;
-    final chunks = StreamController<BinaryPayloadLease>();
+    late final NativeIncomingController<BinaryPayloadLease> chunks;
+    chunks = NativeIncomingController<BinaryPayloadLease>(
+      take: () {
+        final value = DartHttpNative.takeWebTransportStreamChunk(info.streamId);
+        if (value == null) return null;
+        session.track(value.bodyLease);
+        return value.bodyLease;
+      },
+      onListen: () {
+        if (!DartHttpNative.webTransportStreamReceiveMode(info.streamId, 1)) {
+          chunks.addError(StateError('WebTransport receive mode is already selected or closed.'));
+        }
+      },
+      discard: (lease) => lease.close(),
+      cancel: () {
+        final operation = DartHttpNative.webTransportStreamStop(info.streamId, 0);
+        if (operation > 0) {
+          unawaited(
+            _waitForWebTransportOperation(
+              operation,
+              'stream stop',
+            ).then<void>((_) {}, onError: (Object _, StackTrace _) {}),
+          );
+        }
+      },
+    );
     final receive = WebTransportReceiveStream(
       id: info.streamId,
       protocolId: info.protocolId,
@@ -868,7 +962,7 @@ class DartHttp<TServices> extends Router<TServices> {
           DartHttpNative.webTransportStreamWrite(info.streamId, value),
           'stream write',
         );
-      }),
+      }, bytes: value.length),
       writeLease: (lease) => stream.enqueueSend(() async {
         try {
           final operationId = switch (lease) {
@@ -884,7 +978,7 @@ class DartHttp<TServices> extends Router<TServices> {
         } finally {
           lease.close();
         }
-      }),
+      }, bytes: lease.length),
       finish: () => stream.enqueueSend(() async {
         await _waitForWebTransportOperation(
           DartHttpNative.webTransportStreamFinish(info.streamId),
@@ -900,6 +994,7 @@ class DartHttp<TServices> extends Router<TServices> {
     );
     stream = _ActiveWebTransportStream(
       id: info.streamId,
+      kind: info.kind,
       session: session,
       chunks: chunks,
       receive: receive,
@@ -1130,19 +1225,27 @@ Object? _normalizeWebSocketJson(Object? value) {
   }
 }
 
-Future<void> _sendWebSocketText(int sessionId, String value) async {
-  if (!DartHttpNative.webSocketSendText(sessionId, value)) {
-    throw StateError('Failed to send WebSocket text frame for $sessionId.');
-  }
+Future<void> _sendWebSocketText(
+  int sessionId,
+  String value,
+  Future<void> Function(int) wait,
+) async {
+  await wait(DartHttpNative.webSocketSendText(sessionId, value));
 }
 
-Future<void> _sendWebSocketBinary(int sessionId, List<int> value) async {
-  if (!DartHttpNative.webSocketSendBinary(sessionId, value)) {
-    throw StateError('Failed to send WebSocket binary frame for $sessionId.');
-  }
+Future<void> _sendWebSocketBinary(
+  int sessionId,
+  List<int> value,
+  Future<void> Function(int) wait,
+) async {
+  await wait(DartHttpNative.webSocketSendBinary(sessionId, value));
 }
 
-Future<void> _sendWebSocketBinaryLease(int sessionId, BinaryPayloadLease lease) async {
+Future<void> _sendWebSocketBinaryLease(
+  int sessionId,
+  BinaryPayloadLease lease,
+  Future<void> Function(int) wait,
+) async {
   final sent = switch (lease) {
     NativeByteLease(:final bytesPointer, :final length) => DartHttpNative.webSocketSendNativeBinary(
       sessionId,
@@ -1151,16 +1254,16 @@ Future<void> _sendWebSocketBinaryLease(int sessionId, BinaryPayloadLease lease) 
     ),
     _ => DartHttpNative.webSocketSendBinary(sessionId, lease.bytesView),
   };
-  if (!sent) {
-    throw StateError('Failed to send WebSocket binary frame for $sessionId.');
-  }
+  await wait(sent);
 }
 
-Future<void> _sendWebSocketJson(int sessionId, Object? value) async {
+Future<void> _sendWebSocketJson(
+  int sessionId,
+  Object? value,
+  Future<void> Function(int) wait,
+) async {
   final encoded = jsonEncode(_normalizeWebSocketJson(value));
-  if (!DartHttpNative.webSocketSendText(sessionId, encoded)) {
-    throw StateError('Failed to send WebSocket JSON frame for $sessionId.');
-  }
+  await wait(DartHttpNative.webSocketSendText(sessionId, encoded));
 }
 
 Future<void> _sendWebTransportDatagram(int sessionId, List<int> value) async {
@@ -1277,6 +1380,9 @@ final class _RustTransportSession {
     required int workers,
     required int nativeStreamWorkers,
     required Duration streamStallTimeout,
+    required int webSocketMaxPendingMessages,
+    required int webSocketMaxPendingBytes,
+    required Duration webSocketWriteStallTimeout,
     required String routesJson,
     required String middlewaresJson,
     required Future<void> Function(int eventKind, int eventId) onTransportEvent,
@@ -1294,6 +1400,9 @@ final class _RustTransportSession {
       workers: workers,
       nativeStreamWorkers: nativeStreamWorkers,
       streamStallTimeout: streamStallTimeout,
+      webSocketMaxPendingMessages: webSocketMaxPendingMessages,
+      webSocketMaxPendingBytes: webSocketMaxPendingBytes,
+      webSocketWriteStallTimeout: webSocketWriteStallTimeout,
       routesJson: routesJson,
       middlewaresJson: middlewaresJson,
       callback: callback.nativeFunction,
@@ -1353,17 +1462,18 @@ Map<String, Object?> _middlewareConfigurationJson(RustMiddlewareConfiguration co
 final class _ActiveWebSocketSession {
   _ActiveWebSocketSession(this.messages);
 
-  final StreamController<WebSocketMessage> messages;
+  final NativeIncomingController<WebSocketMessage> messages;
   final Set<BinaryPayloadLease> _leases = <BinaryPayloadLease>{};
   Future<void>? task;
 
   void track(BinaryPayloadLease lease) {
-    _leases.removeWhere((value) => value.isClosed);
+    if (lease.isClosed) return;
     _leases.add(lease);
+    (lease as RuntimeNativeBinaryPayloadLease).onClose(() => _leases.remove(lease));
   }
 
   void closeLeases() {
-    for (final lease in _leases) {
+    for (final lease in _leases.toList()) {
       lease.close();
     }
     _leases.clear();
@@ -1380,8 +1490,8 @@ final class _ActiveWebTransportSession {
   );
 
   final int sessionId;
-  final StreamController<BinaryPayloadLease> datagrams;
-  final StreamController<BinaryPayloadLease> streams;
+  final NativeIncomingController<BinaryPayloadLease> datagrams;
+  final NativeIncomingController<BinaryPayloadLease> streams;
   final StreamController<WebTransportReceiveStream> unidirectional;
   final StreamController<WebTransportBidirectionalStream> bidirectional;
   final Map<int, _ActiveWebTransportStream> persistentStreams = <int, _ActiveWebTransportStream>{};
@@ -1389,24 +1499,25 @@ final class _ActiveWebTransportSession {
   Future<void>? task;
 
   void track(BinaryPayloadLease lease) {
-    _leases.removeWhere((value) => value.isClosed);
+    if (lease.isClosed) return;
     _leases.add(lease);
+    (lease as RuntimeNativeBinaryPayloadLease).onClose(() => _leases.remove(lease));
   }
 
   void closeLeases() {
-    for (final lease in _leases) {
+    for (final lease in _leases.toList()) {
       lease.close();
     }
     _leases.clear();
   }
 
   Future<void> close() async {
-    await datagrams.close();
-    await streams.close();
-    await unidirectional.close();
-    await bidirectional.close();
+    datagrams.dispose();
+    streams.dispose();
+    unawaited(unidirectional.close());
+    unawaited(bidirectional.close());
     for (final stream in persistentStreams.values) {
-      if (!stream.chunks.isClosed) await stream.chunks.close();
+      stream.chunks.dispose();
     }
   }
 }
@@ -1414,6 +1525,7 @@ final class _ActiveWebTransportSession {
 final class _ActiveWebTransportStream {
   _ActiveWebTransportStream({
     required this.id,
+    required this.kind,
     required this.session,
     required this.chunks,
     required this.receive,
@@ -1421,13 +1533,23 @@ final class _ActiveWebTransportStream {
   });
 
   final int id;
+  final int kind;
+  bool compatibilityReceive = false;
   final _ActiveWebTransportSession session;
-  final StreamController<BinaryPayloadLease> chunks;
+  final NativeIncomingController<BinaryPayloadLease> chunks;
   final WebTransportReceiveStream receive;
   final WebTransportSendStream send;
   Future<void> _sendTail = Future<void>.value();
 
-  Future<void> enqueueSend(Future<void> Function() action) {
+  var _pendingSends = 0;
+  var _pendingBytes = 0;
+
+  Future<void> enqueueSend(Future<void> Function() action, {int bytes = 0}) {
+    if (_pendingSends >= 32 || bytes > 8 * 1024 * 1024 - _pendingBytes) {
+      return Future<void>.error(StateError('WebTransport outgoing queue limit exceeded.'));
+    }
+    _pendingSends++;
+    _pendingBytes += bytes;
     final completer = Completer<void>();
     _sendTail = _sendTail.then(
       (_) async {
@@ -1436,6 +1558,9 @@ final class _ActiveWebTransportStream {
           completer.complete();
         } catch (error, stackTrace) {
           completer.completeError(error, stackTrace);
+        } finally {
+          _pendingSends--;
+          _pendingBytes -= bytes;
         }
       },
       onError: (_) async {
@@ -1444,6 +1569,9 @@ final class _ActiveWebTransportStream {
           completer.complete();
         } catch (error, stackTrace) {
           completer.completeError(error, stackTrace);
+        } finally {
+          _pendingSends--;
+          _pendingBytes -= bytes;
         }
       },
     );

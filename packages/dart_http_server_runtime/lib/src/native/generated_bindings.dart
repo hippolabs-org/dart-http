@@ -181,6 +181,9 @@ external bool dart_http_server_runtime_start_native_binary_stream_response(
     ffi.Int64,
     ffi.Int64,
     ffi.Int64,
+    ffi.Int64,
+    ffi.Int64,
+    ffi.Int64,
     ffi.Pointer<ffi.Char>,
     ffi.Pointer<ffi.Char>,
     dart_http_server_runtime_transport_event_callback_t,
@@ -192,6 +195,9 @@ external int dart_http_server_runtime_start_server(
   int worker_count,
   int native_stream_worker_count,
   int stream_stall_timeout_ms,
+  int web_socket_max_pending_messages,
+  int web_socket_max_pending_bytes,
+  int web_socket_write_stall_timeout_ms,
   ffi.Pointer<ffi.Char> routes_json,
   ffi.Pointer<ffi.Char> middlewares_json,
   dart_http_server_runtime_transport_event_callback_t callback,
@@ -269,11 +275,11 @@ external bool dart_http_server_runtime_web_socket_close(
   ffi.Pointer<ffi.Char> reason,
 );
 
-@ffi.Native<ffi.Bool Function(ffi.Int64, NativeBytes)>()
-external bool dart_http_server_runtime_web_socket_send_binary(int session_id, NativeBytes body);
+@ffi.Native<ffi.Int64 Function(ffi.Int64, NativeBytes)>()
+external int dart_http_server_runtime_web_socket_send_binary(int session_id, NativeBytes body);
 
-@ffi.Native<ffi.Bool Function(ffi.Int64, ffi.Pointer<ffi.Char>)>()
-external bool dart_http_server_runtime_web_socket_send_text(
+@ffi.Native<ffi.Int64 Function(ffi.Int64, ffi.Pointer<ffi.Char>)>()
+external int dart_http_server_runtime_web_socket_send_text(
   int session_id,
   ffi.Pointer<ffi.Char> text,
 );
@@ -302,6 +308,9 @@ external bool dart_http_server_runtime_web_transport_send_stream(int session_id,
 
 @ffi.Native<ffi.Int64 Function(ffi.Int64)>()
 external int dart_http_server_runtime_web_transport_stream_finish(int stream_id);
+
+@ffi.Native<ffi.Bool Function(ffi.Int64, ffi.Uint8)>()
+external bool dart_http_server_runtime_web_transport_stream_receive_mode(int stream_id, int mode);
 
 @ffi.Native<ffi.Int64 Function(ffi.Int64, ffi.Uint32)>()
 external int dart_http_server_runtime_web_transport_stream_reset(int stream_id, int error_code);

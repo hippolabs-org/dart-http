@@ -8,6 +8,102 @@ import 'package:dart_http_server_runtime/dart_http_server_runtime.dart';
 import 'package:test/test.dart';
 
 void main() {
+  test('large native text decoding retains its borrowed body until the worker completes', () async {
+    final app = DartHttp<void>();
+    app.post(
+      '/large-text',
+      options: const RouteOptions(body: RequestBody.text()),
+      handler: (ctx) => {
+        'length': ctx.req.body<String>().length,
+        'tail': ctx.req.body<String>().substring(ctx.req.body<String>().length - 2),
+      },
+    );
+    final server = await app.listen(port: 0);
+    final client = HttpClient();
+    addTearDown(() async {
+      client.close(force: true);
+      await server.close();
+    });
+    final value = '${'ä' * 100000}€!';
+    final request = await client.postUrl(Uri.http('127.0.0.1:${server.port}', '/large-text'));
+    request.headers.contentType = ContentType.text;
+    request.add(utf8.encode(value));
+    final response = await request.close();
+    expect(response.statusCode, 200);
+    expect(jsonDecode(await utf8.decoder.bind(response).join()), {
+      'length': value.length,
+      'tail': '€!',
+    });
+  });
+
+  for (final streaming in [false, true]) {
+    for (final declaredLength in [false, true]) {
+      test('enforces body limit for ${streaming ? 'streamed' : 'buffered'} '
+          '${declaredLength ? 'declared' : 'chunked'} uploads', () async {
+        final app = DartHttp<void>(middlewares: [RustMiddleware.bodyLimit(maxBytes: 1024)]);
+        app.post(
+          '/limited',
+          options: RouteOptions(
+            body: streaming ? const RequestBody.binaryStream() : const RequestBody.text(),
+          ),
+          handler: (ctx) async {
+            if (streaming) {
+              final body = ctx.req.nativeBodyStream!;
+              final response = NativeBinaryStreamResponse(
+                body: body.takeNative(),
+                contentType: 'application/octet-stream',
+              );
+              return response;
+            }
+            return {'length': ctx.req.body<String>().length};
+          },
+        );
+        final server = await app.listen(port: 0);
+        final client = HttpClient();
+        addTearDown(() async {
+          client.close(force: true);
+          await server.close();
+        });
+        for (final length in [512, 8192]) {
+          if (declaredLength && length > 1024) {
+            // Verify rejection before any body arrives. A client continuing
+            // to upload after an early rejection can observe a TCP reset.
+            final socket = await Socket.connect('127.0.0.1', server.port);
+            try {
+              socket.write(
+                'POST /limited HTTP/1.1\r\nHost: localhost\r\n'
+                'Content-Length: $length\r\nConnection: close\r\n\r\n',
+              );
+              final status = await utf8.decoder
+                  .bind(socket)
+                  .transform(const LineSplitter())
+                  .first
+                  .timeout(const Duration(seconds: 2));
+              expect(status, startsWith('HTTP/1.1 413'));
+            } finally {
+              socket.destroy();
+            }
+            continue;
+          }
+          final request = await client.postUrl(Uri.http('127.0.0.1:${server.port}', '/limited'));
+          request.headers.contentType = streaming ? ContentType.binary : ContentType.text;
+          if (declaredLength) request.contentLength = length;
+          request.add(List<int>.filled(length, 65));
+          final response = await request.close();
+          // A streaming response may have sent its headers before the body
+          // limit is encountered. It must then terminate with a stream error,
+          // rather than transferring excess bytes.
+          if (streaming && !declaredLength && length > 1024 && response.statusCode == 200) {
+            await expectLater(response.drain<void>(), throwsA(isA<HttpException>()));
+          } else {
+            expect(response.statusCode, length <= 1024 ? 200 : 413);
+            await response.drain<void>();
+          }
+        }
+      });
+    }
+  }
+
   test('returns 400 for malformed query values before route handling', () async {
     final app = DartHttp<void>(services: () {});
     app.get(

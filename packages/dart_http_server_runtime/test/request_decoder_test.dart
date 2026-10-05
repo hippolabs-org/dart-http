@@ -11,6 +11,36 @@ import 'package:json_schema/json_schema.dart';
 import 'package:test/test.dart';
 
 void main() {
+  test('large JSON decoding preserves UTF-8 and bounds concurrent workers', () async {
+    final value = 'ä€𐍈' * 12000;
+    final bytes = Uint8List.fromList(utf8.encode(jsonEncode({'value': value})));
+    Future<RequestInput> decode(Uint8List input) => decodeRequestInput(
+      TransportRequest(
+        routeId: 'route_0',
+        pathParams: {},
+        query: {},
+        headers: {},
+        bodyBytes: input,
+        bodyKind: TransportRequestBodyKind.json,
+      ),
+      codecs: DartHttpCodecRegistry.empty,
+      paramsSchemaId: null,
+      querySchemaId: null,
+      headersSchemaId: null,
+      body: RequestBody.json(schema: const JsonSchema.ref('LargeInput')),
+    );
+    final pending = List.generate(18, (_) => decode(bytes));
+    await expectLater(decode(bytes), throwsA(isA<RequestDecodeCapacityException>()));
+    for (final input in await Future.wait(pending)) {
+      expect(input.body<Map<String, dynamic>>()['value'], value);
+    }
+    await expectLater(
+      decode(Uint8List.fromList(List.filled(65536, 255))),
+      throwsA(isA<RequestDecodingException>()),
+    );
+    expect((await decode(bytes)).body<Map<String, dynamic>>()['value'], value);
+  });
+
   test('classifies malformed query values as client decoding errors', () async {
     await expectLater(
       decodeRequestInput(

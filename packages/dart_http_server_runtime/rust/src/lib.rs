@@ -30,7 +30,7 @@ use dart_http_core::{
 use dart_http_server_core::{
     NativeHttpFreeResponse, NativeHttpHandler, NativeHttpMethod, NativeHttpRequest,
 };
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use native_exchange_rust::abi::{
     NEX_ABI_VERSION, NEX_CAPABILITY_CONCURRENT_CANCEL, NEX_CAPABILITY_THREAD_SAFE,
     NEX_STREAM_READ_CHUNK, NEX_STREAM_READ_DONE, NEX_STREAM_READ_ERROR, NexBuffer, NexByteStream,
@@ -48,7 +48,7 @@ use wtransport::{
     ServerConfig as WebTransportServerConfig, VarInt,
 };
 
-const DART_HTTP_SERVER_RUNTIME_NATIVE_ABI_VERSION: i32 = 21;
+const DART_HTTP_SERVER_RUNTIME_NATIVE_ABI_VERSION: i32 = 22;
 const MAX_BINARY_STREAM_CHUNK_BYTES: usize = 64 * 1024;
 const RESERVED_BLOCKING_WORKERS: usize = 16;
 const SCHEMA_REGISTRY_URI: &str = "urn:dart-http:schema-registry";
@@ -102,6 +102,10 @@ struct ServerRuntimeState {
     callback: TransportEventCallback,
     native_stream_slots: Arc<Semaphore>,
     stream_stall_timeout: Duration,
+    body_limit: usize,
+    web_socket_max_pending_messages: usize,
+    web_socket_max_pending_bytes: usize,
+    web_socket_write_stall_timeout: Duration,
 }
 
 #[repr(C)]
@@ -256,6 +260,7 @@ struct NativeWebSocketConnectionHandle {
 struct NativeWebSocketMessageHandle {
     message: NativeWebSocketMessage,
     body: OwnedBytes,
+    _permit: Option<IngressPermit>,
 }
 
 #[repr(C)]
@@ -274,18 +279,21 @@ struct NativeWebTransportConnectionHandle {
 struct NativeWebTransportDatagramHandle {
     datagram: NativeWebTransportDatagram,
     body: OwnedBytes,
+    _permit: Option<IngressPermit>,
 }
 
 #[repr(C)]
 struct NativeWebTransportStreamHandle {
     stream: NativeWebTransportStream,
     body: OwnedBytes,
+    _permit: Option<IngressPermit>,
 }
 
 #[repr(C)]
 struct NativeWebTransportStreamChunkHandle {
     chunk: NativeWebTransportStreamChunk,
     body: OwnedBytes,
+    _permit: Option<IngressPermit>,
 }
 
 #[repr(C)]
@@ -541,7 +549,7 @@ unsafe impl Send for ProducedIncomingBodyStream {}
 unsafe impl Sync for ProducedIncomingBodyStream {}
 
 impl ProducedIncomingBodyStream {
-    fn from_body(body: Body) -> Self {
+    fn from_body(body: Body, limit_exceeded: watch::Sender<bool>) -> Self {
         let (sender, receiver) = mpsc::channel(1);
         let (cancel_tx, mut cancel_rx) = watch::channel(false);
         tokio::spawn(async move {
@@ -556,7 +564,10 @@ impl ProducedIncomingBodyStream {
                     next = stream.next() => {
                         let message = match next {
                             Some(Ok(bytes)) => IncomingBodyMessage::Chunk(bytes),
-                            Some(Err(error)) => IncomingBodyMessage::Error(error.to_string().into_bytes()),
+                            Some(Err(error)) => {
+                                if is_body_limit_error(&error) { let _ = limit_exceeded.send(true); }
+                                IncomingBodyMessage::Error(error.to_string().into_bytes())
+                            },
                             None => IncomingBodyMessage::Done,
                         };
                         let terminal = matches!(message, IncomingBodyMessage::Done | IncomingBodyMessage::Error(_));
@@ -675,17 +686,151 @@ unsafe extern "C" fn incoming_body_buffer_release(context: *mut std::ffi::c_void
     }
 }
 
+// One reservation follows a payload through the native queue and Dart lease.
+// Releasing queue entries alone must not release application-buffer capacity.
+struct IngressBudget {
+    usage: Mutex<(usize, usize, bool)>,
+    max_messages: usize,
+    max_bytes: usize,
+    space: Notify,
+    _parent: Option<IngressPermit>,
+    aggregate: Option<Arc<IngressBudget>>,
+}
+
+impl IngressBudget {
+    fn new(max_messages: usize, max_bytes: usize) -> Arc<Self> {
+        Arc::new(Self {
+            usage: Mutex::new((0, 0, false)),
+            max_messages,
+            max_bytes,
+            space: Notify::new(),
+            _parent: None,
+            aggregate: None,
+        })
+    }
+
+    fn with_parent(
+        max_messages: usize,
+        max_bytes: usize,
+        parent: IngressPermit,
+        aggregate: Option<Arc<IngressBudget>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            usage: Mutex::new((0, 0, false)),
+            max_messages,
+            max_bytes,
+            space: Notify::new(),
+            _parent: Some(parent),
+            aggregate,
+        })
+    }
+
+    fn try_reserve(self: &Arc<Self>, bytes: usize) -> Option<IngressPermit> {
+        let mut usage = self.usage.lock().unwrap();
+        if usage.2 || usage.0 >= self.max_messages || bytes > self.max_bytes.saturating_sub(usage.1)
+        {
+            return None;
+        }
+        let aggregate = match &self.aggregate {
+            Some(aggregate) => Some(Box::new(aggregate.try_reserve(bytes)?)),
+            None => None,
+        };
+        usage.0 += 1;
+        usage.1 += bytes;
+        Some(IngressPermit {
+            budget: Arc::clone(self),
+            bytes,
+            _aggregate: aggregate,
+        })
+    }
+
+    async fn reserve(self: &Arc<Self>, bytes: usize) -> Option<IngressPermit> {
+        if bytes > self.max_bytes {
+            return None;
+        }
+        loop {
+            let ready = self.space.notified();
+            // Subscribe before trying either budget, avoiding lost wakeups.
+            let aggregate_notification = self.aggregate.as_ref().map(|b| b.space.notified());
+            tokio::pin!(ready);
+            tokio::pin!(aggregate_notification);
+            ready.as_mut().enable();
+            if let Some(notification) = aggregate_notification.as_mut().as_pin_mut() {
+                notification.enable();
+            }
+            if let Some(permit) = self.try_reserve(bytes) {
+                return Some(permit);
+            }
+            if self.usage.lock().unwrap().2 {
+                return None;
+            }
+            if self
+                .aggregate
+                .as_ref()
+                .is_some_and(|b| b.usage.lock().unwrap().2)
+            {
+                return None;
+            }
+            tokio::select! {
+                _ = ready => {},
+                _ = async { if let Some(notification) = aggregate_notification.as_mut().as_pin_mut() { notification.await; } else { std::future::pending::<()>().await; } } => {},
+            }
+        }
+    }
+
+    fn close(&self) {
+        self.usage.lock().unwrap().2 = true;
+        self.space.notify_waiters();
+    }
+}
+
+struct IngressPermit {
+    budget: Arc<IngressBudget>,
+    bytes: usize,
+    _aggregate: Option<Box<IngressPermit>>,
+}
+impl IngressPermit {
+    fn grow(&mut self, bytes: usize) -> bool {
+        let mut usage = self.budget.usage.lock().unwrap();
+        if usage.2 || bytes > self.budget.max_bytes.saturating_sub(usage.1) {
+            return false;
+        }
+        if let Some(aggregate) = self._aggregate.as_mut()
+            && !aggregate.grow(bytes)
+        {
+            return false;
+        }
+        usage.1 += bytes;
+        self.bytes += bytes;
+        true
+    }
+}
+impl Drop for IngressPermit {
+    fn drop(&mut self) {
+        let mut usage = self.budget.usage.lock().unwrap();
+        usage.0 -= 1;
+        usage.1 -= self.bytes;
+        drop(usage);
+        self.budget.space.notify_waiters();
+    }
+}
+
+struct IncomingChunk {
+    body: Vec<u8>,
+    permit: IngressPermit,
+}
+
 struct WebSocketSessionState {
     server_id: i64,
     connection: Option<WebSocketConnection>,
     messages: VecDeque<WebSocketIncomingMessage>,
-    pending_bytes: usize,
-    max_pending_messages: usize,
-    max_pending_bytes: usize,
-    command_tx: mpsc::UnboundedSender<WebSocketCommand>,
+    budget: Arc<IngressBudget>,
+    command_tx: mpsc::UnboundedSender<WebSocketWrite>,
+    close_tx: watch::Sender<Option<WebSocketClose>>,
+    outgoing_budget: Arc<IngressBudget>,
+    runtime_state: ServerRuntimeState,
     peer_closed: bool,
     accepting_messages: bool,
-    queue_space: Arc<Notify>,
 }
 
 struct WebSocketConnection {
@@ -701,6 +846,7 @@ struct WebSocketIncomingMessage {
     session_id: i64,
     kind: WebSocketMessageKind,
     body: Vec<u8>,
+    permit: Option<IngressPermit>,
 }
 
 struct WebTransportSessionState {
@@ -708,7 +854,9 @@ struct WebTransportSessionState {
     connection: Option<WebTransportConnectionInfo>,
     datagrams: VecDeque<WebTransportIncomingDatagram>,
     streams: VecDeque<WebTransportIncomingStream>,
-    pending_bytes: usize,
+    budget: Arc<IngressBudget>,
+    outgoing_budget: Arc<IngressBudget>,
+    stream_slots: Arc<IngressBudget>,
     max_pending_messages: usize,
     max_pending_bytes: usize,
     command_tx: mpsc::UnboundedSender<WebTransportCommand>,
@@ -726,11 +874,13 @@ struct WebTransportConnectionInfo {
 struct WebTransportIncomingDatagram {
     session_id: i64,
     body: Vec<u8>,
+    permit: Option<IngressPermit>,
 }
 
 struct WebTransportIncomingStream {
     session_id: i64,
     body: Vec<u8>,
+    permit: Option<IngressPermit>,
 }
 
 #[derive(Clone, Copy)]
@@ -744,10 +894,9 @@ struct WebTransportStreamInfo {
 struct WebTransportStreamState {
     info: WebTransportStreamInfo,
     runtime_state: ServerRuntimeState,
-    chunks: VecDeque<Vec<u8>>,
-    pending_bytes: usize,
-    max_pending_messages: usize,
-    max_pending_bytes: usize,
+    chunks: VecDeque<IncomingChunk>,
+    budget: Arc<IngressBudget>,
+    receive_mode_tx: watch::Sender<u8>,
     terminal: Option<WebTransportStreamTerminal>,
     send_tx: Option<mpsc::Sender<WebTransportStreamCommand>>,
     stop_tx: Option<mpsc::UnboundedSender<u32>>,
@@ -801,23 +950,54 @@ enum WebSocketMessageKind {
     Binary = 2,
 }
 
-enum WebSocketCommand {
-    SendText(String),
-    SendBinary(Vec<u8>),
-    Close {
-        code: Option<u16>,
-        reason: Option<String>,
-    },
+#[derive(Clone)]
+struct WebSocketClose {
+    code: Option<u16>,
+    reason: Option<String>,
+}
+
+struct WebSocketWrite {
+    message: Message,
+    completion: WebSocketWriteCompletion,
+}
+
+struct WebSocketWriteCompletion {
+    operation_id: i64,
+    runtime_state: ServerRuntimeState,
+    consumed: bool,
+    _permit: IngressPermit,
+}
+
+impl Drop for WebSocketWriteCompletion {
+    fn drop(&mut self) {
+        notify_transport_event(
+            &self.runtime_state,
+            TransportEventKind::WebSocketWriteCompleted,
+            if self.consumed {
+                self.operation_id
+            } else {
+                -self.operation_id
+            },
+        );
+    }
 }
 
 enum WebTransportCommand {
-    SendDatagram(Vec<u8>),
-    SendStream(Vec<u8>),
+    SendDatagram {
+        body: Vec<u8>,
+        _permit: IngressPermit,
+    },
+    SendStream {
+        body: Vec<u8>,
+        _permit: IngressPermit,
+    },
     OpenUnidirectional {
         operation_id: i64,
+        _permit: IngressPermit,
     },
     OpenBidirectional {
         operation_id: i64,
+        _permit: IngressPermit,
     },
     Close {
         code: Option<u32>,
@@ -1029,6 +1209,7 @@ enum TransportEventKind {
     WebSocketOpened = 2,
     WebSocketMessageReady = 3,
     WebSocketClosed = 4,
+    WebSocketWriteCompleted = 15,
     WebTransportOpened = 5,
     WebTransportDatagramReady = 6,
     WebTransportClosed = 7,
@@ -1053,6 +1234,9 @@ pub extern "C" fn dart_http_server_runtime_start_server(
     worker_count: i64,
     native_stream_worker_count: i64,
     stream_stall_timeout_ms: i64,
+    web_socket_max_pending_messages: i64,
+    web_socket_max_pending_bytes: i64,
+    web_socket_write_stall_timeout_ms: i64,
     routes_json: *const c_char,
     middlewares_json: *const c_char,
     callback: TransportEventCallback,
@@ -1067,6 +1251,13 @@ pub extern "C" fn dart_http_server_runtime_start_server(
         return -1;
     };
 
+    let body_limit = match compile_body_limit(&middlewares_json) {
+        Ok(limit) => limit,
+        Err(error) => {
+            eprintln!("Invalid HTTP body limit: {error}");
+            return -1;
+        }
+    };
     let compiled_manifest = match compile_manifest(&routes_json) {
         Ok(manifest) => manifest,
         Err(error) => {
@@ -1087,6 +1278,12 @@ pub extern "C" fn dart_http_server_runtime_start_server(
         server_id,
         routes: Arc::new(compiled_manifest.routes),
         schemas: Arc::new(compiled_manifest.schemas),
+        body_limit,
+        web_socket_max_pending_messages: web_socket_max_pending_messages.max(1) as usize,
+        web_socket_max_pending_bytes: web_socket_max_pending_bytes.max(1) as usize,
+        web_socket_write_stall_timeout: Duration::from_millis(
+            web_socket_write_stall_timeout_ms.max(1) as u64,
+        ),
         callback,
         native_stream_slots: Arc::new(Semaphore::new(native_stream_worker_count.max(1) as usize)),
         stream_stall_timeout: Duration::from_millis(stream_stall_timeout_ms.max(1) as u64),
@@ -1243,11 +1440,12 @@ pub extern "C" fn dart_http_server_runtime_stop_server_by_id(server_id: i64) {
             let Some(session) = sessions.remove(&session_id) else {
                 continue;
             };
-            session.queue_space.notify_waiters();
-            let _ = session.command_tx.send(WebSocketCommand::Close {
+            session.budget.close();
+            session.outgoing_budget.close();
+            let _ = session.close_tx.send(Some(WebSocketClose {
                 code: Some(1012),
                 reason: Some("Server stopped".to_string()),
-            });
+            }));
         }
     }
 
@@ -1640,21 +1838,18 @@ pub extern "C" fn dart_http_server_runtime_free_web_socket_connection(
 pub extern "C" fn dart_http_server_runtime_take_web_socket_message(
     session_id: i64,
 ) -> *mut NativeWebSocketMessage {
-    let (message, queue_space) = {
-        let mut sessions = WEB_SOCKET_SESSIONS.lock().unwrap();
-        let Some(session) = sessions.get_mut(&session_id) else {
-            return std::ptr::null_mut();
-        };
-        let Some(message) = session.messages.pop_front() else {
-            return std::ptr::null_mut();
-        };
-        session.pending_bytes = session.pending_bytes.saturating_sub(message.body.len());
-        (message, Arc::clone(&session.queue_space))
+    let message = WEB_SOCKET_SESSIONS
+        .lock()
+        .unwrap()
+        .get_mut(&session_id)
+        .and_then(|session| session.messages.pop_front());
+    let Some(message) = message else {
+        return std::ptr::null_mut();
     };
-    queue_space.notify_one();
-
-    let handle = Box::new(NativeWebSocketMessageHandle::from_message(message));
-    Box::into_raw(handle).cast::<NativeWebSocketMessage>()
+    Box::into_raw(Box::new(NativeWebSocketMessageHandle::from_message(
+        message,
+    )))
+    .cast()
 }
 
 #[unsafe(no_mangle)]
@@ -1723,7 +1918,6 @@ pub extern "C" fn dart_http_server_runtime_take_web_transport_datagram(
     let Some(datagram) = session.datagrams.pop_front() else {
         return std::ptr::null_mut();
     };
-    session.pending_bytes = session.pending_bytes.saturating_sub(datagram.body.len());
 
     let handle = Box::new(NativeWebTransportDatagramHandle::from_datagram(datagram));
     Box::into_raw(handle).cast::<NativeWebTransportDatagram>()
@@ -1740,7 +1934,6 @@ pub extern "C" fn dart_http_server_runtime_take_web_transport_stream(
     let Some(stream) = session.streams.pop_front() else {
         return std::ptr::null_mut();
     };
-    session.pending_bytes = session.pending_bytes.saturating_sub(stream.body.len());
 
     let handle = Box::new(NativeWebTransportStreamHandle::from_stream(stream));
     Box::into_raw(handle).cast::<NativeWebTransportStream>()
@@ -1795,7 +1988,6 @@ pub extern "C" fn dart_http_server_runtime_take_web_transport_stream_chunk(
         let mut streams = WEB_TRANSPORT_STREAMS.lock().unwrap();
         streams.get_mut(&stream_id).and_then(|stream| {
             let body = stream.chunks.pop_front()?;
-            stream.pending_bytes = stream.pending_bytes.saturating_sub(body.len());
             Some(body)
         })
     };
@@ -1885,8 +2077,11 @@ pub extern "C" fn dart_http_server_runtime_free_web_transport_operation(
 pub extern "C" fn dart_http_server_runtime_web_transport_open_unidirectional_stream(
     session_id: i64,
 ) -> i64 {
-    submit_web_transport_session_operation(session_id, |operation_id| {
-        WebTransportCommand::OpenUnidirectional { operation_id }
+    submit_web_transport_session_operation(session_id, |operation_id, permit| {
+        WebTransportCommand::OpenUnidirectional {
+            operation_id,
+            _permit: permit,
+        }
     })
 }
 
@@ -1894,8 +2089,11 @@ pub extern "C" fn dart_http_server_runtime_web_transport_open_unidirectional_str
 pub extern "C" fn dart_http_server_runtime_web_transport_open_bidirectional_stream(
     session_id: i64,
 ) -> i64 {
-    submit_web_transport_session_operation(session_id, |operation_id| {
-        WebTransportCommand::OpenBidirectional { operation_id }
+    submit_web_transport_session_operation(session_id, |operation_id, permit| {
+        WebTransportCommand::OpenBidirectional {
+            operation_id,
+            _permit: permit,
+        }
     })
 }
 
@@ -1907,6 +2105,14 @@ pub extern "C" fn dart_http_server_runtime_web_transport_stream_write(
     let Some(body) = (unsafe { read_native_bytes(body) }) else {
         return 0;
     };
+    if WEB_TRANSPORT_STREAMS
+        .lock()
+        .unwrap()
+        .get(&stream_id)
+        .is_none_or(|stream| body.len() > stream.budget.max_bytes)
+    {
+        return 0;
+    }
     submit_web_transport_send_operation(stream_id, |operation_id| {
         WebTransportStreamCommand::Write {
             operation_id,
@@ -1991,16 +2197,22 @@ pub extern "C" fn dart_http_server_runtime_web_transport_send_datagram(
     let Some(body) = (unsafe { read_native_bytes(body) }) else {
         return false;
     };
-    let command_tx = {
+    let (command_tx, permit) = {
         let sessions = WEB_TRANSPORT_SESSIONS.lock().unwrap();
         let Some(session) = sessions.get(&session_id) else {
             return false;
         };
-        session.command_tx.clone()
+        let Some(permit) = session.outgoing_budget.try_reserve(body.len()) else {
+            return false;
+        };
+        (session.command_tx.clone(), permit)
     };
 
     command_tx
-        .send(WebTransportCommand::SendDatagram(body.to_vec()))
+        .send(WebTransportCommand::SendDatagram {
+            body: body.to_vec(),
+            _permit: permit,
+        })
         .is_ok()
 }
 
@@ -2012,16 +2224,22 @@ pub extern "C" fn dart_http_server_runtime_web_transport_send_stream(
     let Some(body) = (unsafe { read_native_bytes(body) }) else {
         return false;
     };
-    let command_tx = {
+    let (command_tx, permit) = {
         let sessions = WEB_TRANSPORT_SESSIONS.lock().unwrap();
         let Some(session) = sessions.get(&session_id) else {
             return false;
         };
-        session.command_tx.clone()
+        let Some(permit) = session.outgoing_budget.try_reserve(body.len()) else {
+            return false;
+        };
+        (session.command_tx.clone(), permit)
     };
 
     command_tx
-        .send(WebTransportCommand::SendStream(body.to_vec()))
+        .send(WebTransportCommand::SendStream {
+            body: body.to_vec(),
+            _permit: permit,
+        })
         .is_ok()
 }
 
@@ -2048,44 +2266,73 @@ pub extern "C" fn dart_http_server_runtime_web_transport_close(
         .is_ok()
 }
 
+fn submit_web_socket_write(
+    session_id: i64,
+    bytes: usize,
+    message: impl FnOnce() -> Message,
+) -> i64 {
+    let (tx, state, permit) = {
+        let sessions = WEB_SOCKET_SESSIONS.lock().unwrap();
+        let Some(session) = sessions.get(&session_id) else {
+            return 0;
+        };
+        if session.peer_closed || session.close_tx.borrow().is_some() {
+            return 0;
+        }
+        let Some(permit) = session.outgoing_budget.try_reserve(bytes) else {
+            return 0;
+        };
+        (
+            session.command_tx.clone(),
+            session.runtime_state.clone(),
+            permit,
+        )
+    };
+    let operation_id = NEXT_BINARY_CHUNK_ID.fetch_add(1, Ordering::Relaxed);
+    let command = WebSocketWrite {
+        message: message(),
+        completion: WebSocketWriteCompletion {
+            operation_id,
+            runtime_state: state,
+            consumed: false,
+            _permit: permit,
+        },
+    };
+    if tx.send(command).is_ok() {
+        operation_id
+    } else {
+        0
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn dart_http_server_runtime_web_socket_send_text(
     session_id: i64,
     text: *const c_char,
-) -> bool {
-    let Some(text) = (unsafe { read_c_string(text) }) else {
-        return false;
+) -> i64 {
+    if text.is_null() {
+        return 0;
+    }
+    let text = unsafe { CStr::from_ptr(text) };
+    let Ok(text) = text.to_str() else {
+        return 0;
     };
-    let command_tx = {
-        let sessions = WEB_SOCKET_SESSIONS.lock().unwrap();
-        let Some(session) = sessions.get(&session_id) else {
-            return false;
-        };
-        session.command_tx.clone()
-    };
-
-    command_tx.send(WebSocketCommand::SendText(text)).is_ok()
+    submit_web_socket_write(session_id, text.len(), || {
+        Message::Text(text.to_owned().into())
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn dart_http_server_runtime_web_socket_send_binary(
     session_id: i64,
     body: NativeBytes,
-) -> bool {
+) -> i64 {
     let Some(body) = (unsafe { read_native_bytes(body) }) else {
-        return false;
+        return 0;
     };
-    let command_tx = {
-        let sessions = WEB_SOCKET_SESSIONS.lock().unwrap();
-        let Some(session) = sessions.get(&session_id) else {
-            return false;
-        };
-        session.command_tx.clone()
-    };
-
-    command_tx
-        .send(WebSocketCommand::SendBinary(body.to_vec()))
-        .is_ok()
+    submit_web_socket_write(session_id, body.len(), || {
+        Message::Binary(body.to_vec().into())
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -2095,21 +2342,18 @@ pub extern "C" fn dart_http_server_runtime_web_socket_close(
     reason: *const c_char,
 ) -> bool {
     let reason = unsafe { read_optional_c_string(reason) };
-    let (command_tx, queue_space) = {
-        let mut sessions = WEB_SOCKET_SESSIONS.lock().unwrap();
-        let Some(session) = sessions.get_mut(&session_id) else {
-            return false;
-        };
-        session.accepting_messages = false;
-        (session.command_tx.clone(), Arc::clone(&session.queue_space))
+    let sessions = WEB_SOCKET_SESSIONS.lock().unwrap();
+    let Some(session) = sessions.get(&session_id) else {
+        return false;
     };
-    queue_space.notify_waiters();
-
-    command_tx
-        .send(WebSocketCommand::Close {
+    session.budget.close();
+    session.outgoing_budget.close();
+    session
+        .close_tx
+        .send(Some(WebSocketClose {
             code: if code <= 0 { None } else { Some(code as u16) },
             reason,
-        })
+        }))
         .is_ok()
 }
 
@@ -2167,12 +2411,55 @@ pub extern "C" fn dart_http_server_runtime_send_response(
     )
 }
 
+fn validate_buffered_body(
+    headers: &HeaderMap,
+    bytes: Bytes,
+    request_body: Option<&RequestBodyValidation>,
+    state: &ServerRuntimeState,
+) -> Result<ValidatedBody, Response<Body>> {
+    let body = validate_and_read_body(headers, bytes, request_body)?;
+    if let Some(request_body) = request_body {
+        validate_request_body(&body, request_body, state)?;
+    }
+    Ok(body)
+}
+
+fn is_body_limit_error(error: &axum::Error) -> bool {
+    use std::error::Error;
+    let mut source = error.source();
+    while let Some(error) = source {
+        if error.is::<http_body_util::LengthLimitError>() {
+            return true;
+        }
+        source = error.source();
+    }
+    false
+}
+
+fn body_limit_response() -> Response<Body> {
+    response(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "text/plain; charset=utf-8",
+        "Request body exceeds limit".to_string(),
+    )
+}
+
 async fn validate_request_middleware(
     State(runtime_state): State<ServerRuntimeState>,
     request: Request<Body>,
     next: Next,
 ) -> Response<Body> {
     let (parts, body) = request.into_parts();
+    if parts
+        .headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .is_some_and(|length| length > runtime_state.body_limit as u64)
+    {
+        return body_limit_response();
+    }
+    let body = Body::new(http_body_util::Limited::new(body, runtime_state.body_limit));
     let requested_kind = if wants_web_socket_upgrade(&parts.headers) {
         RouteTransportKind::WebSocket
     } else {
@@ -2259,30 +2546,53 @@ async fn validate_request_middleware(
                 });
                 return next.run(request).await;
             }
-            let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
+            let body_bytes = match axum::body::to_bytes(body, runtime_state.body_limit).await {
                 Ok(bytes) => bytes,
-                Err(_) => {
+                Err(error) => {
+                    let too_large = is_body_limit_error(&error);
                     return response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
+                        if too_large {
+                            StatusCode::PAYLOAD_TOO_LARGE
+                        } else {
+                            StatusCode::BAD_REQUEST
+                        },
                         "text/plain; charset=utf-8",
-                        "Failed to read request body".to_string(),
+                        "Request body exceeds limit or could not be read".to_string(),
                     );
                 }
             };
-            let body = match validate_and_read_body(
-                &parts.headers,
-                body_bytes,
-                route_match.request_body.as_ref(),
-            ) {
-                Ok(body) => body,
-                Err(error_response) => return error_response,
+            let validated_body = if body_bytes.len() >= 64 * 1024 {
+                // Full JSON parsing and schema traversal are CPU work. Keep
+                // large bodies off the Tokio threads polling other sockets.
+                let headers = parts.headers.clone();
+                let request_body = route_match.request_body.clone();
+                let state = runtime_state.clone();
+                match tokio::task::spawn_blocking(move || {
+                    validate_buffered_body(&headers, body_bytes, request_body.as_ref(), &state)
+                })
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => {
+                        return response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "text/plain; charset=utf-8",
+                            "Request body validation failed".to_string(),
+                        );
+                    }
+                }
+            } else {
+                validate_buffered_body(
+                    &parts.headers,
+                    body_bytes,
+                    route_match.request_body.as_ref(),
+                    &runtime_state,
+                )
             };
-            if let Some(request_body) = route_match.request_body.as_ref()
-                && let Err(error_response) =
-                    validate_request_body(&body, request_body, &runtime_state)
-            {
-                return error_response;
-            }
+            let body = match validated_body {
+                Ok(body) => body,
+                Err(error) => return error,
+            };
 
             let mut request = Request::from_parts(parts, Body::empty());
             request.extensions_mut().insert(ValidatedRouteRequest {
@@ -2377,13 +2687,15 @@ async fn handle_http_request(
     body_stream: Option<Body>,
     runtime_state: &ServerRuntimeState,
 ) -> Response<Body> {
+    let (limit_tx, mut limit_rx) = watch::channel(false);
     let transport_request = TransportRequest {
         route_id: route_match.route_id,
         path_params: route_match.path_params,
         query,
         headers,
         body: body.bytes,
-        body_stream: body_stream.map(ProducedIncomingBodyStream::from_body),
+        body_stream: body_stream
+            .map(|body| ProducedIncomingBodyStream::from_body(body, limit_tx.clone())),
         request_kind: NativeRequestKind::Http,
         body_kind: body.kind,
     };
@@ -2394,7 +2706,15 @@ async fn handle_http_request(
             Err(error_response) => return error_response,
         };
 
-    match response_rx.recv().await {
+    let first_response = tokio::select! {
+        biased;
+        _ = limit_rx.changed() => { return body_limit_response(); }
+        response = response_rx.recv() => response,
+    };
+    if *limit_rx.borrow() {
+        return body_limit_response();
+    }
+    match first_response {
         Some(PendingResponseMessage::Http(transport_response)) => response_body_with_headers(
             StatusCode::from_u16(transport_response.status)
                 .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
@@ -2751,6 +3071,8 @@ async fn handle_web_socket_request(
             };
 
             let mut response = websocket
+                .max_message_size(max_pending_bytes)
+                .max_frame_size(max_pending_bytes)
                 .on_upgrade(move |socket| {
                     handle_web_socket_session(
                         socket,
@@ -2777,7 +3099,7 @@ async fn handle_web_socket_request(
 }
 
 async fn handle_web_socket_session(
-    mut socket: WebSocket,
+    socket: WebSocket,
     request_id: i64,
     route_id: String,
     path_params: HashMap<String, String>,
@@ -2788,114 +3110,110 @@ async fn handle_web_socket_session(
     runtime_state: ServerRuntimeState,
 ) {
     let session_id = NEXT_WEB_SOCKET_SESSION_ID.fetch_add(1, Ordering::Relaxed);
-    let (command_tx, mut command_rx) = mpsc::unbounded_channel::<WebSocketCommand>();
-    {
-        let mut sessions = WEB_SOCKET_SESSIONS.lock().unwrap();
-        sessions.insert(
-            session_id,
-            WebSocketSessionState {
-                server_id: runtime_state.server_id,
-                connection: Some(WebSocketConnection {
-                    session_id,
-                    request_id,
-                    route_id,
-                    path_params,
-                    query,
-                    headers,
-                }),
-                messages: VecDeque::new(),
-                pending_bytes: 0,
-                max_pending_messages,
-                max_pending_bytes,
-                command_tx,
-                peer_closed: false,
-                accepting_messages: true,
-                queue_space: Arc::new(Notify::new()),
-            },
-        );
-    }
+    let (command_tx, mut command_rx) = mpsc::unbounded_channel::<WebSocketWrite>();
+    let (close_tx, mut close_rx) = watch::channel(None::<WebSocketClose>);
+    let budget = IngressBudget::new(max_pending_messages, max_pending_bytes);
+    let outgoing_budget = IngressBudget::new(
+        runtime_state.web_socket_max_pending_messages,
+        runtime_state.web_socket_max_pending_bytes,
+    );
+    WEB_SOCKET_SESSIONS.lock().unwrap().insert(
+        session_id,
+        WebSocketSessionState {
+            server_id: runtime_state.server_id,
+            connection: Some(WebSocketConnection {
+                session_id,
+                request_id,
+                route_id,
+                path_params,
+                query,
+                headers,
+            }),
+            messages: VecDeque::new(),
+            budget: Arc::clone(&budget),
+            command_tx,
+            close_tx,
+            outgoing_budget: Arc::clone(&outgoing_budget),
+            runtime_state: runtime_state.clone(),
+            peer_closed: false,
+            accepting_messages: true,
+        },
+    );
     notify_transport_event(
         &runtime_state,
         TransportEventKind::WebSocketOpened,
         session_id,
     );
-
-    loop {
-        tokio::select! {
-            incoming = socket.next() => {
-                match incoming {
-                    Some(Ok(Message::Text(text))) => {
-                        let accepted = push_web_socket_message(
-                            session_id,
-                            WebSocketIncomingMessage {
-                                session_id,
-                                kind: WebSocketMessageKind::Text,
-                                body: text.as_str().as_bytes().to_vec(),
-                            },
-                        ).await;
-                        if !accepted {
-                            let _ = try_send_web_socket_close(
-                                &mut socket,
-                                Some(1013),
-                                Some("incoming queue limit exceeded".to_string()),
-                            ).await;
-                            break;
-                        }
-                        notify_transport_event(&runtime_state, TransportEventKind::WebSocketMessageReady, session_id);
-                    }
-                    Some(Ok(Message::Binary(bytes))) => {
-                        let accepted = push_web_socket_message(
-                            session_id,
-                            WebSocketIncomingMessage {
-                                session_id,
-                                kind: WebSocketMessageKind::Binary,
-                                body: bytes.to_vec(),
-                            },
-                        ).await;
-                        if !accepted {
-                            let _ = try_send_web_socket_close(
-                                &mut socket,
-                                Some(1013),
-                                Some("incoming queue limit exceeded".to_string()),
-                            ).await;
-                            break;
-                        }
-                        notify_transport_event(&runtime_state, TransportEventKind::WebSocketMessageReady, session_id);
-                    }
-                    Some(Ok(Message::Close(_))) | None => break,
-                    Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {}
-                    Some(Err(_)) => break,
+    let (mut sink, mut source) = socket.split();
+    {
+        let incoming = async {
+            while let Some(incoming) = source.next().await {
+                let (kind, body) = match incoming {
+                    Ok(Message::Text(text)) => (
+                        WebSocketMessageKind::Text,
+                        text.as_str().as_bytes().to_vec(),
+                    ),
+                    Ok(Message::Binary(bytes)) => (WebSocketMessageKind::Binary, bytes.to_vec()),
+                    Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => continue,
+                    _ => break,
+                };
+                if !push_web_socket_message(
+                    session_id,
+                    WebSocketIncomingMessage {
+                        session_id,
+                        kind,
+                        body,
+                        permit: None,
+                    },
+                )
+                .await
+                {
+                    break;
+                }
+                notify_transport_event(
+                    &runtime_state,
+                    TransportEventKind::WebSocketMessageReady,
+                    session_id,
+                );
+            }
+        };
+        let outgoing = async {
+            while let Some(mut command) = command_rx.recv().await {
+                command.completion.consumed = matches!(
+                    tokio::time::timeout(
+                        runtime_state.web_socket_write_stall_timeout,
+                        sink.send(command.message)
+                    )
+                    .await,
+                    Ok(Ok(()))
+                );
+                if !command.completion.consumed {
+                    break;
                 }
             }
-            command = command_rx.recv() => {
-                match command {
-                    Some(WebSocketCommand::SendText(text)) => {
-                        if socket.send(Message::Text(text.into())).await.is_err() {
-                            break;
-                        }
-                    }
-                    Some(WebSocketCommand::SendBinary(body)) => {
-                        if socket.send(Message::Binary(body.into())).await.is_err() {
-                            break;
-                        }
-                    }
-                    Some(WebSocketCommand::Close { code, reason }) => {
-                        let _ = try_send_web_socket_close(&mut socket, code, reason).await;
-                        break;
-                    }
-                    None => break,
-                }
-            }
-        }
+        };
+        tokio::pin!(incoming, outgoing);
+        tokio::select! { _ = &mut incoming => {}, _ = &mut outgoing => {}, _ = close_rx.changed() => {} }
     }
-
-    // Keep queued frames alive until Dart handles WebSocketClosed. A prior
-    // message-ready notification can still be waiting on the isolate event
-    // loop when a fast peer sends its final frame and closes.
+    budget.close();
+    outgoing_budget.close();
+    // Cancellation bypasses queued data and interrupts a stalled sink send.
+    let close = close_rx.borrow().clone();
+    if let Some(close) = close {
+        let frame = CloseFrame {
+            code: close.code.unwrap_or(close_code::NORMAL),
+            reason: close.reason.unwrap_or_default().into(),
+        };
+        let _ = tokio::time::timeout(
+            Duration::from_millis(250),
+            sink.send(Message::Close(Some(frame))),
+        )
+        .await;
+    }
+    drop(command_rx); // negatively acknowledge every queued write before closed
     if let Some(session) = WEB_SOCKET_SESSIONS.lock().unwrap().get_mut(&session_id) {
         session.peer_closed = true;
         session.accepting_messages = false;
-        session.queue_space.notify_waiters();
     }
     notify_transport_event(
         &runtime_state,
@@ -3072,7 +3390,9 @@ async fn handle_web_transport_session(
                 }),
                 datagrams: VecDeque::new(),
                 streams: VecDeque::new(),
-                pending_bytes: 0,
+                budget: IngressBudget::new(max_pending_messages, max_pending_bytes),
+                outgoing_budget: IngressBudget::new(max_pending_messages, max_pending_bytes),
+                stream_slots: IngressBudget::new(max_pending_messages, 0),
                 max_pending_messages,
                 max_pending_bytes,
                 command_tx,
@@ -3087,124 +3407,135 @@ async fn handle_web_transport_session(
 
     loop {
         tokio::select! {
-            incoming = connection.receive_datagram() => {
-                match incoming {
-                    Ok(datagram) => {
-                        let accepted = push_web_transport_datagram(
-                            session_id,
-                            WebTransportIncomingDatagram {
-                                session_id,
-                                body: datagram.payload().to_vec(),
-                            },
-                        );
-                        if !accepted {
-                            connection.close(
-                                VarInt::from_u32(REALTIME_OVERLOAD_CODE),
-                                b"incoming queue limit exceeded",
-                            );
-                            break;
-                        }
-                        notify_transport_event(
-                            &runtime_state,
-                            TransportEventKind::WebTransportDatagramReady,
-                            session_id,
-                        );
-                    }
-                    Err(_) => break,
-                }
-            }
-            incoming = connection.accept_uni() => {
-                match incoming {
-                    Ok(stream) => {
-                        register_web_transport_receive_stream(
-                            session_id,
-                            WebTransportStreamKind::IncomingUnidirectional,
-                            stream,
-                            None,
-                            runtime_state.clone(),
-                            true,
-                            max_pending_messages,
-                            max_pending_bytes,
-                        );
-                    }
-                    Err(_) => break,
-                }
-            }
-            incoming = connection.accept_bi() => {
-                match incoming {
-                    Ok((send, receive)) => {
-                        register_web_transport_receive_stream(
-                            session_id,
-                            WebTransportStreamKind::IncomingBidirectional,
-                            receive,
-                            Some(send),
-                            runtime_state.clone(),
-                            false,
-                            max_pending_messages,
-                            max_pending_bytes,
-                        );
-                    }
-                    Err(_) => break,
-                }
-            }
-            command = command_rx.recv() => {
-                match command {
-                    Some(WebTransportCommand::SendDatagram(body)) => {
-                        if connection.send_datagram(body).is_err() {
-                            break;
-                        }
-                    }
-                    Some(WebTransportCommand::SendStream(body)) => {
-                        match connection.open_uni().await {
-                            Ok(opening) => match opening.await {
-                                Ok(mut stream) => {
-                                    if stream.write_all(&body).await.is_err()
-                                        || stream.finish().await.is_err()
-                                    {
-                                        break;
-                                    }
+                    incoming = connection.receive_datagram() => {
+                        match incoming {
+                            Ok(datagram) => {
+                                let accepted = push_web_transport_datagram(
+                                    session_id,
+                                    WebTransportIncomingDatagram {
+                                        session_id,
+                                        body: datagram.payload().to_vec(),
+                                    permit: None,
+        },
+                                );
+                                if !accepted {
+                                    connection.close(
+                                        VarInt::from_u32(REALTIME_OVERLOAD_CODE),
+                                        b"incoming queue limit exceeded",
+                                    );
+                                    break;
                                 }
-                                Err(_) => break,
-                            },
+                                notify_transport_event(
+                                    &runtime_state,
+                                    TransportEventKind::WebTransportDatagramReady,
+                                    session_id,
+                                );
+                            }
                             Err(_) => break,
                         }
                     }
-                    Some(WebTransportCommand::OpenUnidirectional { operation_id }) => {
-                        let connection = connection.clone();
-                        let runtime_state = runtime_state.clone();
-                        tokio::spawn(async move {
-                            open_web_transport_unidirectional_stream(
-                                connection,
-                                session_id,
-                                operation_id,
-                                runtime_state,
-                            ).await;
-                        });
+                    incoming = connection.accept_uni() => {
+                        match incoming {
+                            Ok(stream) => {
+                                register_web_transport_receive_stream(
+                                    session_id,
+                                    WebTransportStreamKind::IncomingUnidirectional,
+                                    stream,
+                                    None,
+                                    runtime_state.clone(),
+                                    true,
+                                    max_pending_messages,
+                                    max_pending_bytes,
+                                );
+                            }
+                            Err(_) => break,
+                        }
                     }
-                    Some(WebTransportCommand::OpenBidirectional { operation_id }) => {
-                        let connection = connection.clone();
-                        let runtime_state = runtime_state.clone();
-                        tokio::spawn(async move {
-                            open_web_transport_bidirectional_stream(
-                                connection,
-                                session_id,
-                                operation_id,
-                                runtime_state,
-                            ).await;
-                        });
+                    incoming = connection.accept_bi() => {
+                        match incoming {
+                            Ok((send, receive)) => {
+                                register_web_transport_receive_stream(
+                                    session_id,
+                                    WebTransportStreamKind::IncomingBidirectional,
+                                    receive,
+                                    Some(send),
+                                    runtime_state.clone(),
+                                    false,
+                                    max_pending_messages,
+                                    max_pending_bytes,
+                                );
+                            }
+                            Err(_) => break,
+                        }
                     }
-                    Some(WebTransportCommand::Close { code, reason }) => {
-                        let code = code.map(VarInt::from_u32).unwrap_or_else(|| VarInt::from_u32(0));
-                        let reason = reason.unwrap_or_default();
-                        connection.close(code, reason.as_bytes());
-                        break;
+                    command = command_rx.recv() => {
+                        match command {
+                            Some(WebTransportCommand::SendDatagram { body, _permit }) => {
+                                if connection.send_datagram(body).is_err() {
+                                    break;
+                                }
+                            }
+                            Some(WebTransportCommand::SendStream { body, _permit }) => {
+                                let result = tokio::time::timeout(runtime_state.stream_stall_timeout, async {
+                                    let opening = connection.open_uni().await.map_err(|e| e.to_string())?;
+                                    let mut stream = opening.await.map_err(|e| e.to_string())?;
+                                    stream.write_all(&body).await.map_err(|e| e.to_string())?;
+                                    stream.finish().await.map_err(|e| e.to_string())
+                                }).await;
+                                if !matches!(result, Ok(Ok(()))) {
+                                    connection.close(VarInt::from_u32(REALTIME_OVERLOAD_CODE), b"outgoing stream stalled");
+                                    break;
+                                }
+                            }
+                            Some(WebTransportCommand::OpenUnidirectional { operation_id, _permit }) => {
+                                let connection = connection.clone();
+                                let runtime_state = runtime_state.clone();
+                                tokio::spawn(async move {
+                                    let _slot = _permit;
+                                    open_web_transport_unidirectional_stream(
+                                        connection,
+                                        session_id,
+                                        operation_id,
+                                        runtime_state,
+                                    ).await;
+                                });
+                            }
+                            Some(WebTransportCommand::OpenBidirectional { operation_id, _permit }) => {
+                                let connection = connection.clone();
+                                let runtime_state = runtime_state.clone();
+                                tokio::spawn(async move {
+                                    let _slot = _permit;
+                                    open_web_transport_bidirectional_stream(
+                                        connection,
+                                        session_id,
+                                        operation_id,
+                                        runtime_state,
+                                    ).await;
+                                });
+                            }
+                            Some(WebTransportCommand::Close { code, reason }) => {
+                                let code = code.map(VarInt::from_u32).unwrap_or_else(|| VarInt::from_u32(0));
+                                let reason = reason.unwrap_or_default();
+                                connection.close(code, reason.as_bytes());
+                                break;
+                            }
+                            None => break,
+                        }
                     }
-                    None => break,
                 }
-            }
-        }
     }
 
+    for stream in WEB_TRANSPORT_STREAMS
+        .lock()
+        .unwrap()
+        .values()
+        .filter(|s| s.info.session_id == session_id)
+    {
+        stream.budget.close();
+        if let Some(stop) = &stream.stop_tx {
+            let _ = stop.send(0);
+        }
+    }
     let _ = WEB_TRANSPORT_SESSIONS.lock().unwrap().remove(&session_id);
     WEB_TRANSPORT_STREAMS
         .lock()
@@ -3330,80 +3661,81 @@ fn response_body_with_headers(
         .unwrap_or_else(|_| Response::new(Body::from("Internal Server Error")))
 }
 
-async fn push_web_socket_message(session_id: i64, message: WebSocketIncomingMessage) -> bool {
-    loop {
-        let wait_for_space = {
-            let mut sessions = WEB_SOCKET_SESSIONS.lock().unwrap();
-            let Some(session) = sessions.get_mut(&session_id) else {
-                return false;
-            };
-            if !session.accepting_messages || message.body.len() > session.max_pending_bytes {
-                return false;
-            }
-            let next_bytes = session.pending_bytes.saturating_add(message.body.len());
-            if session.messages.len() < session.max_pending_messages
-                && next_bytes <= session.max_pending_bytes
-            {
-                session.pending_bytes = next_bytes;
-                session.messages.push_back(message);
-                return true;
-            }
-            Arc::clone(&session.queue_space).notified_owned()
+async fn push_web_socket_message(session_id: i64, mut message: WebSocketIncomingMessage) -> bool {
+    let budget = {
+        let sessions = WEB_SOCKET_SESSIONS.lock().unwrap();
+        let Some(session) = sessions.get(&session_id) else {
+            return false;
         };
-        wait_for_space.await;
-    }
-}
-
-fn push_web_transport_datagram(session_id: i64, datagram: WebTransportIncomingDatagram) -> bool {
-    let mut sessions = WEB_TRANSPORT_SESSIONS.lock().unwrap();
-    if let Some(session) = sessions.get_mut(&session_id) {
-        let next_bytes = session.pending_bytes.saturating_add(datagram.body.len());
-        if session
-            .datagrams
-            .len()
-            .saturating_add(session.streams.len())
-            >= session.max_pending_messages
-            || next_bytes > session.max_pending_bytes
-        {
+        if !session.accepting_messages {
             return false;
         }
-        session.pending_bytes = next_bytes;
-        session.datagrams.push_back(datagram);
-        return true;
+        Arc::clone(&session.budget)
+    };
+    let Some(permit) = budget.reserve(message.body.len()).await else {
+        return false;
+    };
+    let mut sessions = WEB_SOCKET_SESSIONS.lock().unwrap();
+    let Some(session) = sessions.get_mut(&session_id) else {
+        return false;
+    };
+    if !session.accepting_messages {
+        return false;
     }
-    false
+    message.permit = Some(permit);
+    session.messages.push_back(message);
+    true
 }
 
-fn push_web_transport_stream(session_id: i64, stream: WebTransportIncomingStream) -> bool {
+fn push_web_transport_datagram(
+    session_id: i64,
+    mut datagram: WebTransportIncomingDatagram,
+) -> bool {
     let mut sessions = WEB_TRANSPORT_SESSIONS.lock().unwrap();
-    if let Some(session) = sessions.get_mut(&session_id) {
-        let next_bytes = session.pending_bytes.saturating_add(stream.body.len());
-        if session
-            .datagrams
-            .len()
-            .saturating_add(session.streams.len())
-            >= session.max_pending_messages
-            || next_bytes > session.max_pending_bytes
-        {
+    let Some(session) = sessions.get_mut(&session_id) else {
+        return false;
+    };
+    let Some(permit) = session.budget.try_reserve(datagram.body.len()) else {
+        return false;
+    };
+    datagram.permit = Some(permit);
+    session.datagrams.push_back(datagram);
+    true
+}
+
+fn push_web_transport_stream(session_id: i64, mut stream: WebTransportIncomingStream) -> bool {
+    let mut sessions = WEB_TRANSPORT_SESSIONS.lock().unwrap();
+    let Some(session) = sessions.get_mut(&session_id) else {
+        return false;
+    };
+    if stream.permit.is_none() {
+        let Some(permit) = session.budget.try_reserve(stream.body.len()) else {
             return false;
-        }
-        session.pending_bytes = next_bytes;
-        session.streams.push_back(stream);
-        return true;
+        };
+        stream.permit = Some(permit);
     }
-    false
+    session.streams.push_back(stream);
+    true
 }
 
 fn register_web_transport_receive_stream(
     session_id: i64,
     kind: WebTransportStreamKind,
     receive: wtransport::stream::RecvStream,
-    send: Option<wtransport::stream::SendStream>,
+    mut send: Option<wtransport::stream::SendStream>,
     runtime_state: ServerRuntimeState,
     collect_legacy_payload: bool,
     max_pending_messages: usize,
     max_pending_bytes: usize,
 ) {
+    let Some(parent) = reserve_web_transport_stream_slot(session_id) else {
+        receive.stop(VarInt::from_u32(REALTIME_OVERLOAD_CODE));
+        if let Some(send) = send.as_mut() {
+            let _ = send.reset(VarInt::from_u32(REALTIME_OVERLOAD_CODE));
+        }
+        return;
+    };
+    let (receive_mode_tx, receive_mode_rx) = watch::channel(0);
     let stream_id = NEXT_WEB_TRANSPORT_STREAM_HANDLE_ID.fetch_add(1, Ordering::Relaxed);
     let protocol_id = receive.id().into_u64() as i64;
     let info = WebTransportStreamInfo {
@@ -3422,9 +3754,13 @@ fn register_web_transport_receive_stream(
             info,
             runtime_state: runtime_state.clone(),
             chunks: VecDeque::new(),
-            pending_bytes: 0,
-            max_pending_messages,
-            max_pending_bytes,
+            budget: IngressBudget::with_parent(
+                max_pending_messages,
+                max_pending_bytes,
+                parent,
+                web_transport_input_budget(session_id),
+            ),
+            receive_mode_tx,
             terminal: None,
             send_tx,
             stop_tx: Some(stop_tx),
@@ -3448,6 +3784,7 @@ fn register_web_transport_receive_stream(
         runtime_state,
         collect_legacy_payload,
         max_pending_bytes,
+        receive_mode_rx,
     ));
 }
 
@@ -3524,10 +3861,25 @@ fn register_opened_web_transport_send_stream(
     operation_id: i64,
     kind: WebTransportStreamKind,
     operation_kind: WebTransportOperationKind,
-    send: wtransport::stream::SendStream,
-    receive: Option<wtransport::stream::RecvStream>,
+    mut send: wtransport::stream::SendStream,
+    mut receive: Option<wtransport::stream::RecvStream>,
     runtime_state: ServerRuntimeState,
 ) {
+    let Some(parent) = reserve_web_transport_stream_slot(session_id) else {
+        let _ = send.reset(VarInt::from_u32(REALTIME_OVERLOAD_CODE));
+        if let Some(receive) = receive.take() {
+            receive.stop(VarInt::from_u32(REALTIME_OVERLOAD_CODE));
+        }
+        complete_web_transport_open_error(
+            session_id,
+            operation_id,
+            operation_kind,
+            "WebTransport stream capacity exhausted".to_string(),
+            &runtime_state,
+        );
+        return;
+    };
+    let (receive_mode_tx, receive_mode_rx) = watch::channel(0);
     let (max_pending_messages, max_pending_bytes) = web_transport_session_limits(session_id);
     let stream_id = NEXT_WEB_TRANSPORT_STREAM_HANDLE_ID.fetch_add(1, Ordering::Relaxed);
     let protocol_id = send.id().into_u64() as i64;
@@ -3550,9 +3902,13 @@ fn register_opened_web_transport_send_stream(
             info,
             runtime_state: runtime_state.clone(),
             chunks: VecDeque::new(),
-            pending_bytes: 0,
-            max_pending_messages,
-            max_pending_bytes,
+            budget: IngressBudget::with_parent(
+                max_pending_messages,
+                max_pending_bytes,
+                parent,
+                web_transport_input_budget(session_id),
+            ),
+            receive_mode_tx,
             terminal: None,
             send_tx: Some(send_tx),
             stop_tx,
@@ -3579,6 +3935,7 @@ fn register_opened_web_transport_send_stream(
             runtime_state,
             false,
             max_pending_bytes,
+            receive_mode_rx,
         ));
     }
 }
@@ -3615,15 +3972,19 @@ fn spawn_web_transport_send_actor(
                 WebTransportStreamCommand::Write { operation_id, body } => (
                     operation_id,
                     WebTransportOperationKind::Write,
-                    send.write_all(&body)
+                    tokio::time::timeout(runtime_state.stream_stall_timeout, send.write_all(&body))
                         .await
-                        .map_err(|error| error.to_string()),
+                        .map_err(|_| "WebTransport stream write stalled".to_string())
+                        .and_then(|result| result.map_err(|error| error.to_string())),
                     false,
                 ),
                 WebTransportStreamCommand::Finish { operation_id } => (
                     operation_id,
                     WebTransportOperationKind::Finish,
-                    send.finish().await.map_err(|error| error.to_string()),
+                    tokio::time::timeout(runtime_state.stream_stall_timeout, send.finish())
+                        .await
+                        .map_err(|_| "WebTransport stream finish stalled".to_string())
+                        .and_then(|result| result.map_err(|error| error.to_string())),
                     true,
                 ),
                 WebTransportStreamCommand::Reset {
@@ -3672,22 +4033,41 @@ async fn read_web_transport_stream_chunks(
     runtime_state: ServerRuntimeState,
     collect_legacy_payload: bool,
     max_pending_bytes: usize,
+    mut receive_mode: watch::Receiver<u8>,
 ) {
-    let mut legacy_payload = collect_legacy_payload.then(Vec::new);
+    let mut legacy_payload: Option<Vec<u8>> = None;
+    let mut legacy_permit: Option<IngressPermit> = None;
+    let mut mode = 0;
     let mut buffer = [0u8; 16 * 1024];
-    let terminal = loop {
+    let budget = {
+        let streams = WEB_TRANSPORT_STREAMS.lock().unwrap();
+        let Some(stream) = streams.get(&info.stream_id) else {
+            return;
+        };
+        Arc::clone(&stream.budget)
+    };
+    let terminal = 'read: loop {
         tokio::select! {
+            changed = receive_mode.changed(), if mode == 0 => {
+                if changed.is_err() { break WebTransportStreamTerminal { error_code: None, error: "receive mode closed".to_string() }; }
+                mode = *receive_mode.borrow_and_update();
+                if mode == 2 && collect_legacy_payload {
+                    legacy_permit = web_transport_input_budget(info.session_id).and_then(|b| b.try_reserve(0));
+                    if legacy_permit.is_none() { break WebTransportStreamTerminal { error_code: Some(REALTIME_OVERLOAD_CODE), error: "incoming compatibility stream capacity exhausted".to_string() }; }
+                    legacy_payload = Some(Vec::new());
+                }
+            }
             stop = stop_rx.recv() => {
                 let error_code = stop.unwrap_or_default();
                 receive.stop(VarInt::from_u32(error_code));
                 break WebTransportStreamTerminal { error_code: Some(error_code), error: "receive stopped locally".to_string() };
             }
-            result = receive.read(&mut buffer) => {
+            result = receive.read(&mut buffer[..max_pending_bytes.min(16 * 1024)]), if mode != 0 => {
                 match result {
                     Ok(Some(bytes_read)) => {
                         let body = buffer[..bytes_read].to_vec();
                         if let Some(payload) = legacy_payload.as_mut() {
-                            if payload.len().saturating_add(body.len()) > max_pending_bytes {
+                            if payload.len().saturating_add(body.len()) > max_pending_bytes || !legacy_permit.as_mut().unwrap().grow(body.len()) {
                                 receive.stop(VarInt::from_u32(REALTIME_OVERLOAD_CODE));
                                 break WebTransportStreamTerminal {
                                     error_code: Some(REALTIME_OVERLOAD_CODE),
@@ -3696,22 +4076,18 @@ async fn read_web_transport_stream_chunks(
                             }
                             payload.extend_from_slice(&body);
                         }
-                        if let Some(stream) = WEB_TRANSPORT_STREAMS.lock().unwrap().get_mut(&info.stream_id) {
-                            let next_bytes = stream.pending_bytes.saturating_add(body.len());
-                            if stream.chunks.len() >= stream.max_pending_messages
-                                || next_bytes > stream.max_pending_bytes
-                            {
-                                receive.stop(VarInt::from_u32(REALTIME_OVERLOAD_CODE));
-                                break WebTransportStreamTerminal {
-                                    error_code: Some(REALTIME_OVERLOAD_CODE),
-                                    error: "incoming stream queue limit exceeded".to_string(),
-                                };
+                        if mode == 2 { continue; }
+                        let permit = tokio::select! {
+                            permit = budget.reserve(body.len()) => match permit { Some(permit) => permit, None => break 'read WebTransportStreamTerminal { error_code: None, error: "receive budget closed".to_string() } },
+                            stop = stop_rx.recv() => {
+                                let code = stop.unwrap_or_default();
+                                receive.stop(VarInt::from_u32(code));
+                                break 'read WebTransportStreamTerminal { error_code: Some(code), error: "receive stopped locally".to_string() };
                             }
-                            stream.pending_bytes = next_bytes;
-                            stream.chunks.push_back(body);
-                        } else {
-                            return;
-                        }
+                        };
+                        if let Some(stream) = WEB_TRANSPORT_STREAMS.lock().unwrap().get_mut(&info.stream_id) {
+                            stream.chunks.push_back(IncomingChunk { body, permit });
+                        } else { return; }
                         notify_transport_event(&runtime_state, TransportEventKind::WebTransportStreamChunkReady, info.stream_id);
                     }
                     Ok(None) => break WebTransportStreamTerminal { error_code: None, error: String::new() },
@@ -3726,12 +4102,15 @@ async fn read_web_transport_stream_chunks(
             }
         }
     };
-    if let Some(body) = legacy_payload {
+    if terminal.error.is_empty()
+        && let Some(body) = legacy_payload
+    {
         let accepted = push_web_transport_stream(
             info.session_id,
             WebTransportIncomingStream {
                 session_id: info.session_id,
                 body,
+                permit: legacy_permit.take(),
             },
         );
         if accepted {
@@ -3758,6 +4137,49 @@ async fn read_web_transport_stream_chunks(
     );
 }
 
+fn web_transport_input_budget(session_id: i64) -> Option<Arc<IngressBudget>> {
+    WEB_TRANSPORT_SESSIONS
+        .lock()
+        .unwrap()
+        .get(&session_id)
+        .map(|s| Arc::clone(&s.budget))
+}
+
+fn reserve_web_transport_stream_slot(session_id: i64) -> Option<IngressPermit> {
+    WEB_TRANSPORT_SESSIONS
+        .lock()
+        .unwrap()
+        .get(&session_id)?
+        .stream_slots
+        .try_reserve(0)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn dart_http_server_runtime_web_transport_stream_receive_mode(
+    stream_id: i64,
+    mode: u8,
+) -> bool {
+    let streams = WEB_TRANSPORT_STREAMS.lock().unwrap();
+    let Some(stream) = streams.get(&stream_id) else {
+        return false;
+    };
+    if mode != 1
+        && !(mode == 2
+            && matches!(
+                stream.info.kind,
+                WebTransportStreamKind::IncomingUnidirectional
+            ))
+    {
+        return false;
+    }
+    let current = *stream.receive_mode_tx.borrow();
+    if current != 0 {
+        return current == mode;
+    }
+    stream.receive_mode_tx.send_replace(mode);
+    true
+}
+
 fn web_transport_session_limits(session_id: i64) -> (usize, usize) {
     WEB_TRANSPORT_SESSIONS
         .lock()
@@ -3772,14 +4194,21 @@ fn web_transport_session_limits(session_id: i64) -> (usize, usize) {
 
 fn submit_web_transport_session_operation(
     session_id: i64,
-    command: impl FnOnce(i64) -> WebTransportCommand,
+    command: impl FnOnce(i64, IngressPermit) -> WebTransportCommand,
 ) -> i64 {
     let operation_id = NEXT_WEB_TRANSPORT_OPERATION_ID.fetch_add(1, Ordering::Relaxed);
     let sessions = WEB_TRANSPORT_SESSIONS.lock().unwrap();
     let Some(session) = sessions.get(&session_id) else {
         return 0;
     };
-    if session.command_tx.send(command(operation_id)).is_err() {
+    let Some(permit) = session.outgoing_budget.try_reserve(0) else {
+        return 0;
+    };
+    if session
+        .command_tx
+        .send(command(operation_id, permit))
+        .is_err()
+    {
         0
     } else {
         operation_id
@@ -3854,22 +4283,6 @@ fn collect_web_transport_headers(headers: HashMap<String, String>) -> HashMap<St
         .collect()
 }
 
-async fn try_send_web_socket_close(
-    socket: &mut WebSocket,
-    code: Option<u16>,
-    reason: Option<String>,
-) -> Result<(), axum::Error> {
-    let frame = match (code, reason) {
-        (None, None) => None,
-        (code, reason) => Some(CloseFrame {
-            code: code.unwrap_or(close_code::NORMAL),
-            reason: reason.unwrap_or_default().into(),
-        }),
-    };
-
-    socket.send(Message::Close(frame)).await
-}
-
 fn compile_manifest(routes_json: &str) -> Result<CompiledManifest, String> {
     let manifest: RouteManifest =
         serde_json::from_str(routes_json).map_err(|error| error.to_string())?;
@@ -3881,6 +4294,25 @@ fn compile_manifest(routes_json: &str) -> Result<CompiledManifest, String> {
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(CompiledManifest { routes, schemas })
+}
+
+fn compile_body_limit(middlewares_json: &str) -> Result<usize, String> {
+    let manifest: MiddlewareManifest =
+        serde_json::from_str(middlewares_json).map_err(|e| e.to_string())?;
+    let mut limit = 64 * 1024 * 1024;
+    for middleware in manifest.middlewares {
+        if middleware.name == "bodyLimit" {
+            let bytes = middleware
+                .configuration
+                .get("maxBytes")
+                .and_then(|value| value.as_u64())
+                .and_then(|value| usize::try_from(value).ok())
+                .filter(|value| *value > 0)
+                .ok_or("bodyLimit.maxBytes must be a positive integer")?;
+            limit = bytes;
+        }
+    }
+    Ok(limit)
 }
 
 fn compile_cors_layer(middlewares_json: &str) -> Result<Option<CorsLayer>, String> {
@@ -4253,6 +4685,7 @@ impl NativeWebSocketMessageHandle {
         Self {
             message: native_message,
             body,
+            _permit: message.permit,
         }
     }
 }
@@ -4303,6 +4736,7 @@ impl NativeWebTransportDatagramHandle {
         Self {
             datagram: native_datagram,
             body,
+            _permit: datagram.permit,
         }
     }
 }
@@ -4318,18 +4752,23 @@ impl NativeWebTransportStreamHandle {
         Self {
             stream: native_stream,
             body,
+            _permit: stream.permit,
         }
     }
 }
 
 impl NativeWebTransportStreamChunkHandle {
-    fn new(stream_id: i64, body: Vec<u8>) -> Self {
-        let body = OwnedBytes::from_vec(body);
+    fn new(stream_id: i64, payload: IncomingChunk) -> Self {
+        let body = OwnedBytes::from_vec(payload.body);
         let chunk = NativeWebTransportStreamChunk {
             stream_id,
             body: body.as_native(),
         };
-        Self { chunk, body }
+        Self {
+            chunk,
+            body,
+            _permit: Some(payload.permit),
+        }
     }
 }
 
@@ -5046,6 +5485,290 @@ mod tests {
 
     extern "C" fn unused_test_callback(_kind: i32, _id: i64) {}
 
+    fn test_runtime_state() -> ServerRuntimeState {
+        ServerRuntimeState {
+            server_id: 0,
+            routes: Arc::new(Vec::new()),
+            schemas: Arc::new(HashMap::new()),
+            callback: unused_test_callback,
+            native_stream_slots: Arc::new(Semaphore::new(1)),
+            stream_stall_timeout: Duration::from_secs(1),
+            body_limit: 1024,
+            web_socket_max_pending_messages: 2,
+            web_socket_max_pending_bytes: 1024,
+            web_socket_write_stall_timeout: Duration::from_secs(1),
+        }
+    }
+
+    #[test]
+    fn stream_capacity_follows_outstanding_chunk_ownership() {
+        let slots = IngressBudget::new(1, 0);
+        let budget = IngressBudget::with_parent(1, 4, slots.try_reserve(0).unwrap(), None);
+        let chunk = budget.try_reserve(4).unwrap();
+        drop(budget);
+        assert!(slots.try_reserve(0).is_none());
+        drop(chunk);
+        assert!(slots.try_reserve(0).is_some());
+    }
+
+    #[tokio::test]
+    async fn web_transport_receive_modes_bound_chunks_and_preserve_compatibility_payloads() {
+        for mode in [1, 2] {
+            let identity = wtransport::Identity::self_signed(["localhost", "127.0.0.1"]).unwrap();
+            let hash = identity.certificate_chain().as_slice()[0].hash();
+            let server = wtransport::Endpoint::server(
+                wtransport::ServerConfig::builder()
+                    .with_bind_address(SocketAddr::from(([127, 0, 0, 1], 0)))
+                    .with_identity(identity)
+                    .build(),
+            )
+            .unwrap();
+            let client = wtransport::Endpoint::client(
+                wtransport::ClientConfig::builder()
+                    .with_bind_default()
+                    .with_server_certificate_hashes([hash])
+                    .build(),
+            )
+            .unwrap();
+            let url = format!("https://127.0.0.1:{}", server.local_addr().unwrap().port());
+            let (accepted, connected) = tokio::join!(
+                async { server.accept().await.await.unwrap().accept().await.unwrap() },
+                client.connect(&url)
+            );
+            let connected = connected.unwrap();
+            let sender = tokio::spawn(async move {
+                let mut stream = connected.open_uni().await.unwrap().await.unwrap();
+                stream.write_all(&vec![42; 128 * 1024]).await.unwrap();
+                stream.finish().await.unwrap();
+                connected
+            });
+            let receive = accepted.accept_uni().await.unwrap();
+            let session_id = NEXT_WEB_TRANSPORT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+            let (command_tx, _commands) = mpsc::unbounded_channel();
+            WEB_TRANSPORT_SESSIONS.lock().unwrap().insert(
+                session_id,
+                WebTransportSessionState {
+                    server_id: 0,
+                    connection: None,
+                    datagrams: VecDeque::new(),
+                    streams: VecDeque::new(),
+                    budget: IngressBudget::new(1, 256 * 1024),
+                    outgoing_budget: IngressBudget::new(1, 256 * 1024),
+                    stream_slots: IngressBudget::new(1, 0),
+                    max_pending_messages: 1,
+                    max_pending_bytes: 256 * 1024,
+                    command_tx,
+                },
+            );
+            register_web_transport_receive_stream(
+                session_id,
+                WebTransportStreamKind::IncomingUnidirectional,
+                receive,
+                None,
+                test_runtime_state(),
+                true,
+                1,
+                256 * 1024,
+            );
+            let stream_id = WEB_TRANSPORT_STREAMS
+                .lock()
+                .unwrap()
+                .values()
+                .find(|s| s.info.session_id == session_id)
+                .unwrap()
+                .info
+                .stream_id;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            assert!(dart_http_server_runtime_take_web_transport_stream_chunk(stream_id).is_null());
+            assert!(dart_http_server_runtime_web_transport_stream_receive_mode(
+                stream_id, mode
+            ));
+            assert!(!dart_http_server_runtime_web_transport_stream_receive_mode(
+                stream_id,
+                if mode == 1 { 2 } else { 1 }
+            ));
+            if mode == 2 {
+                let payload = tokio::time::timeout(Duration::from_secs(3), async {
+                    loop {
+                        let payload =
+                            dart_http_server_runtime_take_web_transport_stream(session_id);
+                        if !payload.is_null() {
+                            break payload as usize;
+                        }
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .unwrap() as *mut NativeWebTransportStream;
+                unsafe {
+                    assert_eq!(
+                        read_native_bytes((*payload).body).unwrap(),
+                        vec![42; 128 * 1024]
+                    );
+                }
+                dart_http_server_runtime_free_web_transport_stream(payload);
+            } else {
+                let mut bytes = Vec::new();
+                while bytes.len() < 128 * 1024 {
+                    let chunk = tokio::time::timeout(Duration::from_secs(3), async {
+                        loop {
+                            let chunk =
+                                dart_http_server_runtime_take_web_transport_stream_chunk(stream_id);
+                            if !chunk.is_null() {
+                                break chunk as usize;
+                            }
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                        }
+                    })
+                    .await
+                    .unwrap() as *mut NativeWebTransportStreamChunk;
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    assert!(
+                        dart_http_server_runtime_take_web_transport_stream_chunk(stream_id)
+                            .is_null(),
+                        "retained chunk must keep the one-message budget occupied"
+                    );
+                    unsafe {
+                        bytes.extend_from_slice(read_native_bytes((*chunk).body).unwrap());
+                    }
+                    dart_http_server_runtime_free_web_transport_stream_chunk(chunk);
+                }
+                assert_eq!(bytes, vec![42; 128 * 1024]);
+            }
+            dart_http_server_runtime_free_web_transport_stream_info(
+                dart_http_server_runtime_take_web_transport_stream_info(stream_id),
+            );
+            let terminal = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let terminal =
+                        dart_http_server_runtime_take_web_transport_stream_terminal(stream_id);
+                    if !terminal.is_null() {
+                        break terminal as usize;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap() as *mut NativeWebTransportStreamTerminal;
+            dart_http_server_runtime_free_web_transport_stream_terminal(terminal);
+            WEB_TRANSPORT_SESSIONS.lock().unwrap().remove(&session_id);
+            let connected = sender.await.unwrap();
+            connected.close(VarInt::from_u32(0), b"done");
+        }
+    }
+
+    #[test]
+    fn compiles_body_limits_and_rejects_invalid_configuration() {
+        assert_eq!(
+            compile_body_limit(r#"{"middlewares":[]}"#).unwrap(),
+            64 * 1024 * 1024
+        );
+        assert_eq!(
+            compile_body_limit(
+                r#"{"middlewares":[{"name":"bodyLimit","configuration":{"maxBytes":1024}}]}"#
+            )
+            .unwrap(),
+            1024
+        );
+        for value in [0, -1] {
+            assert!(compile_body_limit(&json!({"middlewares": [{"name": "bodyLimit", "configuration": {"maxBytes": value}}]}).to_string()).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn closed_ingress_budget_wakes_a_waiting_reader() {
+        let budget = IngressBudget::new(1, 4);
+        let permit = budget.try_reserve(4).unwrap();
+        let pending_budget = Arc::clone(&budget);
+        let waiting = tokio::spawn(async move { pending_budget.reserve(1).await });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        budget.close();
+        assert!(waiting.await.unwrap().is_none());
+        drop(permit);
+        assert_eq!(budget.usage.lock().unwrap().0, 0);
+    }
+
+    #[tokio::test]
+    async fn stream_credit_is_bounded_across_the_connection_and_wakes_other_streams() {
+        let root = IngressBudget::new(1, 4);
+        let slots = IngressBudget::new(2, 0);
+        let first = IngressBudget::with_parent(
+            2,
+            4,
+            slots.try_reserve(0).unwrap(),
+            Some(Arc::clone(&root)),
+        );
+        let second = IngressBudget::with_parent(
+            2,
+            4,
+            slots.try_reserve(0).unwrap(),
+            Some(Arc::clone(&root)),
+        );
+        let mut permit = first.try_reserve(1).unwrap();
+        assert!(permit.grow(3));
+        assert!(!permit.grow(1));
+        assert_eq!(root.usage.lock().unwrap().1, 4);
+        assert!(second.try_reserve(1).is_none());
+        let waiting_budget = Arc::clone(&second);
+        let waiting = tokio::spawn(async move { waiting_budget.reserve(4).await });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        drop(permit);
+        let next = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(root.usage.lock().unwrap().1, 4);
+        drop(next);
+        drop(first);
+        drop(second);
+        assert_eq!(slots.usage.lock().unwrap().0, 0);
+        assert_eq!(root.usage.lock().unwrap().1, 0);
+    }
+
+    #[test]
+    fn web_socket_write_capacity_lasts_until_completion() {
+        let session_id = NEXT_WEB_SOCKET_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+        let (close_tx, _close_rx) = watch::channel(None);
+        let budget = IngressBudget::new(1, 4);
+        WEB_SOCKET_SESSIONS.lock().unwrap().insert(
+            session_id,
+            WebSocketSessionState {
+                server_id: 0,
+                connection: None,
+                messages: VecDeque::new(),
+                budget: IngressBudget::new(1, 4),
+                command_tx,
+                close_tx,
+                outgoing_budget: Arc::clone(&budget),
+                runtime_state: test_runtime_state(),
+                peer_closed: false,
+                accepting_messages: true,
+            },
+        );
+        assert!(submit_web_socket_write(session_id, 4, || Message::Binary(vec![1; 4].into())) > 0);
+        let write = command_rx.try_recv().unwrap();
+        assert_eq!(
+            submit_web_socket_write(session_id, 1, || Message::Text("a".into())),
+            0
+        );
+        drop(write);
+        assert!(submit_web_socket_write(session_id, 1, || Message::Text("a".into())) > 0);
+        assert!(dart_http_server_runtime_web_socket_close(
+            session_id,
+            1000,
+            std::ptr::null()
+        ));
+        assert_eq!(
+            submit_web_socket_write(session_id, 1, || Message::Text("a".into())),
+            0
+        );
+        WEB_SOCKET_SESSIONS.lock().unwrap().remove(&session_id);
+    }
+
     #[test]
     fn binary_chunks_return_before_consumption_and_bound_in_flight_bytes() {
         let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
@@ -5056,14 +5779,7 @@ mod tests {
                 server_id: 0,
                 request: None,
                 response_tx,
-                runtime_state: ServerRuntimeState {
-                    server_id: 0,
-                    routes: Arc::new(Vec::new()),
-                    schemas: Arc::new(HashMap::new()),
-                    callback: unused_test_callback,
-                    native_stream_slots: Arc::new(Semaphore::new(1)),
-                    stream_stall_timeout: Duration::from_secs(1),
-                },
+                runtime_state: test_runtime_state(),
                 binary_chunk: None,
             },
         );
@@ -5316,19 +6032,20 @@ mod tests {
     async fn bounds_web_socket_ingress_by_count_and_bytes() {
         let session_id = NEXT_WEB_SOCKET_SESSION_ID.fetch_add(1, Ordering::Relaxed);
         let (command_tx, _command_rx) = mpsc::unbounded_channel();
+        let (close_tx, _close_rx) = watch::channel(None);
         WEB_SOCKET_SESSIONS.lock().unwrap().insert(
             session_id,
             WebSocketSessionState {
                 server_id: 1,
                 connection: None,
                 messages: VecDeque::new(),
-                pending_bytes: 0,
-                max_pending_messages: 1,
-                max_pending_bytes: 4,
+                budget: IngressBudget::new(1, 4),
                 command_tx,
+                close_tx,
+                outgoing_budget: IngressBudget::new(2, 1024),
+                runtime_state: test_runtime_state(),
                 peer_closed: false,
                 accepting_messages: true,
-                queue_space: Arc::new(Notify::new()),
             },
         );
 
@@ -5339,6 +6056,7 @@ mod tests {
                     session_id,
                     kind: WebSocketMessageKind::Binary,
                     body: vec![0; 4],
+                    permit: None,
                 },
             )
             .await
@@ -5350,6 +6068,7 @@ mod tests {
                 session_id,
                 kind: WebSocketMessageKind::Binary,
                 body: vec![1],
+                permit: None,
             },
         ));
         tokio::task::yield_now().await;
@@ -5357,6 +6076,11 @@ mod tests {
 
         let first = dart_http_server_runtime_take_web_socket_message(session_id);
         assert!(!first.is_null());
+        tokio::task::yield_now().await;
+        assert!(
+            !blocked.is_finished(),
+            "taking a frame must retain its reservation"
+        );
         dart_http_server_runtime_free_web_socket_message(first);
         assert!(blocked.await.unwrap());
 
@@ -5367,6 +6091,7 @@ mod tests {
                     session_id,
                     kind: WebSocketMessageKind::Binary,
                     body: vec![0; 5],
+                    permit: None,
                 },
             )
             .await
@@ -5378,7 +6103,7 @@ mod tests {
             .remove(&session_id)
             .unwrap();
         assert_eq!(session.messages.len(), 1);
-        assert_eq!(session.pending_bytes, 1);
+        assert_eq!(session.budget.usage.lock().unwrap().1, 1);
     }
 
     #[test]
@@ -5392,7 +6117,9 @@ mod tests {
                 connection: None,
                 datagrams: VecDeque::new(),
                 streams: VecDeque::new(),
-                pending_bytes: 0,
+                budget: IngressBudget::new(2, 4),
+                outgoing_budget: IngressBudget::new(2, 4),
+                stream_slots: IngressBudget::new(2, 0),
                 max_pending_messages: 2,
                 max_pending_bytes: 4,
                 command_tx,
@@ -5404,6 +6131,7 @@ mod tests {
             WebTransportIncomingDatagram {
                 session_id,
                 body: vec![0; 2],
+                permit: None,
             },
         ));
         assert!(push_web_transport_stream(
@@ -5411,6 +6139,7 @@ mod tests {
             WebTransportIncomingStream {
                 session_id,
                 body: vec![0; 2],
+                permit: None,
             },
         ));
         assert!(!push_web_transport_datagram(
@@ -5418,6 +6147,7 @@ mod tests {
             WebTransportIncomingDatagram {
                 session_id,
                 body: vec![0],
+                permit: None,
             },
         ));
 
@@ -5427,6 +6157,6 @@ mod tests {
             .remove(&session_id)
             .unwrap();
         assert_eq!(session.datagrams.len() + session.streams.len(), 2);
-        assert_eq!(session.pending_bytes, 4);
+        assert_eq!(session.budget.usage.lock().unwrap().1, 4);
     }
 }

@@ -1,4 +1,9 @@
+import 'dart:async';
+import 'dart:collection';
 import 'dart:convert';
+import 'dart:ffi';
+import 'dart:isolate';
+import 'dart:typed_data';
 
 import 'package:dart_http_core/dart_http_core.dart';
 
@@ -6,6 +11,66 @@ import 'dart_http_codec.dart';
 import 'json_schema_route_id.dart';
 import 'native_request.dart';
 import 'transport_request.dart';
+
+final class RequestDecodeCapacityException implements Exception {
+  const RequestDecodeCapacityException();
+}
+
+// Native inputs remain borrowed until the worker exits. There is deliberately
+// no timeout that could release a request while an isolate still reads it.
+final _bodyDecodeAdmission = _BodyDecodeAdmission();
+
+final class _BodyDecodeAdmission {
+  final _waiting = Queue<Completer<void>>();
+  var _active = 0;
+  var _bytes = 0;
+
+  Future<Object?> run(int bytes, Future<Object?> Function() operation) async {
+    if (bytes > 256 * 1024 * 1024 - _bytes || (_active >= 2 && _waiting.length >= 16)) {
+      throw const RequestDecodeCapacityException();
+    }
+    _bytes += bytes;
+    if (_active >= 2) {
+      final ready = Completer<void>();
+      _waiting.add(ready);
+      await ready.future;
+    } else {
+      _active++;
+    }
+    try {
+      return await operation();
+    } finally {
+      _bytes -= bytes;
+      if (_waiting.isEmpty) {
+        _active--;
+      } else {
+        _waiting.removeFirst().complete();
+      }
+    }
+  }
+}
+
+Object? _parseBodyBytes(Uint8List bytes, int mode) {
+  final text = utf8.decode(bytes);
+  return switch (mode) {
+    1 => jsonDecode(text),
+    2 => Uri.splitQueryString(text),
+    _ => text,
+  };
+}
+
+Future<Object?> _parseNativeBody(int address, int length, int mode) => _bodyDecodeAdmission.run(
+  length,
+  () => Isolate.run(
+    () => _parseBodyBytes(Pointer<Uint8>.fromAddress(address).asTypedList(length), mode),
+  ),
+);
+
+Future<Object?> _parseManagedBody(TransferableTypedData bytes, int length, int mode) =>
+    _bodyDecodeAdmission.run(
+      length,
+      () => Isolate.run(() => _parseBodyBytes(bytes.materialize().asUint8List(), mode)),
+    );
 
 /// A malformed HTTP request value rejected before route handling.
 final class RequestDecodingException implements Exception {
@@ -128,20 +193,27 @@ Future<Object?> _decodeBody(
     return decoder(form.toMultipartFormData());
   }
 
-  final payload = request.bodyBytes;
-  if (payload == null || payload.isEmpty) {
-    return null;
-  }
-
-  final decoded = switch (request.bodyKind) {
-    TransportRequestBodyKind.json => jsonDecode(utf8.decode(payload)),
-    _ when body.contentType.startsWith('application/json') => jsonDecode(utf8.decode(payload)),
-    _ when body.contentType.startsWith('application/x-www-form-urlencoded') => Uri.splitQueryString(
-      utf8.decode(payload),
-    ),
-    _ when body.isBinary => payload,
-    _ => utf8.decode(payload),
+  final mode = switch (request.bodyKind) {
+    TransportRequestBodyKind.json => 1,
+    _ when body.contentType.startsWith('application/json') => 1,
+    _ when body.contentType.startsWith('application/x-www-form-urlencoded') => 2,
+    _ when body.isBinary => -1,
+    _ => 0,
   };
+  final nativeBody = request.nativeBody;
+  final Object? decoded;
+  if (mode >= 0 && nativeBody != null && nativeBody.length >= 64 * 1024) {
+    final bytes = nativeBody.nativeBytes;
+    decoded = await _parseNativeBody(bytes.ptr.address, bytes.len, mode);
+  } else {
+    final payload = request.bodyBytes;
+    if (payload == null || payload.isEmpty) return null;
+    decoded = mode == -1
+        ? payload
+        : payload.length >= 64 * 1024
+        ? await _parseManagedBody(TransferableTypedData.fromList([payload]), payload.length, mode)
+        : _parseBodyBytes(payload, mode);
+  }
 
   if (body.decoder case final decoder?) {
     return decoder(decoded);

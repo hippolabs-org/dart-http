@@ -28,6 +28,16 @@ final class RuntimeNativeBinaryPayloadLease implements BinaryPayloadLease, Nativ
   final int _length;
   final void Function() _release;
   var _isClosed = false;
+  final _closeListeners = <void Function()>[];
+
+  /// Registers bounded lifetime bookkeeping without scanning other leases.
+  void onClose(void Function() listener) {
+    if (_isClosed) {
+      listener();
+    } else {
+      _closeListeners.add(listener);
+    }
+  }
 
   /// Borrowed pointer to the payload.
   ///
@@ -74,7 +84,14 @@ final class RuntimeNativeBinaryPayloadLease implements BinaryPayloadLease, Nativ
     if (_isClosed) return;
     _isClosed = true;
     _bytesPtr = nullptr;
-    _release();
+    try {
+      _release();
+    } finally {
+      for (final listener in _closeListeners) {
+        listener();
+      }
+      _closeListeners.clear();
+    }
   }
 
   void _ensureOpen() {

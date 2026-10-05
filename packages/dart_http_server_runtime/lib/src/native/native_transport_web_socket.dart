@@ -29,11 +29,13 @@ final class NativeWebSocketMessage {
     required this.kind,
     this.body,
     this.bodyLease,
+    this.release,
   });
 
   final int sessionId;
   final NativeWebSocketMessageKind kind;
   final Uint8List? body;
+  final void Function()? release;
   final core_ffi.RuntimeNativeBinaryPayloadLease? bodyLease;
 }
 
@@ -63,6 +65,7 @@ NativeWebSocketMessage decodeNativeWebSocketMessage(
       sessionId: message.session_id,
       kind: NativeWebSocketMessageKind.text,
       body: core_ffi.maybeCopyNativeBytes(message.body) ?? Uint8List(0),
+      release: release,
     ),
     2 => NativeWebSocketMessage(
       sessionId: message.session_id,

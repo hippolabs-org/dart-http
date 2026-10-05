@@ -1,3 +1,18 @@
+## 0.3.52
+
+- Retain realtime ingress reservations until native payload leases close, respect
+  paused Dart listeners, and yield between deliveries. Replace repeated lease
+  scans with constant-time release callbacks.
+- Await WebSocket writes asynchronously with bounded message/byte admission and
+  a configurable 30-second write timeout. Keep reads and close handling independent.
+- Bound WebTransport stream admission and pending writes; select compatibility
+  payloads or persistent chunks when their consumer subscribes.
+- Enforce request body limits before parsing, including streamed/chunked uploads.
+  Default to 64 MiB; configure larger uploads with `RustMiddleware.bodyLimit`.
+- Validate large buffered bodies on native blocking workers instead of I/O threads.
+  Decode large JSON/text/form bodies on bounded Dart workers instead of the request isolate.
+- Bump native artifacts to 0.1.31 and native ABI to 22.
+
 ## 0.3.51
 
 - Await binary response chunk consumption asynchronously so a paused client cannot

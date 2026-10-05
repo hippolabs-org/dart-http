@@ -260,3 +260,35 @@ hand.
 cd packages/dart_http_server_runtime
 dart run ffigen --config tool/ffigen.yaml
 ```
+
+## Streaming limits and scheduling
+
+WebSocket and WebTransport ingress limits follow native payload ownership.
+Taking a binary frame does not free capacity: consume or close its lease to let
+more frames arrive. Pausing a Dart subscription stops native dequeueing, and
+frame delivery yields to other Dart requests. WebTransport persistent stream
+slots remain occupied while their chunk leases are retained. Persistent chunks
+also share the connection-wide ingress budget.
+
+WebSocket `sendText`, `sendBinary`, and leased sends complete after the socket
+write flushes. Await sends to apply backpressure. Concurrent callers share a
+32-message / 8-MiB admission budget by default; excess sends fail immediately.
+Configure `webSocketMaxPendingMessages`, `webSocketMaxPendingBytes`, and
+`webSocketWriteStallTimeout` on `listen`. A stalled write expires after 30 seconds
+by default; reads and local close commands continue independently.
+
+WebTransport incoming unidirectional streams support either complete compatibility
+payloads (`streams`) or persistent chunks (`incomingUnidirectional`). Subscribe to
+the desired receive API before sending data; the first consumer chooses the mode.
+The runtime does not retain an unused duplicate of the same stream. Persistent
+stream writes have a bounded Dart queue and native write timeout.
+
+Request bodies default to a 64-MiB limit. Set
+`RustMiddleware.bodyLimit(maxBytes: ...)` to change it. Declared oversized uploads
+receive HTTP 413 before Dart dispatch. Chunked bodies are capped while read; if a
+streaming response has already sent its headers, an upload limit violation aborts
+that response body. Buffered bodies of at least 64 KiB parse and validate on native
+blocking workers, preserving I/O scheduling. Dart JSON, text and URL-encoded body
+decoding uses separate workers above the same threshold: two active jobs, sixteen
+queued jobs and a 256-MiB aggregate input budget. Exhausted decoding admission
+returns HTTP 503. Route-specific model decoders still run in the request isolate.

@@ -120,6 +120,9 @@ int64_t dart_http_server_runtime_start_server(
     int64_t worker_count,
     int64_t native_stream_worker_count,
     int64_t stream_stall_timeout_ms,
+    int64_t web_socket_max_pending_messages,
+    int64_t web_socket_max_pending_bytes,
+    int64_t web_socket_write_stall_timeout_ms,
     const char* routes_json,
     const char* middlewares_json,
     dart_http_server_runtime_transport_event_callback_t callback);
@@ -234,6 +237,9 @@ NativeWebTransportStreamInfo* dart_http_server_runtime_take_web_transport_stream
 void dart_http_server_runtime_free_web_transport_stream_info(
     NativeWebTransportStreamInfo* value);
 
+/** Select persistent chunks (1) or a complete compatibility payload (2). */
+bool dart_http_server_runtime_web_transport_stream_receive_mode(int64_t stream_id, uint8_t mode);
+
 NativeWebTransportStreamChunk* dart_http_server_runtime_take_web_transport_stream_chunk(
     int64_t stream_id);
 
@@ -286,11 +292,11 @@ bool dart_http_server_runtime_web_transport_close(
     int32_t code,
     const char* reason);
 
-bool dart_http_server_runtime_web_socket_send_text(
+int64_t dart_http_server_runtime_web_socket_send_text(
     int64_t session_id,
     const char* text);
 
-bool dart_http_server_runtime_web_socket_send_binary(
+int64_t dart_http_server_runtime_web_socket_send_binary(
     int64_t session_id,
     NativeBytes body);
 

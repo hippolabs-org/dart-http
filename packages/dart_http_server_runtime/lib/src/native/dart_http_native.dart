@@ -64,10 +64,16 @@ abstract final class DartHttpNative {
     required int workers,
     required int nativeStreamWorkers,
     required Duration streamStallTimeout,
+    required int webSocketMaxPendingMessages,
+    required int webSocketMaxPendingBytes,
+    required Duration webSocketWriteStallTimeout,
     required String routesJson,
     required String middlewaresJson,
     required Pointer<NativeFunction<NativeTransportEvent>> callback,
   }) {
+    if (abiVersion != 22) {
+      throw StateError('Dart HTTP runtime requires native ABI 22; loaded $abiVersion.');
+    }
     final hostPtr = host.toNativeUtf8();
     final routesJsonPtr = routesJson.toNativeUtf8();
     final middlewaresJsonPtr = middlewaresJson.toNativeUtf8();
@@ -79,6 +85,9 @@ abstract final class DartHttpNative {
         workers,
         nativeStreamWorkers,
         streamStallTimeout.inMilliseconds,
+        webSocketMaxPendingMessages,
+        webSocketMaxPendingBytes,
+        webSocketWriteStallTimeout.inMilliseconds,
         routesJsonPtr.cast<Char>(),
         middlewaresJsonPtr.cast<Char>(),
         callback,
@@ -130,7 +139,7 @@ abstract final class DartHttpNative {
     List<HttpHeader> headers = const <HttpHeader>[],
   }) {
     final contentTypePtr = contentType.toNativeUtf8();
-    final bytes = Uint8List.fromList(body);
+    final bytes = body is Uint8List ? body : Uint8List.fromList(body);
     final bodyPtr = calloc<Uint8>(bytes.length);
     final nativeBytesPtr = calloc<core_ffi.NativeBytes>();
     try {
@@ -322,7 +331,7 @@ abstract final class DartHttpNative {
         messagePtr,
         release: () => gen.dart_http_server_runtime_free_web_socket_message(messagePtr),
       );
-      transferred = message.bodyLease != null;
+      transferred = message.bodyLease != null || message.release != null;
       return message;
     } finally {
       if (!transferred) {
@@ -396,6 +405,9 @@ abstract final class DartHttpNative {
     }
   }
 
+  static bool webTransportStreamReceiveMode(int streamId, int mode) =>
+      gen.dart_http_server_runtime_web_transport_stream_receive_mode(streamId, mode);
+
   static NativeWebTransportStreamChunk? takeWebTransportStreamChunk(int streamId) {
     final chunkPtr = gen.dart_http_server_runtime_take_web_transport_stream_chunk(streamId);
     if (chunkPtr == nullptr) return null;
@@ -431,7 +443,7 @@ abstract final class DartHttpNative {
   }
 
   /// Sends a text frame over an active WebSocket session.
-  static bool webSocketSendText(int sessionId, String text) {
+  static int webSocketSendText(int sessionId, String text) {
     final textPtr = text.toNativeUtf8();
     try {
       return gen.dart_http_server_runtime_web_socket_send_text(sessionId, textPtr.cast<Char>());
@@ -441,8 +453,8 @@ abstract final class DartHttpNative {
   }
 
   /// Sends a binary frame over an active WebSocket session.
-  static bool webSocketSendBinary(int sessionId, List<int> body) {
-    final bytes = Uint8List.fromList(body);
+  static int webSocketSendBinary(int sessionId, List<int> body) {
+    final bytes = body is Uint8List ? body : Uint8List.fromList(body);
     final bodyPtr = calloc<Uint8>(bytes.length);
     final nativeBytesPtr = calloc<core_ffi.NativeBytes>();
     try {
@@ -461,7 +473,7 @@ abstract final class DartHttpNative {
   ///
   /// The runtime copies the bytes into its outbound WebSocket frame before
   /// this method returns and does not retain [bodyPtr].
-  static bool webSocketSendNativeBinary(
+  static int webSocketSendNativeBinary(
     int sessionId, {
     required Pointer<Uint8> bodyPtr,
     required int bodyLength,
@@ -568,7 +580,7 @@ abstract final class DartHttpNative {
   }
 
   static T _withNativeBody<T>(List<int> body, T Function(core_ffi.NativeBytes body) run) {
-    final bytes = Uint8List.fromList(body);
+    final bytes = body is Uint8List ? body : Uint8List.fromList(body);
     final bodyPtr = calloc<Uint8>(bytes.length);
     final nativeBytesPtr = calloc<core_ffi.NativeBytes>();
     try {

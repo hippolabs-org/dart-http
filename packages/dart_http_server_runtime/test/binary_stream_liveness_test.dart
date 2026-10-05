@@ -166,7 +166,7 @@ final class _PausedConnection {
     });
     socket.write(
       '${upload ? 'POST' : 'GET'} $path HTTP/1.1\r\nHost: localhost\r\n'
-      'Connection: close\r\n${upload ? 'Content-Type: application/octet-stream\r\nContent-Length: 536870912\r\n' : ''}\r\n',
+      'Connection: close\r\n${upload ? 'Content-Type: application/octet-stream\r\nContent-Length: 16777216\r\n' : ''}\r\n',
     );
     if (upload) socket.add(Uint8List(64 * 1024));
     await socket.flush();
