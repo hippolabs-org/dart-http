@@ -118,6 +118,8 @@ int64_t dart_http_server_runtime_start_server(
     const char* host,
     int64_t port,
     int64_t worker_count,
+    int64_t native_stream_worker_count,
+    int64_t stream_stall_timeout_ms,
     const char* routes_json,
     const char* middlewares_json,
     dart_http_server_runtime_transport_event_callback_t callback);
@@ -164,9 +166,12 @@ bool dart_http_server_runtime_start_binary_stream_response(
     intptr_t header_count,
     const NativePair* headers);
 
-bool dart_http_server_runtime_send_binary_stream_chunk(
+/** Starts one bounded chunk; signed completion IDs arrive as transport event 13. */
+int64_t dart_http_server_runtime_start_binary_stream_chunk(
     int64_t request_id,
     NativeBytes chunk);
+
+void dart_http_server_runtime_abort_binary_stream_response(int64_t request_id);
 
 bool dart_http_server_runtime_finish_binary_stream_response(
     int64_t request_id);

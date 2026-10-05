@@ -23,6 +23,8 @@ dependency_overrides:
 
 hooks:
   user_defines:
+    dart_http_server_runtime:
+      build_from_source: true
     dart_http_native_client:
       build_from_source: true
 

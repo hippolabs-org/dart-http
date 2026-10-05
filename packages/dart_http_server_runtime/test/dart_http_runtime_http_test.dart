@@ -229,6 +229,7 @@ void main() {
   test('streams binary responses in order with a content length', () async {
     final app = DartHttp<void>(services: () {});
     var disposeCount = 0;
+    final disposed = Completer<void>();
     final chunks = <List<int>>[
       [0, 255],
       [1, 2, 128],
@@ -247,6 +248,7 @@ void main() {
         headers: const [HttpHeader('Content-Disposition', 'attachment; filename="tone.wav"')],
         onDispose: () {
           disposeCount += 1;
+          if (!disposed.isCompleted) disposed.complete();
         },
       ),
     );
@@ -273,6 +275,7 @@ void main() {
       128,
       3,
     ]);
+    await disposed.future.timeout(const Duration(seconds: 2));
     expect(disposeCount, 1);
   });
 

@@ -62,6 +62,8 @@ abstract final class DartHttpNative {
     String host,
     int port, {
     required int workers,
+    required int nativeStreamWorkers,
+    required Duration streamStallTimeout,
     required String routesJson,
     required String middlewaresJson,
     required Pointer<NativeFunction<NativeTransportEvent>> callback,
@@ -75,6 +77,8 @@ abstract final class DartHttpNative {
         hostPtr.cast<Char>(),
         port,
         workers,
+        nativeStreamWorkers,
+        streamStallTimeout.inMilliseconds,
         routesJsonPtr.cast<Char>(),
         middlewaresJsonPtr.cast<Char>(),
         callback,
@@ -228,11 +232,9 @@ abstract final class DartHttpNative {
     }
   }
 
-  /// Sends one binary chunk and returns after the native body stream accepts it.
-  static bool sendBinaryStreamChunk(int requestId, List<int> chunk) {
-    if (chunk.isEmpty) {
-      return true;
-    }
+  /// Starts one bounded chunk without waiting on the Dart isolate.
+  /// Transport event 13 acknowledges consumption or cancellation.
+  static int startBinaryStreamChunk(int requestId, List<int> chunk) {
     final bytes = chunk is Uint8List ? chunk : Uint8List.fromList(chunk);
     final bodyPtr = calloc<Uint8>(bytes.length);
     final nativeBytesPtr = calloc<core_ffi.NativeBytes>();
@@ -241,11 +243,15 @@ abstract final class DartHttpNative {
       nativeBytesPtr.ref
         ..ptr = bodyPtr
         ..len = bytes.length;
-      return gen.dart_http_server_runtime_send_binary_stream_chunk(requestId, nativeBytesPtr.ref);
+      return gen.dart_http_server_runtime_start_binary_stream_chunk(requestId, nativeBytesPtr.ref);
     } finally {
       calloc.free(nativeBytesPtr);
       calloc.free(bodyPtr);
     }
+  }
+
+  static void abortBinaryStreamResponse(int requestId) {
+    gen.dart_http_server_runtime_abort_binary_stream_response(requestId);
   }
 
   /// Finishes an active binary streaming response.

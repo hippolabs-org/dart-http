@@ -9,8 +9,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString, c_char};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::mpsc as std_mpsc;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -42,14 +41,16 @@ use once_cell::sync::Lazy;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::net::TcpListener;
-use tokio::sync::{Notify, mpsc, watch};
+use tokio::sync::{Notify, Semaphore, mpsc, watch};
 use tower_http::cors::{Any, CorsLayer};
 use wtransport::{
     Connection as WebTransportConnection, Endpoint as WebTransportEndpoint, Identity,
     ServerConfig as WebTransportServerConfig, VarInt,
 };
 
-const DART_HTTP_SERVER_RUNTIME_NATIVE_ABI_VERSION: i32 = 20;
+const DART_HTTP_SERVER_RUNTIME_NATIVE_ABI_VERSION: i32 = 21;
+const MAX_BINARY_STREAM_CHUNK_BYTES: usize = 64 * 1024;
+const RESERVED_BLOCKING_WORKERS: usize = 16;
 const SCHEMA_REGISTRY_URI: &str = "urn:dart-http:schema-registry";
 const DEFAULT_REALTIME_MAX_PENDING_MESSAGES: usize = 256;
 const DEFAULT_REALTIME_MAX_PENDING_BYTES: usize = 8 * 1024 * 1024;
@@ -58,6 +59,7 @@ const REALTIME_OVERLOAD_CODE: u32 = 0x100;
 type TransportEventCallback = extern "C" fn(i32, i64);
 
 static NEXT_REQUEST_ID: AtomicI64 = AtomicI64::new(1);
+static NEXT_BINARY_CHUNK_ID: AtomicI64 = AtomicI64::new(1);
 static NEXT_SERVER_ID: AtomicI64 = AtomicI64::new(1);
 static NEXT_WEB_SOCKET_SESSION_ID: AtomicI64 = AtomicI64::new(1);
 static NEXT_WEB_TRANSPORT_SESSION_ID: AtomicI64 = AtomicI64::new(1);
@@ -83,6 +85,8 @@ struct PendingRequest {
     server_id: i64,
     request: Option<TransportRequest>,
     response_tx: mpsc::UnboundedSender<PendingResponseMessage>,
+    runtime_state: ServerRuntimeState,
+    binary_chunk: Option<Arc<BinaryChunkCompletion>>,
 }
 
 struct ServerState {
@@ -96,6 +100,8 @@ struct ServerRuntimeState {
     routes: Arc<Vec<CompiledRoute>>,
     schemas: Arc<HashMap<String, jsonschema::Validator>>,
     callback: TransportEventCallback,
+    native_stream_slots: Arc<Semaphore>,
+    stream_stall_timeout: Duration,
 }
 
 #[repr(C)]
@@ -344,7 +350,7 @@ enum PendingResponseMessage {
     },
     BinaryChunk {
         bytes: Vec<u8>,
-        consumed_tx: std_mpsc::SyncSender<()>,
+        completion: BinaryChunkAcknowledgement,
     },
     NativeBinaryStart {
         status: u16,
@@ -359,13 +365,71 @@ enum PendingResponseMessage {
     Close,
 }
 
-struct CancelNativeResponseOnDrop(Option<StreamCancelHandle>);
+struct BinaryChunkCompletion {
+    operation_id: i64,
+    request_id: i64,
+    runtime_state: ServerRuntimeState,
+    completed: AtomicBool,
+}
+
+impl BinaryChunkCompletion {
+    fn complete(&self, consumed: bool) {
+        if self.completed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(request) = PENDING_REQUESTS.lock().unwrap().get_mut(&self.request_id)
+            && request
+                .binary_chunk
+                .as_ref()
+                .is_some_and(|chunk| chunk.operation_id == self.operation_id)
+        {
+            request.binary_chunk = None;
+        }
+        notify_transport_event(
+            &self.runtime_state,
+            TransportEventKind::BinaryStreamChunkCompleted,
+            if consumed {
+                self.operation_id
+            } else {
+                -self.operation_id
+            },
+        );
+    }
+}
+
+struct BinaryChunkAcknowledgement(Arc<BinaryChunkCompletion>);
+
+impl Drop for BinaryChunkAcknowledgement {
+    fn drop(&mut self) {
+        self.0.complete(false);
+    }
+}
+
+struct BinaryResponseLifetime {
+    request_id: i64,
+    runtime_state: ServerRuntimeState,
+}
+
+impl Drop for BinaryResponseLifetime {
+    fn drop(&mut self) {
+        cancel_binary_response(self.request_id);
+        notify_transport_event(
+            &self.runtime_state,
+            TransportEventKind::BinaryStreamClosed,
+            self.request_id,
+        );
+    }
+}
+
+struct CancelNativeResponseOnDrop {
+    cancel: StreamCancelHandle,
+    stopped: watch::Sender<bool>,
+}
 
 impl Drop for CancelNativeResponseOnDrop {
     fn drop(&mut self) {
-        if let Some(cancel) = self.0.take() {
-            cancel.cancel();
-        }
+        self.stopped.send_replace(true);
+        self.cancel.cancel();
     }
 }
 
@@ -373,26 +437,47 @@ fn run_native_response_worker(
     stream: AdoptedByteStream,
     sender: mpsc::Sender<Result<Bytes, std::io::Error>>,
     content_length: Option<u64>,
+    mut stopped: watch::Receiver<bool>,
+    progress: watch::Sender<tokio::time::Instant>,
+    runtime: tokio::runtime::Handle,
 ) {
+    let send = |result, stopped: &mut watch::Receiver<bool>| {
+        runtime.block_on(async {
+            tokio::select! {
+                biased;
+                _ = stopped.wait_for(|stopped| *stopped) => false,
+                sent = sender.send(result) => sent.is_ok(),
+            }
+        })
+    };
     let reader = stream.reader();
     let mut remaining = content_length;
     loop {
+        if *stopped.borrow() {
+            return;
+        }
         match reader.read_next() {
             Ok(StreamRead::Chunk(buffer)) => {
                 let bytes = buffer.into_bytes();
                 if let Some(bytes_remaining) = remaining.as_mut() {
                     let chunk_length = bytes.len() as u64;
                     if chunk_length > *bytes_remaining {
-                        let _ = sender.blocking_send(Err(std::io::Error::other(format!(
-                            "Native response exceeded its declared content length by {} bytes.",
-                            chunk_length - *bytes_remaining
-                        ))));
+                        let _ = send(
+                            Err(std::io::Error::other(format!(
+                                "Native response exceeded its declared content length by {} bytes.",
+                                chunk_length - *bytes_remaining
+                            ))),
+                            &mut stopped,
+                        );
                         return;
                     }
                     *bytes_remaining -= chunk_length;
                 }
-                if !bytes.is_empty() && sender.blocking_send(Ok(bytes)).is_err() {
-                    return;
+                if !bytes.is_empty() {
+                    if !send(Ok(bytes), &mut stopped) {
+                        return;
+                    }
+                    progress.send_replace(tokio::time::Instant::now());
                 }
                 if remaining == Some(0) {
                     stream.mark_complete();
@@ -403,15 +488,18 @@ fn run_native_response_worker(
                 if let Some(bytes_remaining) = remaining
                     && bytes_remaining != 0
                 {
-                    let _ = sender.blocking_send(Err(std::io::Error::other(format!(
-                        "Native response ended with {bytes_remaining} declared bytes remaining."
-                    ))));
+                    let _ = send(
+                        Err(std::io::Error::other(format!(
+                            "Native response ended with {bytes_remaining} declared bytes remaining."
+                        ))),
+                        &mut stopped,
+                    );
                 }
                 return;
             }
             Ok(StreamRead::Canceled) => return,
             Err(error) => {
-                let _ = sender.blocking_send(Err(std::io::Error::other(error)));
+                let _ = send(Err(std::io::Error::other(error)), &mut stopped);
                 return;
             }
         }
@@ -949,6 +1037,8 @@ enum TransportEventKind {
     WebTransportStreamChunkReady = 10,
     WebTransportStreamFinished = 11,
     WebTransportOperationReady = 12,
+    BinaryStreamChunkCompleted = 13,
+    BinaryStreamClosed = 14,
 }
 
 #[unsafe(no_mangle)]
@@ -961,6 +1051,8 @@ pub extern "C" fn dart_http_server_runtime_start_server(
     host: *const c_char,
     port: i64,
     worker_count: i64,
+    native_stream_worker_count: i64,
+    stream_stall_timeout_ms: i64,
     routes_json: *const c_char,
     middlewares_json: *const c_char,
     callback: TransportEventCallback,
@@ -996,6 +1088,8 @@ pub extern "C" fn dart_http_server_runtime_start_server(
         routes: Arc::new(compiled_manifest.routes),
         schemas: Arc::new(compiled_manifest.schemas),
         callback,
+        native_stream_slots: Arc::new(Semaphore::new(native_stream_worker_count.max(1) as usize)),
+        stream_stall_timeout: Duration::from_millis(stream_stall_timeout_ms.max(1) as u64),
     };
 
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -1005,7 +1099,8 @@ pub extern "C" fn dart_http_server_runtime_start_server(
     let worker_count = worker_count.max(1) as usize;
 
     let join_handle = thread::spawn(move || {
-        let runtime = match build_runtime(worker_count) {
+        let runtime = match build_runtime(worker_count, native_stream_worker_count.max(1) as usize)
+        {
             Ok(runtime) => runtime,
             Err(error) => {
                 let _ = ready_tx.send(Err(error.to_string()));
@@ -1322,25 +1417,58 @@ pub extern "C" fn dart_http_server_runtime_start_binary_stream_response(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn dart_http_server_runtime_send_binary_stream_chunk(
+pub extern "C" fn dart_http_server_runtime_start_binary_stream_chunk(
     request_id: i64,
     chunk: NativeBytes,
-) -> bool {
+) -> i64 {
     let Some(chunk) = (unsafe { read_native_bytes(chunk) }) else {
-        return false;
+        return 0;
     };
-    let (consumed_tx, consumed_rx) = std_mpsc::sync_channel(0);
-    if !send_pending_response_message(
-        request_id,
-        PendingResponseMessage::BinaryChunk {
-            bytes: chunk.to_vec(),
-            consumed_tx,
-        },
-        false,
-    ) {
-        return false;
+    if chunk.len() > MAX_BINARY_STREAM_CHUNK_BYTES {
+        return 0;
     }
-    consumed_rx.recv().is_ok()
+    let (response_tx, completion) = {
+        let mut pending = PENDING_REQUESTS.lock().unwrap();
+        let Some(request) = pending.get_mut(&request_id) else {
+            return 0;
+        };
+        if request.binary_chunk.is_some() {
+            return 0;
+        }
+        let completion = Arc::new(BinaryChunkCompletion {
+            operation_id: NEXT_BINARY_CHUNK_ID.fetch_add(1, Ordering::Relaxed),
+            request_id,
+            runtime_state: request.runtime_state.clone(),
+            completed: AtomicBool::new(false),
+        });
+        request.binary_chunk = Some(completion.clone());
+        (request.response_tx.clone(), completion)
+    };
+    let operation_id = completion.operation_id;
+    let message = PendingResponseMessage::BinaryChunk {
+        bytes: chunk.to_vec(),
+        completion: BinaryChunkAcknowledgement(completion),
+    };
+    if response_tx.send(message).is_ok() {
+        operation_id
+    } else {
+        0
+    }
+}
+
+fn cancel_binary_response(request_id: i64) {
+    let request = { PENDING_REQUESTS.lock().unwrap().remove(&request_id) };
+    if let Some(request) = request {
+        if let Some(chunk) = request.binary_chunk {
+            chunk.complete(false);
+        }
+        let _ = request.response_tx.send(PendingResponseMessage::Close);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn dart_http_server_runtime_abort_binary_stream_response(request_id: i64) {
+    cancel_binary_response(request_id);
 }
 
 #[unsafe(no_mangle)]
@@ -2260,7 +2388,7 @@ async fn handle_http_request(
         body_kind: body.kind,
     };
 
-    let (_request_id, mut response_rx) =
+    let (request_id, mut response_rx) =
         match dispatch_request_to_dart(transport_request, runtime_state) {
             Ok(value) => value,
             Err(error_response) => return error_response,
@@ -2311,11 +2439,16 @@ async fn handle_http_request(
                     content_length.to_string(),
                 ));
             }
+            let lifetime = BinaryResponseLifetime {
+                request_id,
+                runtime_state: runtime_state.clone(),
+            };
             let stream = async_stream::stream! {
+                let _lifetime = lifetime;
                 while let Some(message) = response_rx.recv().await {
                     match message {
-                        PendingResponseMessage::BinaryChunk { bytes, consumed_tx } => {
-                            let _ = consumed_tx.send(());
+                        PendingResponseMessage::BinaryChunk { bytes, completion } => {
+                            completion.0.complete(true);
                             yield Ok::<Bytes, std::convert::Infallible>(Bytes::from(bytes));
                         }
                         PendingResponseMessage::Close => break,
@@ -2352,12 +2485,54 @@ async fn handle_http_request(
             let cancel = stream
                 .cancel_handle()
                 .expect("native HTTP response streams require concurrent cancellation");
+            let Ok(slot) = runtime_state
+                .native_stream_slots
+                .clone()
+                .try_acquire_owned()
+            else {
+                return response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "text/plain; charset=utf-8",
+                    "Native response reader capacity exhausted".to_string(),
+                );
+            };
             let (sender, mut receiver) = mpsc::channel(1);
+            let (stopped_tx, stopped_rx) = watch::channel(false);
+            let (progress_tx, mut progress_rx) = watch::channel(tokio::time::Instant::now());
+            let cancel_on_drop = CancelNativeResponseOnDrop {
+                cancel: cancel.clone(),
+                stopped: stopped_tx.clone(),
+            };
+            let mut monitor_stopped = stopped_rx.clone();
+            let stall_timeout = runtime_state.stream_stall_timeout;
+            tokio::spawn(async move {
+                loop {
+                    let deadline = *progress_rx.borrow_and_update() + stall_timeout;
+                    tokio::select! {
+                        _ = monitor_stopped.wait_for(|stopped| *stopped) => break,
+                        changed = progress_rx.changed() => if changed.is_err() { break; },
+                        _ = tokio::time::sleep_until(deadline) => {
+                            stopped_tx.send_replace(true);
+                            cancel.cancel();
+                            break;
+                        }
+                    }
+                }
+            });
+            let runtime = tokio::runtime::Handle::current();
             tokio::task::spawn_blocking(move || {
-                run_native_response_worker(stream, sender, content_length)
+                let _slot = slot;
+                run_native_response_worker(
+                    stream,
+                    sender,
+                    content_length,
+                    stopped_rx,
+                    progress_tx,
+                    runtime,
+                )
             });
             let stream = async_stream::stream! {
-                let _cancel_on_drop = CancelNativeResponseOnDrop(Some(cancel));
+                let _cancel_on_drop = cancel_on_drop;
                 while let Some(result) = receiver.recv().await {
                     yield result;
                 }
@@ -3056,6 +3231,8 @@ fn dispatch_request_to_dart(
                 server_id: runtime_state.server_id,
                 request: Some(transport_request),
                 response_tx,
+                runtime_state: runtime_state.clone(),
+                binary_chunk: None,
             },
         );
     }
@@ -3107,11 +3284,10 @@ fn notify_transport_event(
     event_kind: TransportEventKind,
     event_id: i64,
 ) -> bool {
-    if !SERVER_STATES
-        .lock()
-        .unwrap()
-        .contains_key(&runtime_state.server_id)
-    {
+    // Keep callback invocation and server removal mutually exclusive. Native
+    // listener callbacks only enqueue into Dart and cannot re-enter this lock.
+    let servers = SERVER_STATES.lock().unwrap();
+    if !servers.contains_key(&runtime_state.server_id) {
         return false;
     }
 
@@ -3966,9 +4142,13 @@ fn ensure_schema_exists(
     }
 }
 
-fn build_runtime(worker_count: usize) -> Result<tokio::runtime::Runtime, std::io::Error> {
+fn build_runtime(
+    worker_count: usize,
+    native_stream_workers: usize,
+) -> Result<tokio::runtime::Runtime, std::io::Error> {
     if worker_count == 1 {
         return tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(native_stream_workers + RESERVED_BLOCKING_WORKERS)
             .enable_io()
             .enable_time()
             .build();
@@ -3976,7 +4156,7 @@ fn build_runtime(worker_count: usize) -> Result<tokio::runtime::Runtime, std::io
 
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(worker_count)
-        .max_blocking_threads(worker_count)
+        .max_blocking_threads(native_stream_workers + RESERVED_BLOCKING_WORKERS)
         .thread_stack_size(1024 * 1024)
         .enable_io()
         .enable_time()
@@ -4864,8 +5044,78 @@ mod tests {
     use std::mem::size_of;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
 
+    extern "C" fn unused_test_callback(_kind: i32, _id: i64) {}
+
+    #[test]
+    fn binary_chunks_return_before_consumption_and_bound_in_flight_bytes() {
+        let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+        let (response_tx, mut response_rx) = mpsc::unbounded_channel();
+        PENDING_REQUESTS.lock().unwrap().insert(
+            request_id,
+            PendingRequest {
+                server_id: 0,
+                request: None,
+                response_tx,
+                runtime_state: ServerRuntimeState {
+                    server_id: 0,
+                    routes: Arc::new(Vec::new()),
+                    schemas: Arc::new(HashMap::new()),
+                    callback: unused_test_callback,
+                    native_stream_slots: Arc::new(Semaphore::new(1)),
+                    stream_stall_timeout: Duration::from_secs(1),
+                },
+                binary_chunk: None,
+            },
+        );
+        let bytes = vec![42; MAX_BINARY_STREAM_CHUNK_BYTES + 1];
+        let chunk = NativeBytes {
+            ptr: bytes.as_ptr(),
+            len: MAX_BINARY_STREAM_CHUNK_BYTES as isize,
+        };
+        let oversized = NativeBytes {
+            ptr: bytes.as_ptr(),
+            len: bytes.len() as isize,
+        };
+        assert_eq!(
+            dart_http_server_runtime_start_binary_stream_chunk(request_id, oversized),
+            0
+        );
+        let operation = dart_http_server_runtime_start_binary_stream_chunk(request_id, chunk);
+        assert!(operation > 0);
+        assert_eq!(
+            dart_http_server_runtime_start_binary_stream_chunk(request_id, chunk),
+            0
+        );
+        let PendingResponseMessage::BinaryChunk {
+            bytes: received,
+            completion,
+        } = response_rx.try_recv().unwrap()
+        else {
+            panic!("expected chunk")
+        };
+        assert_eq!(received, bytes[..MAX_BINARY_STREAM_CHUNK_BYTES]);
+        assert!(!completion.0.completed.load(Ordering::Acquire));
+        completion.0.complete(true);
+        drop(completion);
+        // Consumption permits exactly one more chunk. Cancellation also finishes
+        // its acknowledgement, even while the HTTP body has not polled it.
+        assert!(dart_http_server_runtime_start_binary_stream_chunk(request_id, chunk) > 0);
+        let PendingResponseMessage::BinaryChunk { completion, .. } =
+            response_rx.try_recv().unwrap()
+        else {
+            panic!("expected chunk")
+        };
+        cancel_binary_response(request_id);
+        assert!(completion.0.completed.load(Ordering::Acquire));
+        drop(completion);
+        assert_eq!(
+            dart_http_server_runtime_start_binary_stream_chunk(request_id, chunk),
+            0
+        );
+    }
+
     struct TestStreamContext {
-        emitted: AtomicBool,
+        emitted: Arc<AtomicBool>,
         buffer_releases: Arc<AtomicUsize>,
         stream_releases: Arc<AtomicUsize>,
     }
@@ -4915,11 +5165,63 @@ mod tests {
     }
 
     #[test]
+    fn cancels_native_reader_while_its_output_queue_is_full() {
+        let buffer_releases = Arc::new(AtomicUsize::new(0));
+        let stream_releases = Arc::new(AtomicUsize::new(0));
+        let emitted = Arc::new(AtomicBool::new(false));
+        let context = Box::new(TestStreamContext {
+            emitted: Arc::clone(&emitted),
+            buffer_releases: Arc::clone(&buffer_releases),
+            stream_releases: Arc::clone(&stream_releases),
+        });
+        let descriptor = NexByteStream {
+            abi_version: NEX_ABI_VERSION,
+            struct_size: size_of::<NexByteStream>(),
+            capabilities: NEX_CAPABILITY_THREAD_SAFE | NEX_CAPABILITY_CONCURRENT_CANCEL,
+            context: Box::into_raw(context).cast(),
+            next: Some(test_stream_next),
+            cancel: Some(test_stream_cancel),
+            release: Some(test_stream_release),
+        };
+        let stream = unsafe { AdoptedByteStream::adopt(descriptor) }.unwrap();
+        let runtime = build_runtime(2, 1).unwrap();
+        let (sender, mut receiver) = mpsc::channel(1);
+        sender.try_send(Ok(Bytes::from_static(&[0]))).unwrap();
+        let (stopped_tx, stopped_rx) = watch::channel(false);
+        let (progress_tx, _progress_rx) = watch::channel(tokio::time::Instant::now());
+        let handle = runtime.handle().clone();
+        let worker = runtime.spawn_blocking(move || {
+            run_native_response_worker(stream, sender, None, stopped_rx, progress_tx, handle);
+        });
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !emitted.load(Ordering::Acquire) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(!worker.is_finished());
+            stopped_tx.send_replace(true);
+            tokio::time::timeout(Duration::from_secs(1), worker)
+                .await
+                .unwrap()
+                .unwrap();
+        });
+        // No receiver progress was required to release the blocked worker and
+        // its native buffer/source ownership.
+        assert_eq!(buffer_releases.load(Ordering::Acquire), 1);
+        assert_eq!(stream_releases.load(Ordering::Acquire), 1);
+        assert_eq!(&receiver.try_recv().unwrap().unwrap()[..], &[0]);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
     fn consumes_native_exchange_stream_without_copying_chunk_ownership() {
         let buffer_releases = Arc::new(AtomicUsize::new(0));
         let stream_releases = Arc::new(AtomicUsize::new(0));
         let context = Box::new(TestStreamContext {
-            emitted: AtomicBool::new(false),
+            emitted: Arc::new(AtomicBool::new(false)),
             buffer_releases: Arc::clone(&buffer_releases),
             stream_releases: Arc::clone(&stream_releases),
         });

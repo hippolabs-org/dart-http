@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:ffi';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:dart_http_core/dart_http_core.dart';
 import 'package:native_exchange/native_exchange_ffi.dart' show NativeByteLease;
@@ -34,6 +35,9 @@ const _transportEventWebTransportPersistentStreamOpened = 9;
 const _transportEventWebTransportStreamChunkReady = 10;
 const _transportEventWebTransportStreamFinished = 11;
 const _transportEventWebTransportOperationReady = 12;
+const _transportEventBinaryStreamChunkCompleted = 13;
+const _transportEventBinaryStreamClosed = 14;
+const _binaryStreamChunkSize = 64 * 1024;
 
 /// Main application object for a Dart HTTP server.
 ///
@@ -66,6 +70,9 @@ class DartHttp<TServices> extends Router<TServices> {
   JsonSchemaRegistry? _schemaRegistry;
   DartHttpCodecRegistry _codecRegistry;
   _RustTransportSession? _session;
+  Duration _streamStallTimeout = const Duration(minutes: 1);
+  final Map<int, Completer<bool>> _pendingBinaryChunks = {};
+  final Map<int, _BinaryResponseProgress> _activeBinaryResponses = {};
   final Map<int, RequestContext<TServices>> _pendingWebSocketContexts =
       <int, RequestContext<TServices>>{};
   final Map<int, _ActiveWebSocketSession> _activeWebSocketSessions =
@@ -115,10 +122,18 @@ class DartHttp<TServices> extends Router<TServices> {
   ///
   /// When [port] is `0`, the runtime binds an ephemeral free port and returns
   /// the chosen port via the resulting [DartHttpServer].
+  ///
+  /// [workers] controls native asynchronous I/O workers. [nativeStreamWorkers]
+  /// independently limits concurrent native response readers; excess native
+  /// responses receive HTTP 503. Dart handlers still share their isolate.
+  /// Binary transfers are canceled after [streamStallTimeout] without progress
+  /// from either their source or the HTTP transport.
   Future<DartHttpServer> listen({
     String host = '127.0.0.1',
     required int port,
     int workers = 1,
+    int nativeStreamWorkers = 64,
+    Duration streamStallTimeout = const Duration(minutes: 1),
   }) async {
     final normalizedHost = host.trim();
     if (normalizedHost.isEmpty) {
@@ -129,6 +144,12 @@ class DartHttp<TServices> extends Router<TServices> {
     if (workers == 0) {
       throw RangeError.value(workers, 'workers', 'Must be greater than zero.');
     }
+    if (nativeStreamWorkers <= 0) {
+      throw RangeError.value(nativeStreamWorkers, 'nativeStreamWorkers', 'Must be positive.');
+    }
+    if (streamStallTimeout.inMilliseconds <= 0) {
+      throw ArgumentError.value(streamStallTimeout, 'streamStallTimeout', 'Must be positive.');
+    }
 
     final existingSession = _session;
     if (existingSession != null) {
@@ -138,11 +159,14 @@ class DartHttp<TServices> extends Router<TServices> {
     }
 
     final compiledRoutes = _compileRoutes();
+    _streamStallTimeout = streamStallTimeout;
 
     final session = await _RustTransportSession.start(
       host: normalizedHost,
       requestedPort: port,
       workers: workers,
+      nativeStreamWorkers: nativeStreamWorkers,
+      streamStallTimeout: streamStallTimeout,
       routesJson: compiledRoutes.nativeManifestJson(schemaRegistry: _schemaRegistry),
       middlewaresJson: _middlewaresJson(middlewares),
       onTransportEvent: (eventKind, eventId) async {
@@ -160,6 +184,13 @@ class DartHttp<TServices> extends Router<TServices> {
           return;
         }
         _session = null;
+        for (final response in _activeBinaryResponses.values) {
+          response.close();
+        }
+        for (final chunk in _pendingBinaryChunks.values) {
+          if (!chunk.isCompleted) chunk.complete(false);
+        }
+        _pendingBinaryChunks.clear();
         await currentSession.close();
         _pendingWebSocketContexts.clear();
         for (final session in _activeWebSocketSessions.values.toList()) {
@@ -188,6 +219,12 @@ class DartHttp<TServices> extends Router<TServices> {
     CompiledRouteTable<TServices> compiledRoutes,
   ) async {
     switch (eventKind) {
+      case _transportEventBinaryStreamChunkCompleted:
+        _pendingBinaryChunks.remove(eventId.abs())?.complete(eventId > 0);
+        return;
+      case _transportEventBinaryStreamClosed:
+        _activeBinaryResponses[eventId]?.close();
+        return;
       case _transportEventRequestReady:
         await _handleTransportRequest(eventId, compiledRoutes);
         return;
@@ -924,6 +961,10 @@ class DartHttp<TServices> extends Router<TServices> {
 
   Future<void> _streamBinaryResponse(int requestId, BinaryStreamResponse response) async {
     var started = false;
+    var finished = false;
+    final progress = _BinaryResponseProgress();
+    _activeBinaryResponses[requestId] = progress;
+    final iterator = StreamIterator(response.body);
     try {
       started = DartHttpNative.startBinaryStreamResponse(
         requestId,
@@ -936,18 +977,45 @@ class DartHttp<TServices> extends Router<TServices> {
         return;
       }
 
-      await for (final chunk in response.body) {
-        if (!DartHttpNative.sendBinaryStreamChunk(requestId, chunk)) {
-          break;
+      while (await progress.waitFor(iterator.moveNext(), _streamStallTimeout)) {
+        if (progress.closed) break;
+        final chunk = iterator.current;
+        for (var offset = 0; offset < chunk.length; offset += _binaryStreamChunkSize) {
+          final end = (offset + _binaryStreamChunkSize).clamp(0, chunk.length);
+          final part = offset == 0 && end == chunk.length
+              ? chunk
+              : chunk is Uint8List
+              ? Uint8List.sublistView(chunk, offset, end)
+              : chunk.sublist(offset, end);
+          final operationId = DartHttpNative.startBinaryStreamChunk(requestId, part);
+          if (operationId <= 0) return;
+          final completion = Completer<bool>();
+          _pendingBinaryChunks[operationId] = completion;
+          try {
+            final consumed = await progress.waitFor(completion.future, _streamStallTimeout);
+            if (!consumed) return;
+          } finally {
+            _pendingBinaryChunks.remove(operationId);
+          }
         }
       }
+      finished = !progress.closed;
     } finally {
+      _activeBinaryResponses.remove(requestId);
       try {
         if (started) {
-          DartHttpNative.finishBinaryStreamResponse(requestId);
+          if (finished) {
+            DartHttpNative.finishBinaryStreamResponse(requestId);
+          } else {
+            DartHttpNative.abortBinaryStreamResponse(requestId);
+          }
         }
       } finally {
-        await response.dispose();
+        try {
+          await response.dispose();
+        } finally {
+          await iterator.cancel();
+        }
       }
     }
   }
@@ -1146,6 +1214,49 @@ WebSocketMessage _decodeWebSocketMessage(NativeWebSocketMessage message) {
 
 typedef _NativeTransportEvent = Void Function(Int32, Int64);
 
+// Keep only the current wait cancellable. Racing every chunk against one
+// long-lived disconnect future would retain a listener for every sent chunk.
+final class _BinaryResponseProgress {
+  bool closed = false;
+  Completer<bool>? _waiting;
+
+  void close() {
+    closed = true;
+    final waiting = _waiting;
+    if (waiting != null && !waiting.isCompleted) waiting.complete(false);
+  }
+
+  Future<bool> waitFor(Future<bool> progress, Duration timeout) async {
+    if (closed) {
+      progress.ignore();
+      return false;
+    }
+    final waiting = Completer<bool>();
+    _waiting = waiting;
+    unawaited(
+      progress.then(
+        (value) {
+          if (!waiting.isCompleted) waiting.complete(value);
+        },
+        onError: (Object error, StackTrace stackTrace) {
+          if (!waiting.isCompleted) waiting.completeError(error, stackTrace);
+        },
+      ),
+    );
+    try {
+      return await waiting.future.timeout(
+        timeout,
+        onTimeout: () {
+          close();
+          return false;
+        },
+      );
+    } finally {
+      _waiting = null;
+    }
+  }
+}
+
 final class _RustTransportSession {
   _RustTransportSession._({
     required this.serverId,
@@ -1164,6 +1275,8 @@ final class _RustTransportSession {
     required String host,
     required int requestedPort,
     required int workers,
+    required int nativeStreamWorkers,
+    required Duration streamStallTimeout,
     required String routesJson,
     required String middlewaresJson,
     required Future<void> Function(int eventKind, int eventId) onTransportEvent,
@@ -1179,6 +1292,8 @@ final class _RustTransportSession {
       host,
       requestedPort,
       workers: workers,
+      nativeStreamWorkers: nativeStreamWorkers,
+      streamStallTimeout: streamStallTimeout,
       routesJson: routesJson,
       middlewaresJson: middlewaresJson,
       callback: callback.nativeFunction,

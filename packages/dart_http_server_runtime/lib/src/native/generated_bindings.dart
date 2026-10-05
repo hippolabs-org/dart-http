@@ -9,6 +9,9 @@ library;
 
 import 'dart:ffi' as ffi;
 
+@ffi.Native<ffi.Void Function(ffi.Int64)>()
+external void dart_http_server_runtime_abort_binary_stream_response(int request_id);
+
 @ffi.Native<ffi.Bool Function(ffi.Int64, ffi.IntPtr, ffi.Pointer<NativePair>)>()
 external bool dart_http_server_runtime_accept_web_socket(
   int request_id,
@@ -106,9 +109,6 @@ external ffi.Pointer<NativeMultipartForm> dart_http_server_runtime_parse_multipa
 @ffi.Native<ffi.Void Function(ffi.Int64)>()
 external void dart_http_server_runtime_release_web_socket_session(int session_id);
 
-@ffi.Native<ffi.Bool Function(ffi.Int64, NativeBytes)>()
-external bool dart_http_server_runtime_send_binary_stream_chunk(int request_id, NativeBytes chunk);
-
 @ffi.Native<
   ffi.Bool Function(
     ffi.Int64,
@@ -130,6 +130,9 @@ external bool dart_http_server_runtime_send_response(
 
 @ffi.Native<ffi.Bool Function(ffi.Int64, ffi.Pointer<ffi.Char>)>()
 external bool dart_http_server_runtime_send_sse_chunk(int request_id, ffi.Pointer<ffi.Char> chunk);
+
+@ffi.Native<ffi.Int64 Function(ffi.Int64, NativeBytes)>()
+external int dart_http_server_runtime_start_binary_stream_chunk(int request_id, NativeBytes chunk);
 
 @ffi.Native<
   ffi.Bool Function(
@@ -176,6 +179,8 @@ external bool dart_http_server_runtime_start_native_binary_stream_response(
     ffi.Pointer<ffi.Char>,
     ffi.Int64,
     ffi.Int64,
+    ffi.Int64,
+    ffi.Int64,
     ffi.Pointer<ffi.Char>,
     ffi.Pointer<ffi.Char>,
     dart_http_server_runtime_transport_event_callback_t,
@@ -185,6 +190,8 @@ external int dart_http_server_runtime_start_server(
   ffi.Pointer<ffi.Char> host,
   int port,
   int worker_count,
+  int native_stream_worker_count,
+  int stream_stall_timeout_ms,
   ffi.Pointer<ffi.Char> routes_json,
   ffi.Pointer<ffi.Char> middlewares_json,
   dart_http_server_runtime_transport_event_callback_t callback,

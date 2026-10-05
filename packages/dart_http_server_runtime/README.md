@@ -233,7 +233,19 @@ for a larger application example that uses this runtime surface.
 native package directly into the Rust HTTP runtime. The runtime pulls one chunk
 at a time on its blocking worker pool, propagates disconnect cancellation, and
 never copies body chunks through Dart-managed memory. Use
-`BinaryStreamResponse` when the producer is a normal Dart stream.
+`BinaryStreamResponse` when the producer is a normal Dart stream. Its chunk
+acknowledgements are asynchronous: waiting for a slow client yields to other
+Dart request handlers. Large producer chunks are split into at most 64 KiB
+pieces, with one pending acknowledgement per response.
+
+`app.listen(nativeStreamWorkers: 64, streamStallTimeout: Duration(minutes: 1))`
+sets the native reader limit and the maximum time without source or transport
+progress. These are the defaults. Native reader capacity is independent of
+`workers`, which controls asynchronous I/O threads. When every reader is occupied,
+additional native responses receive HTTP 503 instead of waiting in an unbounded
+queue. Disconnects and stalled transfers cancel the source and release capacity.
+Dart handlers still share an isolate, so synchronous application work must also
+avoid blocking that isolate.
 
 ## Native Bindings
 
@@ -245,5 +257,6 @@ hand.
 - Regenerate after ABI changes:
 
 ```sh
-dart pub -C packages/dart_http_server_runtime run ffigen --config tool/ffigen.yaml
+cd packages/dart_http_server_runtime
+dart run ffigen --config tool/ffigen.yaml
 ```

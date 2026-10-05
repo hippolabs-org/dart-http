@@ -1,3 +1,14 @@
+## 0.3.51
+
+- Await binary response chunk consumption asynchronously so a paused client cannot
+  block the Dart request event loop. Bound each in-flight chunk to 64 KiB.
+- Cancel binary producers on disconnect and after a configurable stream stall
+  timeout (one minute by default).
+- Separate native response reader capacity from I/O workers. Configure it with
+  `nativeStreamWorkers` (64 by default); return HTTP 503 when capacity is full.
+- Release stalled native readers and cancel queued sends on disconnect.
+- Bump native artifacts to 0.1.30 and the native ABI to 21.
+
 ## 0.3.50
 
 - Return HTTP 400 for malformed request values rejected during decoding.
