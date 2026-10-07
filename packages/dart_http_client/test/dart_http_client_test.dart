@@ -294,7 +294,7 @@ void main() {
     });
 
     test('custom socketFactory keeps its public constructor name and requires opt-in', () async {
-      final DartHttpWebSocketFactory factory = (
+      Never factory(
         Uri uri, {
         Iterable<String>? protocols,
         Duration? pingInterval,
