@@ -1,3 +1,14 @@
+## 0.2.0
+
+- Breaking: `DartHttpWebSocketClientTransport` now opens a single connection by
+  default. Explicitly set `reconnect: true` for the previous retry/reconnect policy.
+- Require `reconnect: true` when supplying backoff or a custom reconnecting socket factory.
+- Add `DartHttpSingleConnectionWebSocketClientTransport` for stateful protocols
+  that must surface disconnects and recover explicitly.
+- Preserve initial upgrade frames and peer close metadata, support IO headers
+  and pings, and reject unsupported browser capabilities.
+- Require `dart_http_core` 0.3.60 for the close-aware WebSocket contract.
+
 ## 0.1.12
 
 - Honor the per-request redirect policy in the `package:http` transport.

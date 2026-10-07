@@ -6,6 +6,7 @@ import 'package:dart_http_core/dart_http_core.dart';
 import 'package:web_socket_client/web_socket_client.dart' as web_socket_client;
 
 import 'web_socket_message_converter.dart';
+import 'dart_http_single_connection_web_socket_transport.dart';
 
 /// Creates `web_socket_client` sockets for generated Dart HTTP clients.
 typedef DartHttpWebSocketFactory = web_socket_client.WebSocket Function(
@@ -18,25 +19,38 @@ typedef DartHttpWebSocketFactory = web_socket_client.WebSocket Function(
   String? binaryType,
 });
 
-/// WebSocket transport backed by `package:web_socket_client`.
+/// Portable WebSockets with one connection per connect() by default.
+/// Set [reconnect] to true to opt into the legacy reconnecting transport.
 final class DartHttpWebSocketClientTransport implements DartHttpClientWebSocketTransport {
   const DartHttpWebSocketClientTransport({
+    this.reconnect = false,
     this.pingInterval,
     this.backoff,
     this.timeout,
     this.binaryType = 'arraybuffer',
-    DartHttpWebSocketFactory? socketFactory,
-  }) : _socketFactory = socketFactory ?? web_socket_client.WebSocket.new;
+    this._socketFactory,
+  });
 
+  final bool reconnect;
   final Duration? pingInterval;
   final web_socket_client.Backoff? backoff;
   final Duration? timeout;
   final String? binaryType;
-  final DartHttpWebSocketFactory _socketFactory;
+  final DartHttpWebSocketFactory? _socketFactory;
 
   @override
   Future<DartHttpClientWebSocket> connect(DartHttpClientWebSocketRequest request) async {
-    final socket = _socketFactory(
+    if (!reconnect) {
+      if (backoff != null || _socketFactory != null) {
+        throw ArgumentError('backoff and socketFactory require reconnect: true.');
+      }
+      return DartHttpSingleConnectionWebSocketClientTransport(
+        connectTimeout: timeout ?? const Duration(seconds: 60),
+        pingInterval: pingInterval,
+        binaryType: binaryType ?? 'arraybuffer',
+      ).connect(request);
+    }
+    final socket = (_socketFactory ?? web_socket_client.WebSocket.new)(
       request.uri,
       protocols: request.protocols,
       headers: request.headers,
