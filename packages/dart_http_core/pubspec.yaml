@@ -15,7 +15,7 @@ dependencies:
     version: ^0.1.2
   native_exchange:
     hosted: "https://pub.hippolabs.org"
-    version: ^0.3.1
+    version: ^0.3.3
 
 dev_dependencies:
   test: ^1.30.0
