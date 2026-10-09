@@ -56,6 +56,7 @@ final class NativeHttpClientTransport
     this._completionPort,
     this._webSocketIncomingCapacity,
     this._webSocketOutgoingCapacity,
+    this._webSocketCloseTimeout,
   ) {
     _subscription = _completionPort.listen(_handleCompletion);
   }
@@ -65,6 +66,9 @@ final class NativeHttpClientTransport
   /// HTTP requests have no total deadline unless [requestTimeout] is supplied.
   /// Connection establishment remains bounded by
   /// [NativeHttpClientRuntime.connectTimeout].
+  ///
+  /// A WebSocket whose peer does not answer `close()` within
+  /// [webSocketCloseTimeout] is torn down, as `dart:io` does.
   static Future<NativeHttpClientTransport> open({
     Duration? webSocketConnectTimeout,
     @Deprecated(
@@ -75,6 +79,7 @@ final class NativeHttpClientTransport
     Duration? requestTimeout,
     int webSocketIncomingCapacity = 16,
     int webSocketOutgoingCapacity = 8,
+    Duration webSocketCloseTimeout = const Duration(seconds: 5),
   }) async {
     if (webSocketConnectTimeout != null && connectTimeout != null) {
       throw ArgumentError('Specify only webSocketConnectTimeout, not legacy connectTimeout.');
@@ -82,7 +87,8 @@ final class NativeHttpClientTransport
     final resolvedWebSocketConnectTimeout =
         webSocketConnectTimeout ?? connectTimeout ?? NativeHttpClientRuntime.connectTimeout;
     if (resolvedWebSocketConnectTimeout <= Duration.zero ||
-        (requestTimeout != null && requestTimeout <= Duration.zero)) {
+        (requestTimeout != null && requestTimeout <= Duration.zero) ||
+        webSocketCloseTimeout <= Duration.zero) {
       throw ArgumentError('Native HTTP timeouts must be positive.');
     }
     if (webSocketIncomingCapacity < 1 ||
@@ -107,6 +113,7 @@ final class NativeHttpClientTransport
       completionPort,
       webSocketIncomingCapacity,
       webSocketOutgoingCapacity,
+      webSocketCloseTimeout,
     );
   }
 
@@ -114,6 +121,7 @@ final class NativeHttpClientTransport
   final ReceivePort _completionPort;
   final int _webSocketIncomingCapacity;
   final int _webSocketOutgoingCapacity;
+  final Duration _webSocketCloseTimeout;
   late final StreamSubscription<Object?> _subscription;
   final Map<int, Completer<_NativeResponseData>> _pending = {};
   final Map<int, NativeHttpWebSocket> _webSockets = {};

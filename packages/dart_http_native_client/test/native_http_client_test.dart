@@ -681,6 +681,58 @@ void main() {
     prefixedLease.close();
   });
 
+  group('a peer that never answers close', () {
+    late _SilencingProxy proxy;
+    late NativeHttpClientTransport closingTransport;
+
+    setUp(() async {
+      server.listen((request) async {
+        await WebSocketTransformer.upgrade(request);
+      });
+      proxy = await _SilencingProxy.start(server.port);
+      closingTransport = await NativeHttpClientTransport.open(
+        webSocketCloseTimeout: const Duration(milliseconds: 300),
+      );
+    });
+
+    tearDown(() async {
+      closingTransport.close();
+      await proxy.close();
+    });
+
+    Future<NativeHttpWebSocket> connect() async => await closingTransport.connect(
+      DartHttpClientWebSocketRequest(uri: Uri.parse('ws://127.0.0.1:${proxy.port}/silent')),
+    ) as NativeHttpWebSocket;
+
+    test('is torn down after the close deadline', () async {
+      final socket = await connect();
+      final ended = socket.messages.drain<void>();
+      proxy.silence();
+      final watch = Stopwatch()..start();
+
+      await socket.close();
+      await ended.timeout(const Duration(seconds: 2));
+      await proxy.clientDisconnected.timeout(const Duration(seconds: 2));
+
+      expect(watch.elapsed, greaterThanOrEqualTo(const Duration(milliseconds: 250)));
+      expect(socket.closeDetails, isNull);
+    });
+
+    test('ends quietly when the transport closes during the handshake', () async {
+      final socket = await connect();
+      final errors = <Object>[];
+      final ended = Completer<void>();
+      socket.messages.listen((_) {}, onError: errors.add, onDone: ended.complete);
+      proxy.silence();
+
+      await socket.close();
+      closingTransport.close();
+      await ended.future.timeout(const Duration(seconds: 2));
+
+      expect(errors, isEmpty);
+    });
+  });
+
   test('exposes the peer WebSocket close code and reason', () async {
     server.listen((request) async {
       final socket = await WebSocketTransformer.upgrade(request);
@@ -1093,4 +1145,49 @@ void main() {
     await Future<void>.delayed(const Duration(milliseconds: 100));
     await socket.close().timeout(const Duration(seconds: 5));
   });
+}
+
+/// Forwards TCP traffic to a WebSocket server until [silence] is called, then
+/// drops everything the server sends, so the client's close goes unanswered.
+final class _SilencingProxy {
+  _SilencingProxy._(this._server, this._upstreamPort) {
+    _server.listen((client) async {
+      final upstream = await Socket.connect(InternetAddress.loopbackIPv4, _upstreamPort);
+      _sockets.addAll([client, upstream]);
+      upstream.listen((data) {
+        if (!_silenced) client.add(data);
+      }, onError: (Object _) {});
+      client.listen(
+        upstream.add,
+        onError: (Object _) {},
+        onDone: () {
+          if (!_disconnected.isCompleted) _disconnected.complete();
+          upstream.destroy();
+        },
+      );
+    });
+  }
+
+  static Future<_SilencingProxy> start(int upstreamPort) async =>
+      _SilencingProxy._(await ServerSocket.bind(InternetAddress.loopbackIPv4, 0), upstreamPort);
+
+  final ServerSocket _server;
+  final int _upstreamPort;
+  final _sockets = <Socket>[];
+  final _disconnected = Completer<void>();
+  var _silenced = false;
+
+  int get port => _server.port;
+
+  /// Completes when the client side of the connection closes.
+  Future<void> get clientDisconnected => _disconnected.future;
+
+  void silence() => _silenced = true;
+
+  Future<void> close() async {
+    for (final socket in _sockets) {
+      socket.destroy();
+    }
+    await _server.close();
+  }
 }

@@ -1,3 +1,12 @@
+## 0.2.24
+
+- Tear down a WebSocket whose peer does not answer `close()` within
+  `webSocketCloseTimeout` (default 5 seconds, as in `dart:io`); it previously
+  kept its task and connection until the transport closed.
+- End the message stream normally when the transport closes after the caller
+  already closed the socket, instead of reporting "Native HTTP client closed."
+- `close()` no longer fails when the socket ends while its close frame is queued.
+
 ## 0.2.23
 
 - Upgrade to `hippolabs_native_assets` 0.2.0 for corrected Apple deployment-target propagation and `code_assets` 2.0.

@@ -111,6 +111,7 @@ final class NativeHttpWebSocket
   var _terminal = false;
   var _closing = false;
   var _queuedOperations = 0;
+  Timer? _closeTimer;
   _NativeHttpWebSocketAdoptedStream? _byteStream;
 
   /// Subprotocol selected by the server, when one was negotiated.
@@ -466,19 +467,28 @@ final class NativeHttpWebSocket
     _closing = true;
     _discardData = true;
     _flushDeferredData();
-    await _scheduleOperation(() {
-      final nativeReason = reason?.toNativeUtf8();
-      try {
-        return native.dart_http_native_client_websocket_close(
-          _transport._clientId,
-          _socketId,
-          code ?? -1,
-          nativeReason?.cast() ?? nullptr,
-        );
-      } finally {
-        if (nativeReason != null) calloc.free(nativeReason);
-      }
-    }, allowClosing: true);
+    // A peer that never answers the close frame would otherwise keep the
+    // socket and its connection alive until the transport closes.
+    _closeTimer = Timer(_transport._webSocketCloseTimeout, _finish);
+    try {
+      await _scheduleOperation(() {
+        final nativeReason = reason?.toNativeUtf8();
+        try {
+          return native.dart_http_native_client_websocket_close(
+            _transport._clientId,
+            _socketId,
+            code ?? -1,
+            nativeReason?.cast() ?? nullptr,
+          );
+        } finally {
+          if (nativeReason != null) calloc.free(nativeReason);
+        }
+      }, allowClosing: true);
+    } on Object {
+      // The socket already ended, e.g. through the close deadline or the
+      // transport closing; closing it has succeeded.
+      if (!_terminal) rethrow;
+    }
   }
 
   Future<void> _scheduleOperation(int Function() start, {bool allowClosing = false}) {
@@ -652,6 +662,8 @@ final class NativeHttpWebSocket
   }
 
   void _transportClosed() {
+    // The caller already closed this socket; ending its stream is expected.
+    if (_closing) return _finish();
     final error = const NativeHttpClientException('Native HTTP client closed.');
     final failedWhileConnecting = !_connected.isCompleted;
     if (failedWhileConnecting) {
@@ -665,6 +677,7 @@ final class NativeHttpWebSocket
   void _finish([Object? error, StackTrace? stackTrace]) {
     if (_terminal) return;
     _terminal = true;
+    _closeTimer?.cancel();
     _byteStream?._socketClosed();
     _abortNative();
     final failure = error ?? const NativeHttpClientException('Native WebSocket closed.');
