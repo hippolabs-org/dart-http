@@ -89,6 +89,16 @@ app.websocket(
 );
 ```
 
+`WebSocketOptions.keepAlive` makes the server ping each client and close
+sessions whose client stops answering. Browsers answer pings automatically, so
+this also keeps idle browser sessions open through firewalls:
+
+```dart
+options: const WebSocketOptions(
+  keepAlive: WebSocketKeepAlive(interval: Duration(seconds: 15)),
+),
+```
+
 WebTransport offers the same split: `datagrams()` and `streams()` return safe
 Dart bytes, while `datagrams.leases()` and `streams.leases()` preserve native
 payload ownership. JSON and text control messages continue through the normal

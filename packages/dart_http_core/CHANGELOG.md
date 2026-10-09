@@ -1,3 +1,9 @@
+## 0.3.62
+
+- Add `WebSocketKeepAlive` (ping interval and pong timeout, RFC 6455 ping/pong)
+  as a per-connection `DartHttpClientWebSocketRequest.keepAlive` and a per-route
+  `WebSocketOptions.keepAlive`.
+
 ## 0.3.61
 
 - Decode scalar URL query values according to their declared JSON Schema.

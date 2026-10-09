@@ -9,7 +9,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString, c_char};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -48,7 +48,7 @@ use wtransport::{
     ServerConfig as WebTransportServerConfig, VarInt,
 };
 
-const DART_HTTP_SERVER_RUNTIME_NATIVE_ABI_VERSION: i32 = 22;
+const DART_HTTP_SERVER_RUNTIME_NATIVE_ABI_VERSION: i32 = 23;
 const MAX_BINARY_STREAM_CHUNK_BYTES: usize = 64 * 1024;
 const RESERVED_BLOCKING_WORKERS: usize = 16;
 const SCHEMA_REGISTRY_URI: &str = "urn:dart-http:schema-registry";
@@ -1042,6 +1042,10 @@ struct RouteManifestEntry {
     max_pending_messages: usize,
     #[serde(default = "default_realtime_max_pending_bytes")]
     max_pending_bytes: usize,
+    #[serde(default)]
+    keep_alive_interval_ms: Option<u64>,
+    #[serde(default)]
+    keep_alive_timeout_ms: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -1075,6 +1079,7 @@ struct CompiledRoute {
     native_handler: Option<CompiledNativeHttpHandler>,
     max_pending_messages: usize,
     max_pending_bytes: usize,
+    keep_alive: Option<WebSocketKeepAlive>,
 }
 
 #[derive(Clone)]
@@ -1120,6 +1125,7 @@ struct NativeRouteMatch {
     native_handler: Option<CompiledNativeHttpHandler>,
     max_pending_messages: usize,
     max_pending_bytes: usize,
+    keep_alive: Option<WebSocketKeepAlive>,
 }
 
 #[derive(Clone)]
@@ -3035,6 +3041,7 @@ async fn handle_web_socket_request(
 ) -> Response<Body> {
     let max_pending_messages = route_match.max_pending_messages;
     let max_pending_bytes = route_match.max_pending_bytes;
+    let keep_alive = route_match.keep_alive;
     let route_id = route_match.route_id;
     let path_params = route_match.path_params;
     let transport_request = TransportRequest {
@@ -3083,6 +3090,7 @@ async fn handle_web_socket_request(
                         headers,
                         max_pending_messages,
                         max_pending_bytes,
+                        keep_alive,
                         runtime_state,
                     )
                 })
@@ -3107,6 +3115,7 @@ async fn handle_web_socket_session(
     headers: HashMap<String, String>,
     max_pending_messages: usize,
     max_pending_bytes: usize,
+    keep_alive: Option<WebSocketKeepAlive>,
     runtime_state: ServerRuntimeState,
 ) {
     let session_id = NEXT_WEB_SOCKET_SESSION_ID.fetch_add(1, Ordering::Relaxed);
@@ -3145,9 +3154,12 @@ async fn handle_web_socket_session(
         session_id,
     );
     let (mut sink, mut source) = socket.split();
+    // Every received frame, including pongs, proves the client is alive.
+    let activity = Arc::new(AtomicU64::new(0));
     {
         let incoming = async {
             while let Some(incoming) = source.next().await {
+                activity.fetch_add(1, Ordering::Relaxed);
                 let (kind, body) = match incoming {
                     Ok(Message::Text(text)) => (
                         WebSocketMessageKind::Text,
@@ -3178,17 +3190,43 @@ async fn handle_web_socket_session(
             }
         };
         let outgoing = async {
-            while let Some(mut command) = command_rx.recv().await {
-                command.completion.consumed = matches!(
-                    tokio::time::timeout(
-                        runtime_state.web_socket_write_stall_timeout,
-                        sink.send(command.message)
-                    )
-                    .await,
-                    Ok(Ok(()))
-                );
-                if !command.completion.consumed {
-                    break;
+            let mut keep_alive =
+                keep_alive.map(|config| KeepAliveState::new(config, Arc::clone(&activity)));
+            loop {
+                let next = tokio::select! {
+                    command = command_rx.recv() => OutgoingWebSocketEvent::Command(command),
+                    due = next_keep_alive(&mut keep_alive) => OutgoingWebSocketEvent::KeepAlive(due),
+                };
+                match next {
+                    OutgoingWebSocketEvent::Command(None) => break,
+                    OutgoingWebSocketEvent::Command(Some(mut command)) => {
+                        command.completion.consumed = matches!(
+                            tokio::time::timeout(
+                                runtime_state.web_socket_write_stall_timeout,
+                                sink.send(command.message)
+                            )
+                            .await,
+                            Ok(Ok(()))
+                        );
+                        if !command.completion.consumed {
+                            break;
+                        }
+                    }
+                    OutgoingWebSocketEvent::KeepAlive(KeepAliveDue::Ping) => {
+                        let sent = tokio::time::timeout(
+                            runtime_state.web_socket_write_stall_timeout,
+                            sink.send(Message::Ping(Bytes::new())),
+                        )
+                        .await;
+                        if !matches!(sent, Ok(Ok(()))) {
+                            break;
+                        }
+                        if let Some(state) = keep_alive.as_mut() {
+                            state.ping_sent();
+                        }
+                    }
+                    // The client stopped answering; drop the connection.
+                    OutgoingWebSocketEvent::KeepAlive(KeepAliveDue::Dead) => break,
                 }
             }
         };
@@ -4533,6 +4571,10 @@ fn compile_route(
         native_handler,
         max_pending_messages: route.max_pending_messages,
         max_pending_bytes: route.max_pending_bytes,
+        keep_alive: WebSocketKeepAlive::from_millis(
+            route.keep_alive_interval_ms,
+            route.keep_alive_timeout_ms,
+        ),
     })
 }
 
@@ -4971,6 +5013,7 @@ fn match_route(
                 native_handler: route.native_handler.clone(),
                 max_pending_messages: route.max_pending_messages,
                 max_pending_bytes: route.max_pending_bytes,
+                keep_alive: route.keep_alive,
             });
         }
     }
@@ -5469,6 +5512,92 @@ unsafe fn read_optional_c_string(value: *const c_char) -> Option<String> {
     }
 
     unsafe { read_c_string(value) }
+}
+
+/// Route-level WebSocket keepalive: ping every `interval`, give up when no
+/// frame arrives within `timeout` of a ping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WebSocketKeepAlive {
+    interval: Duration,
+    timeout: Duration,
+}
+
+impl WebSocketKeepAlive {
+    fn from_millis(interval_ms: Option<u64>, timeout_ms: Option<u64>) -> Option<Self> {
+        match (interval_ms, timeout_ms) {
+            (Some(interval), Some(timeout)) if interval > 0 && timeout > 0 => Some(Self {
+                interval: Duration::from_millis(interval),
+                timeout: Duration::from_millis(timeout),
+            }),
+            _ => None,
+        }
+    }
+}
+
+enum KeepAliveDue {
+    Ping,
+    Dead,
+}
+
+enum OutgoingWebSocketEvent {
+    Command(Option<WebSocketWrite>),
+    KeepAlive(KeepAliveDue),
+}
+
+/// Schedules pings and detects a silent peer. `activity` counts received
+/// frames; a ping is answered when the count moved before its deadline.
+struct KeepAliveState {
+    config: WebSocketKeepAlive,
+    activity: Arc<AtomicU64>,
+    next_ping: tokio::time::Instant,
+    pending: Option<(tokio::time::Instant, u64)>,
+}
+
+impl KeepAliveState {
+    fn new(config: WebSocketKeepAlive, activity: Arc<AtomicU64>) -> Self {
+        Self {
+            config,
+            activity,
+            next_ping: tokio::time::Instant::now() + config.interval,
+            pending: None,
+        }
+    }
+
+    /// Waits for the next ping or for a missed deadline. Cancel-safe: state
+    /// changes only after a timer completes.
+    async fn next(&mut self) -> KeepAliveDue {
+        loop {
+            if let Some((deadline, seen)) = self.pending
+                && deadline <= self.next_ping
+            {
+                tokio::time::sleep_until(deadline).await;
+                if self.activity.load(Ordering::Relaxed) == seen {
+                    return KeepAliveDue::Dead;
+                }
+                self.pending = None;
+                continue;
+            }
+            tokio::time::sleep_until(self.next_ping).await;
+            self.next_ping = tokio::time::Instant::now() + self.config.interval;
+            if self.pending.is_none() {
+                return KeepAliveDue::Ping;
+            }
+        }
+    }
+
+    fn ping_sent(&mut self) {
+        self.pending = Some((
+            tokio::time::Instant::now() + self.config.timeout,
+            self.activity.load(Ordering::Relaxed),
+        ));
+    }
+}
+
+async fn next_keep_alive(state: &mut Option<KeepAliveState>) -> KeepAliveDue {
+    match state {
+        Some(state) => state.next().await,
+        None => std::future::pending().await,
+    }
 }
 
 #[cfg(test)]

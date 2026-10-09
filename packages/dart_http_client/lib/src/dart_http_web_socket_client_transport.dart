@@ -54,7 +54,7 @@ final class DartHttpWebSocketClientTransport implements DartHttpClientWebSocketT
       request.uri,
       protocols: request.protocols,
       headers: request.headers,
-      pingInterval: pingInterval,
+      pingInterval: request.keepAlive?.interval ?? pingInterval,
       backoff: backoff,
       timeout: timeout,
       binaryType: binaryType,

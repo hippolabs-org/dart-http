@@ -12,6 +12,10 @@ import 'web_socket_message_converter.dart';
 
 /// Opens one WebSocket connection without reconnecting or replaying messages.
 /// Stateful protocols recover by opening a new connection explicitly.
+///
+/// A request's `keepAlive` overrides [pingInterval]. `dart:io` closes the
+/// connection when a ping goes unanswered until the next one, so its pong
+/// timeout equals the interval. Browsers cannot send pings.
 final class DartHttpSingleConnectionWebSocketClientTransport
     implements DartHttpClientWebSocketTransport {
   const DartHttpSingleConnectionWebSocketClientTransport({
@@ -32,9 +36,10 @@ final class DartHttpSingleConnectionWebSocketClientTransport
     if (binaryType != 'arraybuffer' && binaryType != 'blob') {
       throw ArgumentError.value(binaryType, 'binaryType', 'Use arraybuffer or blob.');
     }
+    request.keepAlive?.validate();
     final channel = connectSingleWebSocket(
       request,
-      pingInterval: pingInterval,
+      pingInterval: request.keepAlive?.interval ?? pingInterval,
       binaryType: binaryType,
     );
     try {

@@ -265,11 +265,16 @@ final class DartHttpClientWebSocketRequest {
     required this.uri,
     this.headers = const <String, String>{},
     this.protocols = const <String>[],
+    this.keepAlive,
   });
 
   final Uri uri;
   final Map<String, String> headers;
   final List<String> protocols;
+
+  /// Pings the server and fails the connection when it stops answering.
+  /// `null` keeps the transport's default. Browsers cannot send pings.
+  final WebSocketKeepAlive? keepAlive;
 }
 
 /// Active WebSocket connection returned by a generated client.

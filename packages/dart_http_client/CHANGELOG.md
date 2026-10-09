@@ -1,3 +1,8 @@
+## 0.2.1
+
+- Honor `DartHttpClientWebSocketRequest.keepAlive` as the ping interval; on
+  `dart:io` the pong timeout equals the interval. Browsers reject it.
+
 ## 0.2.0
 
 - Breaking: `DartHttpWebSocketClientTransport` now opens a single connection by

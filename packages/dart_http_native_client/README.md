@@ -114,6 +114,27 @@ stops native receive draining and applies socket backpressure. Queue capacities
 can be configured with `webSocketIncomingCapacity` and
 `webSocketOutgoingCapacity` when opening the transport.
 
+Set `keepAlive` on a request to ping the server with WebSocket ping frames.
+Any received frame counts as an answer; when nothing arrives within the
+timeout of a ping, the stream fails with "keepalive timed out" and the
+connection is released. Regular pings also keep idle connections open through
+firewalls that drop silent flows:
+
+```dart
+final socket = await transport.connect(
+  DartHttpClientWebSocketRequest(
+    uri: Uri.parse('wss://example.com/realtime'),
+    keepAlive: const WebSocketKeepAlive(
+      interval: Duration(seconds: 15),
+      timeout: Duration(seconds: 5),
+    ),
+  ),
+);
+```
+
+A socket whose peer never answers `close()` is torn down after
+`webSocketCloseTimeout` (5 seconds by default).
+
 Outbound Native Exchange buffers can also move directly into the native send
 queue. The send consumes the lease on success or failure, and completes once
 the transport no longer owns the payload:

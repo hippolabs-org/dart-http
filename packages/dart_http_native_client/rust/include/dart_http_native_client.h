@@ -98,7 +98,9 @@ int64_t dart_http_native_client_websocket_connect(
     const char* const* protocols,
     intptr_t protocol_count,
     intptr_t incoming_capacity,
-    intptr_t outgoing_capacity);
+    intptr_t outgoing_capacity,
+    int64_t keep_alive_interval_ms,
+    int64_t keep_alive_timeout_ms);
 int64_t dart_http_native_client_websocket_send_text(
     int64_t client_id,
     int64_t socket_id,

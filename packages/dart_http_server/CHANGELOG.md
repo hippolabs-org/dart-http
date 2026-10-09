@@ -1,3 +1,7 @@
+## 0.3.27
+
+- Require `dart_http_server_runtime` 0.3.53 for WebSocket route keepalive.
+
 ## 0.3.26
 
 - **Breaking:** Adopt the new Dart HTTP package and public API namespace.

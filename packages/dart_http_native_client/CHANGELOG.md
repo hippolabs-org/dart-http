@@ -1,3 +1,12 @@
+## 0.2.25
+
+- Send keepalive pings for requests with `keepAlive` and fail the connection
+  ("keepalive timed out") when no frame arrives within the timeout of a ping.
+  Native ABI 16.
+- Upgrade the native crate to reqwest 0.13 (keeping the ring provider and
+  bundled webpki roots), tokio-tungstenite 0.30 and base64 0.23, and require
+  rustls 0.23.45 or newer (RUSTSEC-2026-0285).
+
 ## 0.2.24
 
 - Tear down a WebSocket whose peer does not answer `close()` within

@@ -9,6 +9,7 @@ const _webSocketEventSent = 6;
 
 extension on NativeHttpClientTransport {
   Future<NativeHttpWebSocket> _connectWebSocket(DartHttpClientWebSocketRequest request) async {
+    final keepAlive = request.keepAlive?..validate();
     _ensureOpen();
     if (request.uri.scheme != 'ws' && request.uri.scheme != 'wss') {
       throw ArgumentError.value(
@@ -53,6 +54,8 @@ extension on NativeHttpClientTransport {
         request.protocols.length,
         _webSocketIncomingCapacity,
         _webSocketOutgoingCapacity,
+        keepAlive?.interval.inMilliseconds ?? 0,
+        keepAlive?.timeout.inMilliseconds ?? 0,
       );
       if (socketId <= 0) {
         throw const NativeHttpClientException('The native WebSocket connection was rejected.');

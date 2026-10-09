@@ -1,3 +1,10 @@
+## 0.3.53
+
+- Ping clients of WebSocket routes with `WebSocketOptions.keepAlive` and close
+  sessions whose client stops answering. Native ABI 23.
+- Upgrade the native crate to jsonschema 0.58 and tower-http 0.7, and drop the
+  pin on the yanked `time` 0.3.48.
+
 ## 0.3.52
 
 - Retain realtime ingress reservations until native payload leases close, respect

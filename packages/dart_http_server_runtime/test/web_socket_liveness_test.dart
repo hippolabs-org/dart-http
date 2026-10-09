@@ -40,6 +40,45 @@ void main() {
     },
   );
 
+  test('keepalive closes a session whose client stops answering pings', () async {
+    final server = await _Server.start();
+    // The peer completes the handshake, then never reads, so pings go unanswered.
+    final peer = await _PausedPeer.open(server.port, '/keepalive');
+    try {
+      final deadline = DateTime.now().add(const Duration(seconds: 3));
+      Map<String, dynamic> state;
+      do {
+        state = await _get(server.port);
+        if (state['keepAliveClosed'] == 1) break;
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+      } while (DateTime.now().isBefore(deadline));
+      expect(state['keepAliveOpened'], 1);
+      expect(state['keepAliveClosed'], 1);
+    } finally {
+      await peer.close();
+      await server.close();
+    }
+  });
+
+  test('keepalive keeps a responsive idle client connected', () async {
+    final server = await _Server.start();
+    final client = await WebSocket.connect('ws://127.0.0.1:${server.port}/keepalive');
+    try {
+      final replies = StreamIterator(client);
+      // Idle for several ping intervals; dart:io answers pings while read.
+      final reply = replies.moveNext();
+      await Future<void>.delayed(const Duration(milliseconds: 1500));
+      client.add('hello');
+      expect(await reply.timeout(const Duration(seconds: 2)), isTrue);
+      expect(replies.current, 'echo:hello');
+      final state = await _get(server.port);
+      expect(state['keepAliveClosed'], 0);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
   test('a stalled WebSocket write leaves reads and HTTP live and expires independently', () async {
     final server = await _Server.start();
     final peer = await _PausedPeer.open(server.port, '/outbound');
@@ -124,6 +163,8 @@ Future<void> _serve(SendPort events) async {
   var received = 0;
   var sent = 0;
   var writeStopped = false;
+  var keepAliveOpened = 0;
+  var keepAliveClosed = 0;
   var maxGapMs = 0.0;
   var lastTick = DateTime.now();
   final timer = Timer.periodic(const Duration(milliseconds: 5), (_) {
@@ -137,6 +178,8 @@ Future<void> _serve(SendPort events) async {
     'received': received,
     'sent': sent,
     'writeStopped': writeStopped,
+    'keepAliveOpened': keepAliveOpened,
+    'keepAliveClosed': keepAliveClosed,
     'maxGapMs': maxGapMs,
   };
   final app = DartHttp<void>();
@@ -161,6 +204,26 @@ Future<void> _serve(SendPort events) async {
       maxGapMs = 0;
       lastTick = DateTime.now();
       await done.future;
+    },
+  );
+  app.websocket(
+    '/keepalive',
+    options: const WebSocketOptions(
+      // Generous timeout: a loaded test machine may answer pings late.
+      keepAlive: WebSocketKeepAlive(
+        interval: Duration(milliseconds: 200),
+        timeout: Duration(milliseconds: 800),
+      ),
+    ),
+    onConnect: (socket) async {
+      keepAliveOpened++;
+      try {
+        await for (final frame in socket.messages.frames()) {
+          await socket.sendText('echo:${frame.text}');
+        }
+      } finally {
+        keepAliveClosed++;
+      }
     },
   );
   app.websocket(

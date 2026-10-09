@@ -37,7 +37,7 @@ use tokio_tungstenite::tungstenite::protocol::{
 use tokio_tungstenite::{Connector, connect_async_tls_with_config};
 use tokio_util::sync::CancellationToken;
 
-const ABI_VERSION: i32 = 15;
+const ABI_VERSION: i32 = 16;
 const RESPONSE_MODE_NATIVE_STREAM: i32 = 0;
 const RESPONSE_MODE_BUFFERED: i32 = 1;
 const RESPONSE_MODE_DIRECT_STREAM: i32 = 2;
@@ -445,7 +445,7 @@ fn shared_engine() -> Result<&'static NativeHttpEngine, String> {
             web_socket_tls.alpn_protocols = vec![b"http/1.1".to_vec()];
             let web_socket_tls = Arc::new(web_socket_tls);
             let client = Client::builder()
-                .use_preconfigured_tls(http_tls)
+                .tls_backend_preconfigured(http_tls)
                 .connect_timeout(SHARED_HTTP_CONNECT_TIMEOUT)
                 .pool_idle_timeout(SHARED_HTTP_IDLE_TIMEOUT)
                 .pool_max_idle_per_host(SHARED_HTTP_MAX_IDLE_PER_HOST)
@@ -453,7 +453,7 @@ fn shared_engine() -> Result<&'static NativeHttpEngine, String> {
                 .build()
                 .map_err(|error| format!("Could not initialize native HTTP client: {error}"))?;
             let no_redirect_client = Client::builder()
-                .use_preconfigured_tls(no_redirect_http_tls)
+                .tls_backend_preconfigured(no_redirect_http_tls)
                 .redirect(Policy::none())
                 .connect_timeout(SHARED_HTTP_CONNECT_TIMEOUT)
                 .pool_idle_timeout(SHARED_HTTP_IDLE_TIMEOUT)
@@ -948,10 +948,13 @@ pub unsafe extern "C" fn dart_http_native_client_websocket_connect(
     protocol_count: isize,
     incoming_capacity: isize,
     outgoing_capacity: isize,
+    keep_alive_interval_ms: i64,
+    keep_alive_timeout_ms: i64,
 ) -> i64 {
     let Some(state) = client_state(client_id) else {
         return 0;
     };
+    let keep_alive = WebSocketKeepAlive::from_millis(keep_alive_interval_ms, keep_alive_timeout_ms);
     if state.closed.load(Ordering::Acquire) {
         return 0;
     }
@@ -1009,6 +1012,7 @@ pub unsafe extern "C" fn dart_http_native_client_websocket_connect(
             event_tx,
             control_event_tx,
             cancellation,
+            keep_alive,
         )
         .await;
     });
@@ -2103,6 +2107,7 @@ async fn run_web_socket(
     events: mpsc::Sender<WebSocketEventData>,
     control_events: mpsc::UnboundedSender<WebSocketEventData>,
     cancellation: CancellationToken,
+    keep_alive: Option<WebSocketKeepAlive>,
 ) {
     let request = match prepare_web_socket_request(&url, headers, protocols) {
         Ok(request) => request,
@@ -2196,6 +2201,9 @@ async fn run_web_socket(
     let reader_events = events.clone();
     let reader_control_events = control_events.clone();
     let reader_cancellation = cancellation.clone();
+    // Every received frame, including pongs, proves the server is alive.
+    let activity = Arc::new(AtomicU64::new(0));
+    let reader_activity = Arc::clone(&activity);
     let reader_task = tokio::spawn(async move {
         loop {
             let incoming = tokio::select! {
@@ -2203,6 +2211,7 @@ async fn run_web_socket(
                 () = reader_cancellation.cancelled() => return,
                 incoming = reader.next() => incoming,
             };
+            reader_activity.fetch_add(1, Ordering::Relaxed);
             let event = match incoming {
                 Some(Ok(Message::Text(value))) => WebSocketEventData::Text(value.to_string()),
                 Some(Ok(Message::Binary(value))) => WebSocketEventData::Binary(value),
@@ -2247,12 +2256,41 @@ async fn run_web_socket(
             }
         }
     });
+    let mut keep_alive = keep_alive.map(|config| KeepAliveState::new(config, activity));
     loop {
         tokio::select! {
             biased;
             () = cancellation.cancelled() => {
                 let _ = writer.close().await;
                 break;
+            }
+            due = next_keep_alive(&mut keep_alive) => {
+                let failure = match due {
+                    KeepAliveDue::Ping => match writer.send(Message::Ping(Bytes::new())).await {
+                        Ok(()) => {
+                            if let Some(state) = keep_alive.as_mut() {
+                                state.ping_sent();
+                            }
+                            None
+                        }
+                        Err(error) => Some(format!("Native WebSocket ping failed: {error}")),
+                    },
+                    KeepAliveDue::Dead => Some(format!(
+                        "Native WebSocket keepalive timed out: no frame within {} ms of a ping.",
+                        keep_alive.as_ref().map_or(0, |state| state.config.timeout.as_millis()),
+                    )),
+                };
+                if let Some(message) = failure {
+                    let _ = send_web_socket_event(
+                        &state,
+                        socket_id,
+                        &events,
+                        &control_events,
+                        WebSocketEventData::Error(message),
+                        &cancellation,
+                    ).await;
+                    break;
+                }
             }
             Some(value) = pong_rx.recv() => {
                 if let Err(error) = writer.send(Message::Pong(value)).await {
@@ -3185,5 +3223,83 @@ impl Api {
             }
         }
         Err(format!("Dart API DL function {name} not found."))
+    }
+}
+
+/// Per-connection WebSocket keepalive: ping every `interval`, fail when no
+/// frame arrives within `timeout` of a ping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WebSocketKeepAlive {
+    interval: Duration,
+    timeout: Duration,
+}
+
+impl WebSocketKeepAlive {
+    fn from_millis(interval_ms: i64, timeout_ms: i64) -> Option<Self> {
+        (interval_ms > 0 && timeout_ms > 0).then(|| Self {
+            interval: Duration::from_millis(interval_ms as u64),
+            timeout: Duration::from_millis(timeout_ms as u64),
+        })
+    }
+}
+
+enum KeepAliveDue {
+    Ping,
+    Dead,
+}
+
+/// Schedules pings and detects a silent peer. `activity` counts received
+/// frames; a ping is answered when the count moved before its deadline.
+struct KeepAliveState {
+    config: WebSocketKeepAlive,
+    activity: Arc<AtomicU64>,
+    next_ping: tokio::time::Instant,
+    pending: Option<(tokio::time::Instant, u64)>,
+}
+
+impl KeepAliveState {
+    fn new(config: WebSocketKeepAlive, activity: Arc<AtomicU64>) -> Self {
+        Self {
+            config,
+            activity,
+            next_ping: tokio::time::Instant::now() + config.interval,
+            pending: None,
+        }
+    }
+
+    /// Waits for the next ping or for a missed deadline. Cancel-safe: state
+    /// changes only after a timer completes.
+    async fn next(&mut self) -> KeepAliveDue {
+        loop {
+            if let Some((deadline, seen)) = self.pending
+                && deadline <= self.next_ping
+            {
+                tokio::time::sleep_until(deadline).await;
+                if self.activity.load(Ordering::Relaxed) == seen {
+                    return KeepAliveDue::Dead;
+                }
+                self.pending = None;
+                continue;
+            }
+            tokio::time::sleep_until(self.next_ping).await;
+            self.next_ping = tokio::time::Instant::now() + self.config.interval;
+            if self.pending.is_none() {
+                return KeepAliveDue::Ping;
+            }
+        }
+    }
+
+    fn ping_sent(&mut self) {
+        self.pending = Some((
+            tokio::time::Instant::now() + self.config.timeout,
+            self.activity.load(Ordering::Relaxed),
+        ));
+    }
+}
+
+async fn next_keep_alive(state: &mut Option<KeepAliveState>) -> KeepAliveDue {
+    match state {
+        Some(state) => state.next().await,
+        None => std::future::pending().await,
     }
 }

@@ -173,6 +173,8 @@ external bool dart_http_native_client_websocket_close_byte_stream(int client_id,
     ffi.IntPtr,
     ffi.IntPtr,
     ffi.IntPtr,
+    ffi.Int64,
+    ffi.Int64,
   )
 >()
 external int dart_http_native_client_websocket_connect(
@@ -184,6 +186,8 @@ external int dart_http_native_client_websocket_connect(
   int protocol_count,
   int incoming_capacity,
   int outgoing_capacity,
+  int keep_alive_interval_ms,
+  int keep_alive_timeout_ms,
 );
 
 @ffi.Native<ffi.Int64 Function(ffi.Int64, ffi.Int64, ffi.Pointer<ffi.Uint8>, ffi.IntPtr)>()

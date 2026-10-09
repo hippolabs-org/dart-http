@@ -2,6 +2,7 @@ import 'package:json_schema/json_schema.dart';
 
 import '../router/route_exposure.dart';
 import '../router/route_options.dart';
+import 'web_socket_keep_alive.dart';
 
 /// Convenience options for inline `Router.websocket` handlers.
 final class WebSocketOptions {
@@ -17,6 +18,7 @@ final class WebSocketOptions {
     this.queryDecoder,
     this.maxPendingMessages = 256,
     this.maxPendingBytes = 8 * 1024 * 1024,
+    this.keepAlive,
   });
 
   /// Optional stable identifier used in generated output and manifests.
@@ -56,6 +58,11 @@ final class WebSocketOptions {
   /// Maximum total incoming payload bytes retained before closing the session.
   final int maxPendingBytes;
 
+  /// Pings each client and closes sessions that stop answering. Browsers
+  /// answer pings automatically, so this also keeps idle browser sessions
+  /// open through firewalls. `null` disables server pings.
+  final WebSocketKeepAlive? keepAlive;
+
   /// Returns a normalized options object suitable for runtime execution.
   WebSocketOptions normalized({String? defaultOperationId}) {
     final resolvedOperationId = operationId ?? defaultOperationId;
@@ -68,6 +75,7 @@ final class WebSocketOptions {
     }
     RangeError.checkValueInInterval(maxPendingMessages, 1, 1 << 20, 'maxPendingMessages');
     RangeError.checkValueInInterval(maxPendingBytes, 1, 1 << 40, 'maxPendingBytes');
+    keepAlive?.validate();
 
     return WebSocketOptions(
       operationId: resolvedOperationId,
@@ -81,6 +89,7 @@ final class WebSocketOptions {
       queryDecoder: queryDecoder,
       maxPendingMessages: maxPendingMessages,
       maxPendingBytes: maxPendingBytes,
+      keepAlive: keepAlive,
     );
   }
 }

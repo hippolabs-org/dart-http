@@ -61,6 +61,8 @@ final class CompiledWebSocketRoute<TServices> {
     'requestBody': null,
     'maxPendingMessages': options.maxPendingMessages,
     'maxPendingBytes': options.maxPendingBytes,
+    'keepAliveIntervalMs': options.keepAlive?.interval.inMilliseconds,
+    'keepAliveTimeoutMs': options.keepAlive?.timeout.inMilliseconds,
   };
 }
 
@@ -80,6 +82,7 @@ WebSocketOptions _effectiveOptions<TServices>(
     queryDecoder: options.queryDecoder,
     maxPendingMessages: options.maxPendingMessages,
     maxPendingBytes: options.maxPendingBytes,
+    keepAlive: options.keepAlive,
   );
 }
 

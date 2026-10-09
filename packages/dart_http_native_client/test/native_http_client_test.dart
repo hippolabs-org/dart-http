@@ -681,6 +681,79 @@ void main() {
     prefixedLease.close();
   });
 
+  group('keepalive', () {
+    // dart:io answers pings only while the server socket is being read.
+    test('fails a connection whose peer stops answering pings', () async {
+      server.listen((request) async {
+        (await WebSocketTransformer.upgrade(request)).listen((_) {});
+      });
+      final proxy = await _SilencingProxy.start(server.port);
+      addTearDown(proxy.close);
+      final socket = await transport.connect(
+        DartHttpClientWebSocketRequest(
+          uri: Uri.parse('ws://127.0.0.1:${proxy.port}/keepalive'),
+          keepAlive: const WebSocketKeepAlive(
+            interval: Duration(milliseconds: 100),
+            timeout: Duration(milliseconds: 150),
+          ),
+        ),
+      );
+      final failure = Completer<Object>();
+      socket.messages.listen((_) {}, onError: failure.complete, onDone: () {});
+      // Healthy pings are answered for a while before the peer goes silent.
+      await Future<void>.delayed(const Duration(milliseconds: 400));
+      expect(failure.isCompleted, isFalse);
+      proxy.silence();
+
+      final error = await failure.future.timeout(const Duration(seconds: 2));
+
+      expect('$error', contains('keepalive timed out'));
+      await proxy.clientDisconnected.timeout(const Duration(seconds: 2));
+    });
+
+    test('keeps a healthy idle connection open', () async {
+      final serverSocket = Completer<WebSocket>();
+      server.listen((request) async {
+        final upgraded = await WebSocketTransformer.upgrade(request);
+        upgraded.listen((_) {});
+        serverSocket.complete(upgraded);
+      });
+      final socket = await transport.connect(
+        DartHttpClientWebSocketRequest(
+          uri: Uri.parse('ws://${server.address.host}:${server.port}/keepalive'),
+          // Generous timeout: a loaded test machine may answer pings late.
+          keepAlive: const WebSocketKeepAlive(
+            interval: Duration(milliseconds: 100),
+            timeout: Duration(milliseconds: 500),
+          ),
+        ),
+      );
+      final errors = <Object>[];
+      final messages = <String>[];
+      socket.messages.listen((message) => messages.add(message.text), onError: errors.add);
+
+      await Future<void>.delayed(const Duration(milliseconds: 1000));
+      (await serverSocket.future).add('still here');
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+
+      expect(errors, isEmpty);
+      expect(messages, ['still here']);
+      await socket.close();
+    });
+
+    test('rejects a non-positive interval', () {
+      expect(
+        () => transport.connect(
+          DartHttpClientWebSocketRequest(
+            uri: Uri.parse('ws://127.0.0.1:1/'),
+            keepAlive: const WebSocketKeepAlive(interval: Duration.zero),
+          ),
+        ),
+        throwsArgumentError,
+      );
+    });
+  });
+
   group('a peer that never answers close', () {
     late _SilencingProxy proxy;
     late NativeHttpClientTransport closingTransport;
