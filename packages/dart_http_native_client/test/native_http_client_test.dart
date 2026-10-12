@@ -681,6 +681,75 @@ void main() {
     prefixedLease.close();
   });
 
+  test('extracts selected JSON audio into native leases and preserves control metadata', () async {
+    server.listen((request) async {
+      final peer = await WebSocketTransformer.upgrade(request);
+      peer.listen(peer.add);
+    });
+    final socket = await transport.connect(
+      DartHttpClientWebSocketRequest(
+        uri: Uri.parse('ws://${server.address.host}:${server.port}/json-audio'),
+      ),
+    );
+    addTearDown(socket.close);
+    (socket as DartHttpClientJsonBinaryWebSocket).setJsonBase64Decoding(const [
+      WebSocketJsonBase64Rule(
+        pointer: '/parts/*/a~1b~0c',
+        matchPointer: '/type',
+        matchValues: ['audio'],
+      ),
+    ]);
+    final incoming = StreamIterator(socket.messages);
+    addTearDown(incoming.cancel);
+    final first = incoming.moveNext();
+    await socket.sendJson({
+      'type': 'control',
+      'parts': [
+        {'a/b~c': 'unchanged'},
+      ],
+    });
+    expect(await first, isTrue);
+    expect(incoming.current.hasJsonBinaryLeases, isFalse);
+    expect(jsonDecode(incoming.current.text)['parts'][0]['a/b~c'], 'unchanged');
+    final second = incoming.moveNext();
+    await socket.sendJson({
+      'type': 'audio',
+      'sequence': 7,
+      'interrupted': true,
+      'parts': [
+        {'a/b~c': 'AQID'},
+        {'a/b~c': 'BAUG'},
+      ],
+    });
+    expect(await second, isTrue);
+    final message = incoming.current;
+    expect(message.hasJsonBinaryLeases, isTrue);
+    final metadata = jsonDecode(message.text);
+    expect(metadata['sequence'], 7);
+    expect(metadata['interrupted'], isTrue);
+    expect(metadata['parts'][0]['a/b~c'], isNull);
+    final payloads = message.takeJsonBinaryLeases();
+    expect(message.takeJsonBinaryLeases(), isEmpty);
+    expect(payloads.keys, ['/parts/0/a~1b~0c', '/parts/1/a~1b~0c']);
+    expect(payloads.values.first.bytesView, [1, 2, 3]);
+    expect(payloads.values.last.bytesView, [4, 5, 6]);
+    message.close(); // Transferred owners remain valid independently.
+    expect(payloads.values.first.isClosed, isFalse);
+    for (final payload in payloads.values) {
+      payload.close();
+    }
+    final third = incoming.moveNext();
+    await socket.sendJson({
+      'type': 'audio',
+      'parts': [
+        {'a/b~c': 'AQID'},
+      ],
+    });
+    expect(await third, isTrue);
+    incoming.current.close();
+    expect(incoming.current.hasJsonBinaryLeases, isFalse);
+  });
+
   group('keepalive', () {
     // dart:io answers pings only while the server socket is being read.
     test('fails a connection whose peer stops answering pings', () async {
@@ -1163,6 +1232,61 @@ void main() {
     expect(receivedBytes, sourceBytes);
     expect(stats.byteCount, sourceBytes.length);
     expect(stats.chunkCount, greaterThan(0));
+  });
+
+  test('canceling a blocked native pump leaves control commands usable', () async {
+    final firstAudio = Completer<void>();
+    final releaseSource = Completer<void>();
+    addTearDown(() {
+      if (!releaseSource.isCompleted) releaseSource.complete();
+    });
+    server.listen((request) async {
+      if (WebSocketTransformer.isUpgradeRequest(request)) {
+        final peer = await WebSocketTransformer.upgrade(request);
+        peer.listen((frame) {
+          if (frame == 'after-cancel') {
+            peer.add('confirmed');
+          } else if (!firstAudio.isCompleted) {
+            firstAudio.complete();
+          }
+        });
+      } else {
+        request.response.add(List<int>.filled(16 * 1024, 1));
+        await request.response.flush();
+        await releaseSource.future;
+        await request.response.close();
+      }
+    });
+    final socket = await transport.connect(
+      DartHttpClientWebSocketRequest(
+        uri: Uri.parse('ws://${server.address.host}:${server.port}/cancel-pump'),
+      ),
+    );
+    addTearDown(socket.close);
+    final received = Completer<void>();
+    final errors = <Object>[];
+    final subscription = socket.messages.listen((message) {
+      try {
+        if (message.text == 'confirmed') received.complete();
+      } finally {
+        message.close();
+      }
+    }, onError: errors.add);
+    addTearDown(subscription.cancel);
+    final source = await transport.sendNative(
+      DartHttpClientRequest(
+        method: HttpMethod.get,
+        uri: Uri.parse('http://${server.address.host}:${server.port}/blocked'),
+      ),
+    );
+    final pump = (socket as DartHttpClientNativeStreamWebSocket).adoptBase64TextStream(source.body);
+    pump.resume(prefix: '{"audio":"', suffix: '"}');
+    await firstAudio.future.timeout(const Duration(seconds: 5));
+    await Future<void>.delayed(const Duration(milliseconds: 30));
+    pump.close();
+    await socket.sendText('after-cancel');
+    await received.future.timeout(const Duration(seconds: 5));
+    expect(errors, isEmpty);
   });
 
   test('rejects sends beyond the configured bounded queue', () async {

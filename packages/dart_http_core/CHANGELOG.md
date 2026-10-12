@@ -1,3 +1,7 @@
+## 0.3.63
+
+- Add provider-neutral JSON/base64 WebSocket extraction rules and single-owner binary payload transfer.
+
 ## 0.3.62
 
 - Add `WebSocketKeepAlive` (ping interval and pong timeout, RFC 6455 ping/pong)

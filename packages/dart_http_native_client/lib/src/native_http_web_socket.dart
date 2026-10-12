@@ -87,6 +87,7 @@ extension on NativeHttpClientTransport {
 final class NativeHttpWebSocket
     implements
         DartHttpClientNativeStreamWebSocket,
+        DartHttpClientJsonBinaryWebSocket,
         DartHttpClientBase64TextWebSocket,
         DartHttpClientCloseAwareWebSocket {
   NativeHttpWebSocket._(this._transport, this._socketId) {
@@ -416,6 +417,23 @@ final class NativeHttpWebSocket
   );
 
   @override
+  void setJsonBase64Decoding(List<WebSocketJsonBase64Rule> rules) {
+    if (_terminal || _closing) throw StateError('Native WebSocket is closed.');
+    final json = jsonEncode(rules.map((rule) => rule.toJson()).toList()).toNativeUtf8();
+    try {
+      if (!native.dart_http_native_client_websocket_set_json_base64_rules(
+        _transport._clientId,
+        _socketId,
+        json.cast(),
+      )) {
+        throw ArgumentError('Native WebSocket rejected JSON base64 extraction rules.');
+      }
+    } finally {
+      calloc.free(json);
+    }
+  }
+
+  @override
   DartHttpClientNativeWebSocketByteStream adoptByteStream(ByteStreamLease stream) {
     _adoptByteStream(stream);
     return _byteStream = _NativeHttpWebSocketByteStream(this);
@@ -564,7 +582,44 @@ final class NativeHttpWebSocket
           if (!_connected.isCompleted) _connected.complete();
         case _webSocketEventText:
           if (!_discardData) {
-            _controller.add(WebSocketMessage.text(text ?? ''));
+            final payloads = <String, BinaryPayloadLease>{};
+            try {
+              final count = native.dart_http_native_client_websocket_event_json_payload_count(
+                event,
+              );
+              for (var index = 0; index < count; index++) {
+                final path = _readCString(
+                  native.dart_http_native_client_websocket_event_json_payload_path(event, index),
+                );
+                if (path == null) {
+                  throw const NativeHttpClientException('Extracted JSON payload has no path.');
+                }
+                final descriptor = calloc<NexBuffer>();
+                if (!native.dart_http_native_client_websocket_event_take_json_payload(
+                  event,
+                  index,
+                  descriptor.cast(),
+                )) {
+                  calloc.free(descriptor);
+                  throw const NativeHttpClientException(
+                    'Extracted JSON payload could not be transferred.',
+                  );
+                }
+                payloads[path] = BinaryPayloadLease.fromByteLease(
+                  NativeBufferLease.fromPointer(descriptor),
+                );
+              }
+              _controller.add(
+                payloads.isEmpty
+                    ? WebSocketMessage.text(text ?? '')
+                    : WebSocketMessage.jsonBinary(text ?? '', payloads),
+              );
+            } catch (_) {
+              for (final payload in payloads.values) {
+                payload.close();
+              }
+              rethrow;
+            }
           }
         case _webSocketEventBinary:
           final descriptor = calloc<NexBuffer>();

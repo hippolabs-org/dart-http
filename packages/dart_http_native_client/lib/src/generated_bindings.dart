@@ -243,9 +243,27 @@ external int dart_http_native_client_websocket_enqueue_text_base64_native(
   int suffix_length,
 );
 
+@ffi.Native<ffi.Size Function(ffi.Pointer<NativeWebSocketEvent>)>()
+external int dart_http_native_client_websocket_event_json_payload_count(
+  ffi.Pointer<NativeWebSocketEvent> event,
+);
+
+@ffi.Native<ffi.Pointer<ffi.Char> Function(ffi.Pointer<NativeWebSocketEvent>, ffi.Size)>()
+external ffi.Pointer<ffi.Char> dart_http_native_client_websocket_event_json_payload_path(
+  ffi.Pointer<NativeWebSocketEvent> event,
+  int index,
+);
+
 @ffi.Native<ffi.Bool Function(ffi.Pointer<NativeWebSocketEvent>, ffi.Pointer<ffi.Void>)>()
 external bool dart_http_native_client_websocket_event_take_binary(
   ffi.Pointer<NativeWebSocketEvent> event,
+  ffi.Pointer<ffi.Void> out_buffer,
+);
+
+@ffi.Native<ffi.Bool Function(ffi.Pointer<NativeWebSocketEvent>, ffi.Size, ffi.Pointer<ffi.Void>)>()
+external bool dart_http_native_client_websocket_event_take_json_payload(
+  ffi.Pointer<NativeWebSocketEvent> event,
+  int index,
   ffi.Pointer<ffi.Void> out_buffer,
 );
 
@@ -355,6 +373,13 @@ external int dart_http_native_client_websocket_send_text_base64_native(
   int suffix_length,
 );
 
+@ffi.Native<ffi.Bool Function(ffi.Int64, ffi.Int64, ffi.Pointer<ffi.Char>)>()
+external bool dart_http_native_client_websocket_set_json_base64_rules(
+  int client_id,
+  int socket_id,
+  ffi.Pointer<ffi.Char> rules_json,
+);
+
 @ffi.Native<ffi.Pointer<NativeWebSocketEvent> Function(ffi.Int64, ffi.Int64, ffi.Int32)>()
 external ffi.Pointer<NativeWebSocketEvent> dart_http_native_client_websocket_take_event(
   int client_id,
@@ -439,6 +464,8 @@ final class NativeWebSocketEvent extends ffi.Struct {
 
   external ffi.Pointer<ffi.Void> binary_buffer;
 
+  external ffi.Pointer<ffi.Void> json_payloads;
+
   static ffi.Pointer<NativeWebSocketEvent> $allocate(
     ffi.Allocator $allocator, {
     required int kind,
@@ -447,11 +474,13 @@ final class NativeWebSocketEvent extends ffi.Struct {
     required int close_code,
     required ffi.Pointer<ffi.Char> text,
     required ffi.Pointer<ffi.Void> binary_buffer,
+    required ffi.Pointer<ffi.Void> json_payloads,
   }) => $allocator<NativeWebSocketEvent>()
     ..ref.kind = kind
     ..ref.socket_id = socket_id
     ..ref.operation_id = operation_id
     ..ref.close_code = close_code
     ..ref.text = text
-    ..ref.binary_buffer = binary_buffer;
+    ..ref.binary_buffer = binary_buffer
+    ..ref.json_payloads = json_payloads;
 }

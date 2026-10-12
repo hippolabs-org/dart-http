@@ -30,3 +30,9 @@ here.
 ## Validation
 
 Run `dart pub get` followed by `dart run melos run ci` from the repository root.
+
+Native client ABI 17 adds generic JSON base64 extraction. Configure
+WebSocketJsonBase64Rule selectors through DartHttpClientJsonBinaryWebSocket;
+selected fields become null metadata and owning native leases keyed by JSON
+pointer. Transfer with WebSocketMessage.takeJsonBinaryLeases or close the
+message. Domain/provider field mappings belong in provider packages.

@@ -57,3 +57,13 @@ final class AppServices {
 
 This package only models the shared contracts. It does not open sockets, accept
 connections, or execute a concrete HTTP runtime by itself.
+
+Native JSON audio extraction (client native ABI 17): opt into
+`DartHttpClientJsonBinaryWebSocket.setJsonBase64Decoding` with generic
+`WebSocketJsonBase64Rule` selectors. RFC 6901 pointers support `*` for array
+items and optional root string-value/prefix matching. Selected base64 fields
+become null in JSON metadata; `WebSocketMessage.takeJsonBinaryLeases()`
+transfers owning payloads keyed by concrete pointer once. Close the message
+to release unclaimed payloads. Invalid selected base64 is a transport error.
+Unselected control frames keep their original JSON. This layer contains no
+provider-specific protocol rules. Update the native asset with the Dart API.

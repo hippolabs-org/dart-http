@@ -29,6 +29,7 @@ typedef struct NativeWebSocketEvent {
   int32_t close_code;
   char* text;
   void* binary_buffer;
+  void* json_payloads;
 } NativeWebSocketEvent;
 
 int32_t dart_http_native_client_initialize_api_dl(void* data);
@@ -200,5 +201,10 @@ bool dart_http_native_client_websocket_event_take_binary(
     void* out_buffer);
 void dart_http_native_client_websocket_free_event(
     NativeWebSocketEvent* event);
+
+bool dart_http_native_client_websocket_set_json_base64_rules(int64_t client_id, int64_t socket_id, const char* rules_json);
+size_t dart_http_native_client_websocket_event_json_payload_count(const NativeWebSocketEvent* event);
+const char* dart_http_native_client_websocket_event_json_payload_path(const NativeWebSocketEvent* event, size_t index);
+bool dart_http_native_client_websocket_event_take_json_payload(NativeWebSocketEvent* event, size_t index, void* out_buffer);
 
 #endif

@@ -37,7 +37,7 @@ use tokio_tungstenite::tungstenite::protocol::{
 use tokio_tungstenite::{Connector, connect_async_tls_with_config};
 use tokio_util::sync::CancellationToken;
 
-const ABI_VERSION: i32 = 16;
+const ABI_VERSION: i32 = 17;
 const RESPONSE_MODE_NATIVE_STREAM: i32 = 0;
 const RESPONSE_MODE_BUFFERED: i32 = 1;
 const RESPONSE_MODE_DIRECT_STREAM: i32 = 2;
@@ -96,6 +96,7 @@ pub struct NativeWebSocketEvent {
     close_code: i32,
     text: *mut c_char,
     binary_buffer: *mut c_void,
+    json_payloads: *mut c_void,
 }
 
 struct ClientState {
@@ -138,6 +139,7 @@ struct WebSocketState {
     cancellation: CancellationToken,
     next_operation_id: AtomicI64,
     byte_stream: Mutex<Option<WebSocketByteStreamPump>>,
+    json_base64_rules: Mutex<Vec<JsonBase64Rule>>,
 }
 
 enum WebSocketCommand {
@@ -158,6 +160,7 @@ enum WebSocketCommand {
 }
 
 struct WebSocketByteStreamPump {
+    stopped: Arc<AtomicBool>,
     controls: std_mpsc::Sender<WebSocketByteStreamControl>,
     cancel: RequestStreamCancel,
     stats: Arc<WebSocketByteStreamStats>,
@@ -171,6 +174,7 @@ struct WebSocketByteStreamStats {
 
 impl Drop for WebSocketByteStreamPump {
     fn drop(&mut self) {
+        self.stopped.store(true, Ordering::Release);
         let _ = self.controls.send(WebSocketByteStreamControl::Stop);
         self.cancel.cancel();
     }
@@ -198,12 +202,230 @@ struct WebSocketBinaryStreamFraming {
 }
 
 enum WebSocketEventData {
-    Opened { protocol: Option<String> },
+    Opened {
+        protocol: Option<String>,
+    },
     Text(String),
+    JsonBinary {
+        metadata: String,
+        payloads: Vec<(String, Bytes)>,
+    },
     Binary(Bytes),
-    Closed { code: Option<u16>, reason: String },
+    Closed {
+        code: Option<u16>,
+        reason: String,
+    },
     Error(String),
-    Sent { operation_id: i64 },
+    Sent {
+        operation_id: i64,
+    },
+}
+
+#[derive(serde::Deserialize)]
+struct JsonBase64Rule {
+    pointer: String,
+    match_pointer: Option<String>,
+    #[serde(default)]
+    match_values: Vec<String>,
+    match_prefix: Option<String>,
+}
+
+struct JsonBinaryPayload {
+    path: CString,
+    buffer: Option<NexBuffer>,
+}
+
+impl Drop for JsonBinaryPayload {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.buffer.take()
+            && let Some(release) = buffer.release
+        {
+            unsafe { release(buffer.context) };
+        }
+    }
+}
+
+fn decode_json_base64(
+    text: String,
+    rules: &[JsonBase64Rule],
+) -> Result<WebSocketEventData, String> {
+    if rules.is_empty() {
+        return Ok(WebSocketEventData::Text(text));
+    }
+    let mut json: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|error| format!("Invalid JSON WebSocket frame: {error}"))?;
+    let mut payloads = Vec::new();
+    for rule in rules {
+        if let Some(pointer) = &rule.match_pointer {
+            let value = json.pointer(pointer).and_then(serde_json::Value::as_str);
+            let Some(value) = value else {
+                continue;
+            };
+            if !rule.match_values.is_empty()
+                && !rule.match_values.iter().any(|candidate| candidate == value)
+            {
+                continue;
+            }
+            if rule
+                .match_prefix
+                .as_ref()
+                .is_some_and(|prefix| !value.starts_with(prefix))
+            {
+                continue;
+            }
+        }
+        let tokens = rule.pointer[1..].split('/').collect::<Vec<_>>();
+        extract_json_base64(&mut json, &tokens, String::new(), &mut payloads)?;
+    }
+    if payloads.is_empty() {
+        return Ok(WebSocketEventData::Text(text));
+    }
+    Ok(WebSocketEventData::JsonBinary {
+        metadata: json.to_string(),
+        payloads,
+    })
+}
+
+fn extract_json_base64(
+    value: &mut serde_json::Value,
+    tokens: &[&str],
+    path: String,
+    payloads: &mut Vec<(String, Bytes)>,
+) -> Result<(), String> {
+    if tokens.is_empty() {
+        let Some(encoded) = value.as_str() else {
+            return Ok(());
+        };
+        let bytes = BASE64_STANDARD
+            .decode(encoded)
+            .map_err(|error| format!("Invalid base64 WebSocket payload at {path}: {error}"))?;
+        payloads.push((path, Bytes::from(bytes)));
+        *value = serde_json::Value::Null;
+        return Ok(());
+    }
+    let token = tokens[0];
+    if token == "*" {
+        if let Some(values) = value.as_array_mut() {
+            for (index, item) in values.iter_mut().enumerate() {
+                extract_json_base64(item, &tokens[1..], format!("{path}/{index}"), payloads)?;
+            }
+        }
+    } else {
+        let key = token.replace("~1", "/").replace("~0", "~");
+        let child = if let Some(values) = value.as_array_mut() {
+            key.parse::<usize>()
+                .ok()
+                .and_then(|index| values.get_mut(index))
+        } else {
+            value
+                .as_object_mut()
+                .and_then(|values| values.get_mut(&key))
+        };
+        if let Some(child) = child {
+            extract_json_base64(child, &tokens[1..], format!("{path}/{token}"), payloads)?;
+        }
+    }
+    Ok(())
+}
+
+#[unsafe(no_mangle)]
+/// Configures generic JSON base64 extraction for subsequent incoming frames.
+/// # Safety
+/// `rules_json` must point to a NUL-terminated UTF-8 JSON array.
+pub unsafe extern "C" fn dart_http_native_client_websocket_set_json_base64_rules(
+    client_id: i64,
+    socket_id: i64,
+    rules_json: *const c_char,
+) -> bool {
+    if rules_json.is_null() {
+        return false;
+    }
+    let Ok(text) = (unsafe { CStr::from_ptr(rules_json) }).to_str() else {
+        return false;
+    };
+    let Ok(rules) = serde_json::from_str::<Vec<JsonBase64Rule>>(text) else {
+        return false;
+    };
+    if rules.len() > 64
+        || rules.iter().any(|rule| {
+            !rule.pointer.starts_with('/')
+                || rule.pointer.len() > 1024
+                || rule.pointer.contains('\0')
+        })
+    {
+        return false;
+    }
+    let Some(socket) = web_socket_state(client_id, socket_id) else {
+        return false;
+    };
+    let Ok(mut configured) = socket.json_base64_rules.lock() else {
+        return false;
+    };
+    *configured = rules;
+    true
+}
+
+#[unsafe(no_mangle)]
+/// Returns the number of extracted binary fields in one JSON text event.
+/// # Safety
+/// `event` must be a live native event.
+pub unsafe extern "C" fn dart_http_native_client_websocket_event_json_payload_count(
+    event: *const NativeWebSocketEvent,
+) -> usize {
+    if event.is_null() {
+        return 0;
+    }
+    let payloads = unsafe { (*event).json_payloads.cast::<Vec<JsonBinaryPayload>>() };
+    if payloads.is_null() {
+        return 0;
+    }
+    unsafe { &*payloads }.len()
+}
+
+#[unsafe(no_mangle)]
+/// Borrows one payload's concrete JSON pointer until the event is freed.
+/// # Safety
+/// `event` must be live; returned text must not be freed by the consumer.
+pub unsafe extern "C" fn dart_http_native_client_websocket_event_json_payload_path(
+    event: *const NativeWebSocketEvent,
+    index: usize,
+) -> *const c_char {
+    if event.is_null() {
+        return ptr::null();
+    }
+    let payloads = unsafe { (*event).json_payloads.cast::<Vec<JsonBinaryPayload>>() };
+    if payloads.is_null() {
+        return ptr::null();
+    }
+    unsafe { &*payloads }
+        .get(index)
+        .map_or(ptr::null(), |payload| payload.path.as_ptr())
+}
+
+#[unsafe(no_mangle)]
+/// Transfers one selected payload once. Unclaimed payloads are released with the event.
+/// # Safety
+/// `event` must be live and `out_buffer` writable for NexBuffer.
+pub unsafe extern "C" fn dart_http_native_client_websocket_event_take_json_payload(
+    event: *mut NativeWebSocketEvent,
+    index: usize,
+    out_buffer: *mut c_void,
+) -> bool {
+    if event.is_null() || out_buffer.is_null() {
+        return false;
+    }
+    let payloads = unsafe { (*event).json_payloads.cast::<Vec<JsonBinaryPayload>>() };
+    if payloads.is_null() {
+        return false;
+    }
+    let Some(payload) = (unsafe { &mut *payloads }).get_mut(index) else {
+        return false;
+    };
+    let Some(buffer) = payload.buffer.take() else {
+        return false;
+    };
+    unsafe { out_buffer.cast::<NexBuffer>().write(buffer) };
+    true
 }
 
 struct AdoptedRequestStream {
@@ -989,6 +1211,7 @@ pub unsafe extern "C" fn dart_http_native_client_websocket_connect(
         cancellation: cancellation.clone(),
         next_operation_id: AtomicI64::new(1),
         byte_stream: Mutex::new(None),
+        json_base64_rules: Mutex::new(Vec::new()),
     });
     let inserted = match state.web_sockets.lock() {
         Ok(mut sockets) => sockets.insert(socket_id, socket).is_none(),
@@ -1396,13 +1619,23 @@ pub unsafe extern "C" fn dart_http_native_client_websocket_adopt_byte_stream(
     let outgoing_slots = Arc::clone(&socket.outgoing_slots);
     let stats = Arc::new(WebSocketByteStreamStats::default());
     let worker_stats = Arc::clone(&stats);
+    let stopped = Arc::new(AtomicBool::new(false));
+    let worker_stopped = Arc::clone(&stopped);
     thread::Builder::new()
         .name("dart-http-ws-stream".to_owned())
         .spawn(move || {
-            run_web_socket_byte_stream(reader, control_rx, commands, outgoing_slots, worker_stats)
+            run_web_socket_byte_stream(
+                reader,
+                control_rx,
+                commands,
+                outgoing_slots,
+                worker_stats,
+                worker_stopped,
+            )
         })
         .expect("native WebSocket byte-stream worker must start");
     *attached = Some(WebSocketByteStreamPump {
+        stopped,
         controls: control_tx,
         cancel,
         stats,
@@ -1767,6 +2000,13 @@ pub unsafe extern "C" fn dart_http_native_client_websocket_free_event(
     }
     let event = unsafe { Box::from_raw(event) };
     unsafe { free_c_string(event.text) };
+    if !event.json_payloads.is_null() {
+        unsafe {
+            drop(Box::from_raw(
+                event.json_payloads.cast::<Vec<JsonBinaryPayload>>(),
+            ))
+        };
+    }
     if !event.binary_buffer.is_null() {
         unsafe { release_buffer_pointer(event.binary_buffer.cast::<NexBuffer>()) };
     }
@@ -1818,6 +2058,7 @@ fn run_web_socket_byte_stream(
     commands: mpsc::UnboundedSender<WebSocketCommand>,
     outgoing_slots: Arc<Semaphore>,
     stats: Arc<WebSocketByteStreamStats>,
+    stopped: Arc<AtomicBool>,
 ) {
     let mut framing: Option<WebSocketByteStreamFraming> = None;
     let mut pending: Option<Bytes> = None;
@@ -1931,6 +2172,11 @@ fn run_web_socket_byte_stream(
                     continue;
                 }
                 Err(error) => {
+                    // Explicit pump cancellation must not tear down its socket.
+                    // Drop marks stopped before waking the blocking reader.
+                    if stopped.load(Ordering::Acquire) {
+                        return;
+                    }
                     let _ = commands.send(WebSocketCommand::PumpError(error));
                     return;
                 }
@@ -2213,7 +2459,24 @@ async fn run_web_socket(
             };
             reader_activity.fetch_add(1, Ordering::Relaxed);
             let event = match incoming {
-                Some(Ok(Message::Text(value))) => WebSocketEventData::Text(value.to_string()),
+                Some(Ok(Message::Text(value))) => {
+                    let rules = reader_state
+                        .web_sockets
+                        .lock()
+                        .ok()
+                        .and_then(|sockets| sockets.get(&socket_id).cloned());
+                    match rules.and_then(|socket| {
+                        socket
+                            .json_base64_rules
+                            .lock()
+                            .ok()
+                            .map(|rules| decode_json_base64(value.to_string(), &rules))
+                    }) {
+                        Some(Ok(event)) => event,
+                        Some(Err(error)) => WebSocketEventData::Error(error),
+                        None => WebSocketEventData::Text(value.to_string()),
+                    }
+                }
                 Some(Ok(Message::Binary(value))) => WebSocketEventData::Binary(value),
                 Some(Ok(Message::Close(frame))) => {
                     let (code, reason) = frame
@@ -2424,7 +2687,7 @@ async fn send_web_socket_event(
 const fn web_socket_event_kind(event: &WebSocketEventData) -> i32 {
     match event {
         WebSocketEventData::Opened { .. } => WEBSOCKET_EVENT_OPENED,
-        WebSocketEventData::Text(_) => WEBSOCKET_EVENT_TEXT,
+        WebSocketEventData::Text(_) | WebSocketEventData::JsonBinary { .. } => WEBSOCKET_EVENT_TEXT,
         WebSocketEventData::Binary(_) => WEBSOCKET_EVENT_BINARY,
         WebSocketEventData::Closed { .. } => WEBSOCKET_EVENT_CLOSED,
         WebSocketEventData::Error(_) => WEBSOCKET_EVENT_ERROR,
@@ -2440,6 +2703,7 @@ fn web_socket_event_to_ffi(socket_id: i64, event: WebSocketEventData) -> NativeW
         close_code: -1,
         text: ptr::null_mut(),
         binary_buffer: ptr::null_mut(),
+        json_payloads: ptr::null_mut(),
     };
     match event {
         WebSocketEventData::Opened { protocol } => {
@@ -2451,6 +2715,18 @@ fn web_socket_event_to_ffi(socket_id: i64, event: WebSocketEventData) -> NativeW
         WebSocketEventData::Text(text) => {
             value.kind = WEBSOCKET_EVENT_TEXT;
             value.text = c_string(text);
+        }
+        WebSocketEventData::JsonBinary { metadata, payloads } => {
+            value.kind = WEBSOCKET_EVENT_TEXT;
+            value.text = c_string(metadata);
+            let payloads = payloads
+                .into_iter()
+                .map(|(path, bytes)| JsonBinaryPayload {
+                    path: CString::new(path).expect("JSON pointer has no NUL"),
+                    buffer: Some(native_buffer(bytes)),
+                })
+                .collect::<Vec<_>>();
+            value.json_payloads = Box::into_raw(Box::new(payloads)).cast();
         }
         WebSocketEventData::Binary(bytes) => {
             value.kind = WEBSOCKET_EVENT_BINARY;

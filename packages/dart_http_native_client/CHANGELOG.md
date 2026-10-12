@@ -1,7 +1,10 @@
 ## 0.2.26
 
+- Extract selected JSON/base64 WebSocket fields into native-owned payloads.
+- Require native client ABI 17 and native artifacts 0.2.25.
+
 - Pin native source builds to Rust 1.99.0, including the macOS 27 library-stripping fix.
-- Bump native artifacts to 0.2.24 for the updated toolchain.
+- Bump native artifacts to 0.2.25 for the updated toolchain.
 
 ## 0.2.25
 

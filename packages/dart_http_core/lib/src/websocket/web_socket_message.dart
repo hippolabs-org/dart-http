@@ -8,7 +8,7 @@ enum WebSocketMessageKind { text, binary }
 
 /// One incoming or outgoing WebSocket data frame.
 final class WebSocketMessage {
-  WebSocketMessage._({required this.kind, this._bytes, this._binaryLease});
+  WebSocketMessage._({required this.kind, this._bytes, this._binaryLease, this._jsonBinaryLeases});
 
   /// Creates a text frame from a Dart string.
   factory WebSocketMessage.text(String value) {
@@ -29,11 +29,31 @@ final class WebSocketMessage {
     return WebSocketMessage._(kind: WebSocketMessageKind.binary, binaryLease: lease);
   }
 
+  /// A JSON text frame with selected base64 fields removed and represented
+  /// by native binary leases keyed by RFC 6901 JSON pointer. The owner must
+  /// transfer or close every lease. This is opt-in protocol preprocessing.
+  factory WebSocketMessage.jsonBinary(String metadata, Map<String, BinaryPayloadLease> payloads) =>
+      WebSocketMessage._(
+        kind: WebSocketMessageKind.text,
+        bytes: Uint8List.fromList(utf8.encode(metadata)),
+        jsonBinaryLeases: payloads,
+      );
+
   /// Whether this is a text or binary frame.
   final WebSocketMessageKind kind;
 
   Uint8List? _bytes;
   BinaryPayloadLease? _binaryLease;
+  Map<String, BinaryPayloadLease>? _jsonBinaryLeases;
+
+  bool get hasJsonBinaryLeases => _jsonBinaryLeases?.isNotEmpty ?? false;
+
+  /// Transfers all extracted payloads once; ordinary text frames return an empty map.
+  Map<String, BinaryPayloadLease> takeJsonBinaryLeases() {
+    final payloads = _jsonBinaryLeases;
+    _jsonBinaryLeases = null;
+    return payloads ?? <String, BinaryPayloadLease>{};
+  }
 
   /// Raw frame bytes.
   ///
@@ -74,6 +94,10 @@ final class WebSocketMessage {
 
   /// Releases a leased binary payload without copying it.
   void close() {
+    for (final payload in _jsonBinaryLeases?.values ?? const <BinaryPayloadLease>[]) {
+      payload.close();
+    }
+    _jsonBinaryLeases = null;
     _binaryLease?.close();
     _binaryLease = null;
   }

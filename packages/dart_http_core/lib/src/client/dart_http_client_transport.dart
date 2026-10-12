@@ -311,6 +311,35 @@ abstract interface class DartHttpClientCloseAwareWebSocket implements DartHttpCl
   DartHttpClientWebSocketCloseDetails? get closeDetails;
 }
 
+/// Generic opt-in JSON base64 extraction, before incoming payloads enter Dart.
+/// Pointers use RFC 6901 escaping; `*` traverses every array element. A matching
+/// field is replaced with null in the JSON metadata and its lease is keyed by
+/// its concrete pointer on WebSocketMessage. Other fields retain their order.
+final class WebSocketJsonBase64Rule {
+  const WebSocketJsonBase64Rule({
+    required this.pointer,
+    this.matchPointer,
+    this.matchValues = const [],
+    this.matchPrefix,
+  });
+  final String pointer;
+  final String? matchPointer;
+  final List<String> matchValues;
+  final String? matchPrefix;
+  Map<String, Object?> toJson() => {
+    'pointer': pointer,
+    'match_pointer': ?matchPointer,
+    'match_values': matchValues,
+    'match_prefix': ?matchPrefix,
+  };
+}
+
+abstract interface class DartHttpClientJsonBinaryWebSocket implements DartHttpClientWebSocket {
+  /// Configure before requesting protocol audio. Invalid JSON/base64 fails the
+  /// connection; unmatched frames remain ordinary text. At most 64 rules.
+  void setJsonBase64Decoding(List<WebSocketJsonBase64Rule> rules);
+}
+
 /// Optional WebSocket capability for consuming binary payload ownership.
 ///
 /// Implementations may transfer native payloads directly into their outbound
