@@ -1,3 +1,8 @@
+## 0.2.26
+
+- Pin native source builds to Rust 1.99.0, including the macOS 27 library-stripping fix.
+- Bump native artifacts to 0.2.24 for the updated toolchain.
+
 ## 0.2.25
 
 - Send keepalive pings for requests with `keepAlive` and fail the connection

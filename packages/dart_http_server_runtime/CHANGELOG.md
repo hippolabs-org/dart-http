@@ -1,3 +1,8 @@
+## 0.3.54
+
+- Pin native source builds to Rust 1.99.0, including the macOS 27 library-stripping fix.
+- Bump native artifacts to 0.1.33 for the updated toolchain.
+
 ## 0.3.53
 
 - Ping clients of WebSocket routes with `WebSocketOptions.keepAlive` and close

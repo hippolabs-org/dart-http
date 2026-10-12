@@ -35,7 +35,7 @@ jobs:
           - dart_http_server_runtime
     steps:
       - uses: actions/checkout@v5
-      - run: rustup toolchain install 1.95.0 --profile minimal
+      - run: rustup toolchain install 1.99.0 --profile minimal
       - run: >-
           cargo fmt --check
           --manifest-path packages/${{ matrix.package }}/rust/Cargo.toml
@@ -64,7 +64,7 @@ jobs:
           sdk: ${{ env.DART_VERSION }}
       - name: Install Rust toolchain
         shell: bash
-        run: rustup toolchain install 1.95.0 --profile minimal
+        run: rustup toolchain install 1.99.0 --profile minimal
       - name: Get dependencies
         working-directory: packages/dart_http_native_client
         run: dart pub get
