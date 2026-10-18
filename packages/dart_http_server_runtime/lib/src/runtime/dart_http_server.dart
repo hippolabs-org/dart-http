@@ -1447,6 +1447,7 @@ Map<String, Object?> _middlewareConfigurationJson(RustMiddlewareConfiguration co
     RustCorsMiddlewareConfiguration() => {
       'allowOrigins': configuration.allowOrigins,
       'allowHeaders': configuration.allowHeaders,
+      'exposeHeaders': configuration.exposeHeaders,
     },
     RustTracingMiddlewareConfiguration() => {
       if (configuration.openTelemetry case final openTelemetry?)

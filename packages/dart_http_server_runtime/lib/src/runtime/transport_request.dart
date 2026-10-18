@@ -6,7 +6,7 @@ import 'native_request.dart';
 enum TransportRequestKind { http, webSocket, webTransport }
 
 /// Encoded request body kind received from the native transport.
-enum TransportRequestBodyKind { none, text, json, multipart }
+enum TransportRequestBodyKind { none, text, json, multipart, binary }
 
 /// Low-level request passed from the native transport runtime into Dart.
 ///

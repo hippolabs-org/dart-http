@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:math' as math;
 
 import 'package:dart_http_core/dart_http_core.dart';
@@ -107,6 +108,9 @@ final class ResumableUploadClient {
     void Function(ResumableUploadEvent event)? onEvent,
     Future<void>? abortTrigger,
   }) async {
+    if (checkpoint.protocolInteropVersion != ResumableUploadProtocol.draftInteropVersion) {
+      throw const ResumableUploadProtocolException('Checkpoint uses a different protocol version.');
+    }
     if (source.length != checkpoint.totalBytes) {
       throw ResumableUploadSourceException(
         'Upload source length changed from ${checkpoint.totalBytes} to ${source.length}.',
@@ -115,21 +119,19 @@ final class ResumableUploadClient {
     final inspection = await _inspect(
       checkpoint.uploadUri,
       expectedLength: checkpoint.totalBytes,
+      minimumOffset: checkpoint.offset,
       headers: headers,
       onEvent: onEvent,
       abortTrigger: abortTrigger,
     );
     _emitCheckpoint(inspection.checkpoint, onCheckpoint: onCheckpoint, onEvent: onEvent);
     if (inspection.checkpoint.complete) {
-      onEvent?.call(
-        ResumableUploadEvent(
-          type: ResumableUploadEventType.completed,
-          checkpoint: inspection.checkpoint,
-        ),
-      );
-      return ResumableUploadResult(
-        checkpoint: inspection.checkpoint,
-        response: inspection.response,
+      return await _finish(
+        inspection.checkpoint,
+        inspection.response,
+        headers: headers,
+        onEvent: onEvent,
+        abortTrigger: abortTrigger,
       );
     }
     return _uploadFrom(
@@ -138,6 +140,39 @@ final class ResumableUploadClient {
       limits: inspection.limits,
       headers: headers,
       onCheckpoint: onCheckpoint,
+      onEvent: onEvent,
+      abortTrigger: abortTrigger,
+    );
+  }
+
+  /// Recovers the application result after byte completion, without reopening
+  /// the source file. The server must confirm that no bytes remain to upload.
+  Future<ResumableUploadResult> finalize({
+    required ResumableUploadCheckpoint checkpoint,
+    Map<String, String> headers = const {},
+    void Function(ResumableUploadCheckpoint checkpoint)? onCheckpoint,
+    void Function(ResumableUploadEvent event)? onEvent,
+    Future<void>? abortTrigger,
+  }) async {
+    if (checkpoint.protocolInteropVersion != ResumableUploadProtocol.draftInteropVersion) {
+      throw const ResumableUploadProtocolException('Checkpoint uses a different protocol version.');
+    }
+    final inspection = await _inspect(
+      checkpoint.uploadUri,
+      expectedLength: checkpoint.totalBytes,
+      minimumOffset: checkpoint.offset,
+      headers: headers,
+      onEvent: onEvent,
+      abortTrigger: abortTrigger,
+    );
+    _emitCheckpoint(inspection.checkpoint, onCheckpoint: onCheckpoint, onEvent: onEvent);
+    if (!inspection.checkpoint.complete) {
+      throw const ResumableUploadProtocolException('Upload is incomplete; resume with its source.');
+    }
+    return _finish(
+      inspection.checkpoint,
+      inspection.response,
+      headers: headers,
       onEvent: onEvent,
       abortTrigger: abortTrigger,
     );
@@ -194,7 +229,7 @@ final class ResumableUploadClient {
     var currentLimits = limits;
     var retryAttempt = 0;
     var aborted = false;
-    abortTrigger?.then<void>((_) => aborted = true);
+    abortTrigger?.then<void>((_) => aborted = true, onError: (Object _, StackTrace _) {});
 
     if (currentLimits?.maxSize case final maxSize? when checkpoint.totalBytes > maxSize) {
       throw ResumableUploadProtocolException(
@@ -220,6 +255,9 @@ final class ResumableUploadClient {
           'Configured chunk size $appendLength is below the server minimum $minAppendSize.',
         );
       }
+      final attemptCheckpoint = checkpoint;
+      var acceptingProgress = true;
+      var lastTransportBytes = -1;
       try {
         final response = await transport.send(
           DartHttpClientRequest(
@@ -243,10 +281,27 @@ final class ResumableUploadClient {
               onEvent: onEvent,
             ),
             bodyStreamLength: appendLength,
+            onUploadProgress: (progress) {
+              if (!acceptingProgress ||
+                  progress.bytes <= lastTransportBytes ||
+                  progress.bytes > appendLength) {
+                return;
+              }
+              lastTransportBytes = progress.bytes;
+              onEvent?.call(
+                ResumableUploadEvent(
+                  type: ResumableUploadEventType.uploading,
+                  checkpoint: attemptCheckpoint,
+                  transportOffset: attemptCheckpoint.offset + progress.bytes,
+                  transportMeasurement: progress.measurement,
+                ),
+              );
+            },
             abortTrigger: abortTrigger,
           ),
         );
 
+        acceptingProgress = false;
         final responseComplete = ResumableUploadProtocol.parseBoolean(
           ResumableUploadProtocol.header(response.headers, ResumableUploadProtocol.completeHeader),
         );
@@ -254,22 +309,26 @@ final class ResumableUploadClient {
           final responseOffset = ResumableUploadProtocol.parseNonNegativeInteger(
             ResumableUploadProtocol.header(response.headers, ResumableUploadProtocol.offsetHeader),
           );
-          if (responseOffset != null) {
-            _validateOffset(responseOffset, checkpoint: checkpoint);
+          if (responseOffset == null || responseOffset != checkpoint.totalBytes) {
+            throw const ResumableUploadProtocolException(
+              'Completed upload must confirm its full offset.',
+            );
           }
-          checkpoint = checkpoint.copyWith(
-            offset: responseOffset ?? checkpoint.offset,
-            complete: true,
-          );
+          checkpoint = checkpoint.copyWith(offset: responseOffset, complete: true);
           _emitCheckpoint(checkpoint, onCheckpoint: onCheckpoint, onEvent: onEvent);
-          onEvent?.call(
-            ResumableUploadEvent(type: ResumableUploadEventType.completed, checkpoint: checkpoint),
+          return await _finish(
+            checkpoint,
+            response,
+            headers: headers,
+            onEvent: onEvent,
+            abortTrigger: abortTrigger,
           );
-          return ResumableUploadResult(checkpoint: checkpoint, response: response);
         }
 
         if (!_isSuccess(response.status)) {
-          if (!_isRetryable(response.status)) throw ResumableUploadRejectedException(response);
+          if (!_isRetryable(response.status) && !_isOffsetMismatch(response)) {
+            throw ResumableUploadRejectedException(response);
+          }
           throw _RetryableResponseException(response);
         }
 
@@ -277,7 +336,12 @@ final class ResumableUploadClient {
         final responseOffset = ResumableUploadProtocol.parseNonNegativeInteger(
           ResumableUploadProtocol.header(response.headers, ResumableUploadProtocol.offsetHeader),
         );
-        final nextOffset = responseOffset ?? checkpoint.offset + appendLength;
+        if (responseOffset == null || responseOffset > checkpoint.offset + appendLength) {
+          throw const ResumableUploadProtocolException(
+            'Append response did not confirm a valid offset.',
+          );
+        }
+        final nextOffset = responseOffset;
         _validateOffset(nextOffset, checkpoint: checkpoint);
         if (nextOffset == checkpoint.offset && appendLength > 0) {
           throw const ResumableUploadProtocolException(
@@ -288,15 +352,11 @@ final class ResumableUploadClient {
         checkpoint = checkpoint.copyWith(offset: nextOffset, complete: complete);
         retryAttempt = 0;
         _emitCheckpoint(checkpoint, onCheckpoint: onCheckpoint, onEvent: onEvent);
-        if (complete) {
-          onEvent?.call(
-            ResumableUploadEvent(type: ResumableUploadEventType.completed, checkpoint: checkpoint),
-          );
-          return ResumableUploadResult(checkpoint: checkpoint, response: response);
-        }
       } on ResumableUploadException {
+        acceptingProgress = false;
         rethrow;
       } catch (error) {
+        acceptingProgress = false;
         var recoveryError = error;
         while (true) {
           if (aborted) {
@@ -316,7 +376,7 @@ final class ResumableUploadClient {
               error: recoveryError,
             ),
           );
-          await _delay(delay);
+          await _waitToRetry(delay, abortTrigger);
           if (aborted) {
             throw ResumableUploadPausedException(checkpoint: checkpoint, cause: recoveryError);
           }
@@ -324,6 +384,7 @@ final class ResumableUploadClient {
             final inspection = await _inspect(
               checkpoint.uploadUri,
               expectedLength: checkpoint.totalBytes,
+              minimumOffset: checkpoint.offset,
               headers: headers,
               onEvent: onEvent,
               abortTrigger: abortTrigger,
@@ -332,13 +393,13 @@ final class ResumableUploadClient {
             currentLimits = inspection.limits ?? currentLimits;
             _emitCheckpoint(checkpoint, onCheckpoint: onCheckpoint, onEvent: onEvent);
             if (checkpoint.complete) {
-              onEvent?.call(
-                ResumableUploadEvent(
-                  type: ResumableUploadEventType.completed,
-                  checkpoint: checkpoint,
-                ),
+              return await _finish(
+                checkpoint,
+                inspection.response,
+                headers: headers,
+                onEvent: onEvent,
+                abortTrigger: abortTrigger,
               );
-              return ResumableUploadResult(checkpoint: checkpoint, response: inspection.response);
             }
             break;
           } on ResumableUploadException {
@@ -353,9 +414,102 @@ final class ResumableUploadClient {
     throw const ResumableUploadProtocolException('Upload loop ended without a final response.');
   }
 
+  Future<ResumableUploadResult> _finish(
+    ResumableUploadCheckpoint checkpoint,
+    DartHttpClientResponse response, {
+    required Map<String, String> headers,
+    required void Function(ResumableUploadEvent event)? onEvent,
+    required Future<void>? abortTrigger,
+  }) async {
+    if (!_isSuccess(response.status)) {
+      throw ResumableUploadFinalizationException(checkpoint: checkpoint, response: response);
+    }
+    final location = ResumableUploadProtocol.header(
+      response.headers,
+      ResumableUploadProtocol.finalizationLocationHeader,
+    );
+    if (location != null) {
+      final uri = checkpoint.uploadUri.resolve(location);
+      // Never forward application credentials to an advertised foreign origin.
+      if (uri.origin != checkpoint.uploadUri.origin) {
+        throw const ResumableUploadProtocolException('Finalization must use the upload origin.');
+      }
+      onEvent?.call(
+        ResumableUploadEvent(type: ResumableUploadEventType.finalizing, checkpoint: checkpoint),
+      );
+      var attempt = 0;
+      var aborted = false;
+      abortTrigger?.then<void>((_) => aborted = true, onError: (Object _, StackTrace _) {});
+      while (true) {
+        try {
+          if (aborted) throw StateError('Finalization interrupted.');
+          response = await transport.send(
+            DartHttpClientRequest(
+              method: HttpMethod.post,
+              uri: uri,
+              headers: {
+                ...headers,
+                ResumableUploadProtocol.draftInteropVersionHeader:
+                    '${ResumableUploadProtocol.draftInteropVersion}',
+              },
+              bodyBytes: const [],
+              abortTrigger: abortTrigger,
+            ),
+          );
+          if (_isSuccess(response.status)) break;
+          if (!_isRetryable(response.status)) {
+            throw ResumableUploadFinalizationException(checkpoint: checkpoint, response: response);
+          }
+          throw _RetryableResponseException(response);
+        } on ResumableUploadException {
+          rethrow;
+        } catch (error) {
+          if (aborted || attempt >= retryPolicy.maxRetries) {
+            throw ResumableUploadFinalizationException(
+              checkpoint: checkpoint,
+              response: error is _RetryableResponseException ? error.response : null,
+              cause: error,
+            );
+          }
+          attempt++;
+          onEvent?.call(
+            ResumableUploadEvent(
+              type: ResumableUploadEventType.waitingToRetry,
+              checkpoint: checkpoint,
+              retryAttempt: attempt,
+              retryDelay: retryPolicy.delayFor(attempt),
+              error: error,
+            ),
+          );
+          await _waitToRetry(retryPolicy.delayFor(attempt), abortTrigger);
+        }
+      }
+    }
+    onEvent?.call(
+      ResumableUploadEvent(type: ResumableUploadEventType.completed, checkpoint: checkpoint),
+    );
+    return ResumableUploadResult(checkpoint: checkpoint, response: response);
+  }
+
+  Future<void> _waitToRetry(Duration delay, Future<void>? abortTrigger) =>
+      Future.any<void>([_delay(delay), ?abortTrigger]);
+
+  static bool _isOffsetMismatch(DartHttpClientResponse response) {
+    if (response.status != 400) return false;
+    try {
+      final problem = jsonDecode(response.body);
+      return problem is Map &&
+          problem['type'] ==
+              'https://iana.org/assignments/http-problem-types#mismatching-upload-offset';
+    } on FormatException {
+      return false;
+    }
+  }
+
   Future<_Inspection> _inspect(
     Uri uploadUri, {
     required int expectedLength,
+    int minimumOffset = 0,
     required Map<String, String> headers,
     void Function(ResumableUploadEvent event)? onEvent,
     Future<void>? abortTrigger,
@@ -396,7 +550,9 @@ final class ResumableUploadClient {
         'Server upload length changed from $expectedLength to $length.',
       );
     }
-    if (offset > expectedLength) {
+    if (offset < minimumOffset ||
+        offset > expectedLength ||
+        (complete && offset != expectedLength)) {
       throw ResumableUploadProtocolException(
         'Server offset $offset exceeds upload length $expectedLength.',
       );
@@ -430,9 +586,9 @@ final class ResumableUploadClient {
       emitted += chunk.length;
       onEvent?.call(
         ResumableUploadEvent(
-          type: ResumableUploadEventType.uploading,
+          type: ResumableUploadEventType.preparing,
           checkpoint: checkpoint,
-          optimisticOffset: checkpoint.offset + emitted,
+          preparedOffset: checkpoint.offset + emitted,
         ),
       );
       yield chunk;

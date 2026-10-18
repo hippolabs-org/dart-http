@@ -40,3 +40,14 @@ final class ResumableUploadPausedException extends ResumableUploadException {
   final ResumableUploadCheckpoint checkpoint;
   final Object cause;
 }
+
+/// Bytes are complete, but application finalization failed or was interrupted.
+/// Resume [checkpoint] to retry finalization without retransmitting the source.
+final class ResumableUploadFinalizationException extends ResumableUploadException {
+  const ResumableUploadFinalizationException({required this.checkpoint, this.response, this.cause})
+    : super('Upload bytes are complete, but finalization did not succeed.');
+
+  final ResumableUploadCheckpoint checkpoint;
+  final DartHttpClientResponse? response;
+  final Object? cause;
+}

@@ -1150,6 +1150,14 @@ void main() {
           final text = utf8.decode(await _collectStreamBytes(request.bodyStream!));
           expect(openedFileStream, isTrue);
           expect(request.bodyStreamLength, utf8.encode(text).length);
+          expect(progressEvents, isEmpty);
+          request.onUploadProgress!(
+            DartHttpClientUploadProgress(
+              bytes: request.bodyStreamLength!,
+              totalBytes: request.bodyStreamLength,
+              measurement: DartHttpClientUploadMeasurement.transmitted,
+            ),
+          );
           expect(progressEvents, isNotEmpty);
           expect(progressEvents.last.bytesSent, request.bodyStreamLength);
           expect(progressEvents.last.totalBytes, request.bodyStreamLength);

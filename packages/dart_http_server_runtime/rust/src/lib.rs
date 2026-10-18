@@ -315,6 +315,7 @@ enum NativeBodyKind {
     Text = 1,
     Json = 2,
     Multipart = 3,
+    Binary = 4,
 }
 
 #[repr(u8)]
@@ -1061,6 +1062,8 @@ struct RouteSegmentManifest {
 #[serde(rename_all = "camelCase")]
 struct RequestBodyManifest {
     content_type: String,
+    #[serde(default)]
+    binary: bool,
     schema_id: Option<String>,
     #[serde(default)]
     streaming: bool,
@@ -1107,6 +1110,7 @@ struct RequestBodyValidation {
 
 #[derive(Clone, Copy)]
 enum RequestBodyKind {
+    Binary,
     Json,
     Text,
     Multipart,
@@ -1206,6 +1210,8 @@ struct CorsMiddlewareConfiguration {
     allow_origins: Vec<String>,
     #[serde(default)]
     allow_headers: Vec<String>,
+    #[serde(default)]
+    expose_headers: Vec<String>,
 }
 
 #[repr(i32)]
@@ -4419,6 +4425,15 @@ fn cors_layer(configuration: CorsMiddlewareConfiguration) -> Result<CorsLayer, S
         layer.allow_headers(headers)
     };
 
+    let exposed = configuration
+        .expose_headers
+        .iter()
+        .map(|header| {
+            HeaderName::try_from(header.as_str())
+                .map_err(|error| format!("Invalid exposed CORS header '{header}': {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    layer = layer.expose_headers(exposed);
     Ok(layer)
 }
 
@@ -4519,7 +4534,11 @@ fn compile_route(
             route
                 .request_body
                 .map(|request_body| RequestBodyValidation {
-                    kind: body_kind(&request_body.content_type),
+                    kind: if request_body.binary {
+                        RequestBodyKind::Binary
+                    } else {
+                        body_kind(&request_body.content_type)
+                    },
                     content_type: request_body.content_type,
                     schema_id: request_body.schema_id,
                     streaming: request_body.streaming,
@@ -5070,6 +5089,11 @@ fn validate_and_read_body(
         }
 
         return match request_body.kind {
+            RequestBodyKind::Binary => Ok(ValidatedBody {
+                bytes: Some(body.to_vec()),
+                kind: NativeBodyKind::Binary,
+                json: None,
+            }),
             RequestBodyKind::Json => parse_json_body(body),
             RequestBodyKind::Multipart => Ok(ValidatedBody {
                 bytes: Some(body.to_vec()),
@@ -5149,6 +5173,10 @@ fn validate_request_body(
     request_body: &RequestBodyValidation,
     runtime_state: &ServerRuntimeState,
 ) -> Result<(), Response<Body>> {
+    // JSON Schema cannot validate an opaque binary payload as JSON text.
+    if matches!(body.kind, NativeBodyKind::Binary) {
+        return Ok(());
+    }
     let Some(schema_id) = request_body.schema_id.as_deref() else {
         return Ok(());
     };
@@ -5164,7 +5192,9 @@ fn validate_request_body(
             }
             None => serde_json::Value::Null,
         },
-        NativeBodyKind::Multipart | NativeBodyKind::None => serde_json::Value::Null,
+        NativeBodyKind::Multipart | NativeBodyKind::None | NativeBodyKind::Binary => {
+            serde_json::Value::Null
+        }
     };
 
     validate_schema_value(schema_id, &instance, "Request body", runtime_state)

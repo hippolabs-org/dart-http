@@ -1,3 +1,7 @@
+import 'dart:async';
+
+import 'package:dart_http_core/dart_http_core.dart';
+
 import '../models/content.dart';
 
 /// Server-side state for one temporary upload resource.
@@ -44,6 +48,16 @@ abstract interface class ResumableUploadStore {
   });
 
   Future<void> cancel(String id);
+}
+
+/// Stores that coordinate and persist application finalization results.
+///
+/// Serialize finalization with append/cancel, require complete bytes, and cache
+/// successful responses durably. Failures must remain retryable. The callback
+/// must itself be idempotent: a process can crash after its side effects but
+/// before its response is persisted. Keep domain storage out of HTTP core.
+abstract interface class ResumableUploadFinalizationStore implements ResumableUploadStore {
+  Future<RawResponse> finalize(String id, FutureOr<RawResponse> Function() operation);
 }
 
 /// Marker for stores that adopt runtime-native upload streams directly.

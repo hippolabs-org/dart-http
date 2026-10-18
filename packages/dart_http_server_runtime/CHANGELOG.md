@@ -1,3 +1,7 @@
+## 0.3.55
+
+- Preserve declared binary request bodies without UTF-8 decoding and expose configured response headers through CORS. Native artifacts 0.1.34.
+
 ## 0.3.54
 
 - Pin native source builds to Rust 1.99.0, including the macOS 27 library-stripping fix.

@@ -1,13 +1,15 @@
 import 'dart:async';
 import 'dart:typed_data';
 
+import 'package:dart_http_core/dart_http_core.dart';
+
 import '../models/content.dart';
 import 'resumable_upload_store.dart';
 
 typedef ResumableUploadIdGenerator = String Function();
 
 /// In-memory reference store intended for tests and examples.
-final class InMemoryResumableUploadStore implements ResumableUploadStore {
+final class InMemoryResumableUploadStore implements ResumableUploadFinalizationStore {
   InMemoryResumableUploadStore({ResumableUploadIdGenerator? idGenerator})
     : _idGenerator = idGenerator ?? _defaultId;
 
@@ -92,6 +94,20 @@ final class InMemoryResumableUploadStore implements ResumableUploadStore {
   }
 
   @override
+  Future<RawResponse> finalize(String id, FutureOr<RawResponse> Function() operation) async {
+    final entry = _activeEntry(id);
+    if (entry == null) throw ResumableUploadNotFoundException(id);
+    return entry.synchronized(() async {
+      if (entry.canceled || _entries[id] != entry) throw ResumableUploadNotFoundException(id);
+      if (!entry.complete) throw const ResumableUploadLengthException('Upload is incomplete.');
+      if (entry.finalizationResponse case final response?) return response;
+      final response = await operation();
+      if (response.status >= 200 && response.status < 300) entry.finalizationResponse = response;
+      return response;
+    });
+  }
+
+  @override
   Future<void> cancel(String id) async {
     final entry = _entries[id];
     if (entry == null) return;
@@ -128,6 +144,7 @@ final class _Entry {
   final Map<String, String> metadata;
   final DateTime? expiresAt;
   final List<int> bytes = <int>[];
+  RawResponse? finalizationResponse;
   bool complete = false;
   bool canceled = false;
   Future<void> _tail = Future<void>.value();

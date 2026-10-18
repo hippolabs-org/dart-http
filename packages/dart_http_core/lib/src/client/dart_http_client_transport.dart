@@ -5,6 +5,9 @@ import 'dart:typed_data';
 import 'package:native_exchange/native_exchange.dart';
 
 import '../http.dart';
+import 'dart_http_client_upload_progress.dart';
+
+export 'dart_http_client_upload_progress.dart';
 import '../web_socket.dart';
 import '../web_transport.dart';
 
@@ -56,6 +59,7 @@ final class DartHttpClientRequest {
     this.bodyStreamLength,
     this.nativeBody,
     this.abortTrigger,
+    this.onUploadProgress,
     this.responseMode = DartHttpClientResponseMode.buffered,
     this.redirectPolicy = DartHttpClientRedirectPolicy.follow,
   }) : assert(
@@ -85,6 +89,9 @@ final class DartHttpClientRequest {
   final DartHttpClientNativeBody? nativeBody;
   final Future<void>? abortTrigger;
 
+  /// Optional transport measurement for this request attempt.
+  final void Function(DartHttpClientUploadProgress progress)? onUploadProgress;
+
   /// Expected response delivery semantics.
   final DartHttpClientResponseMode responseMode;
 
@@ -102,6 +109,7 @@ final class DartHttpClientRequest {
     int? bodyStreamLength,
     DartHttpClientNativeBody? nativeBody,
     Future<void>? abortTrigger,
+    void Function(DartHttpClientUploadProgress progress)? onUploadProgress,
     DartHttpClientResponseMode? responseMode,
     DartHttpClientRedirectPolicy? redirectPolicy,
   }) {
@@ -116,6 +124,7 @@ final class DartHttpClientRequest {
       bodyStreamLength: bodyStreamLength ?? this.bodyStreamLength,
       nativeBody: nativeBody ?? this.nativeBody,
       abortTrigger: abortTrigger ?? this.abortTrigger,
+      onUploadProgress: onUploadProgress ?? this.onUploadProgress,
       responseMode: responseMode ?? this.responseMode,
       redirectPolicy: redirectPolicy ?? this.redirectPolicy,
     );

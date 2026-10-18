@@ -1,6 +1,6 @@
 name: dart_http_resumable_upload
 description: Standards-based resumable upload client and server helpers for Dart HTTP.
-version: 0.1.0
+version: 0.1.1
 homepage: https://hippolabs.org
 repository: https://github.com/hippolabs-org/dart-http/tree/main/packages/dart_http_resumable_upload
 publish_to: "https://pub.hippolabs.org"
@@ -12,9 +12,15 @@ environment:
 dependencies:
   dart_http_core:
     hosted: "https://pub.hippolabs.org"
-    version: ^0.3.49
+    version: ^0.3.64
 
 dev_dependencies:
+  dart_http_native_client:
+    hosted: https://pub.hippolabs.org
+    version: ^0.2.27
+  dart_http_server_runtime:
+    hosted: https://pub.hippolabs.org
+    version: ^0.3.55
   hippo_analysis:
     hosted: https://pub.hippolabs.org
     version: ^0.1.2

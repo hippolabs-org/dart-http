@@ -1,3 +1,7 @@
+## 0.3.64
+
+- Add transport upload measurements and preserve multipart progress without treating source reads as transmitted bytes.
+
 ## 0.3.63
 
 - Add provider-neutral JSON/base64 WebSocket extraction rules and single-owner binary payload transfer.

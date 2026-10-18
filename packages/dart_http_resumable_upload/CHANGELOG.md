@@ -1,3 +1,7 @@
+## 0.1.1
+
+- Recover interrupted transfers and completion results, distinguish transport progress from confirmed offsets, add the router extension and persistent filesystem upload store.
+
 ## 0.1.0
 
 - Add careful-creation resumable upload clients, server routes, durable

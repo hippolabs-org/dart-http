@@ -20,6 +20,67 @@ void main() {
     await server.close(force: true);
   });
 
+  test('reports network body consumption before response, with an explicit measurement', () async {
+    final firstProgress = Completer<void>();
+    final releaseTail = Completer<void>();
+    final releaseResponse = Completer<void>();
+    final receivedAll = Completer<void>();
+    final events = <DartHttpClientUploadProgress>[];
+    server.listen((request) async {
+      await request.drain<void>();
+      receivedAll.complete();
+      await releaseResponse.future;
+      await request.response.close();
+    });
+    final response = transport.send(
+      DartHttpClientRequest(
+        method: HttpMethod.post,
+        uri: Uri.parse('http://${server.address.host}:${server.port}/progress'),
+        bodyStream: () async* {
+          yield const [1, 2, 3];
+          await releaseTail.future;
+          yield const [4, 5, 6];
+        }(),
+        bodyStreamLength: 6,
+        onUploadProgress: (event) {
+          events.add(event);
+          if (event.bytes == 3 && !firstProgress.isCompleted) firstProgress.complete();
+        },
+      ),
+    );
+    await firstProgress.future.timeout(const Duration(seconds: 5));
+    expect(events.single.totalBytes, 6);
+    expect(events.single.measurement, DartHttpClientUploadMeasurement.transportConsumed);
+    releaseTail.complete();
+    await receivedAll.future.timeout(const Duration(seconds: 5));
+    releaseResponse.complete();
+    await response;
+    expect(events.last.bytes, 6);
+    expect(
+      events.map((e) => e.bytes),
+      orderedEquals(events.map((e) => e.bytes).toSet().toList()..sort()),
+    );
+  });
+
+  test('reports exact buffered UTF-8 body progress and preserves content length', () async {
+    final events = <DartHttpClientUploadProgress>[];
+    server.listen((request) async {
+      expect(request.contentLength, utf8.encode('héllo').length);
+      expect(await utf8.decoder.bind(request).join(), 'héllo');
+      await request.response.close();
+    });
+    await transport.send(
+      DartHttpClientRequest(
+        method: HttpMethod.post,
+        uri: Uri.parse('http://${server.address.host}:${server.port}/progress'),
+        body: 'héllo',
+        onUploadProgress: events.add,
+      ),
+    );
+    expect(events.last.bytes, utf8.encode('héllo').length);
+    expect(events.last.totalBytes, utf8.encode('héllo').length);
+  });
+
   test('sends bytes and buffers a native response', () async {
     server.listen((request) async {
       final body = await utf8.decoder.bind(request).join();

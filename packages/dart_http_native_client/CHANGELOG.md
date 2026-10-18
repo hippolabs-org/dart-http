@@ -1,3 +1,7 @@
+## 0.2.27
+
+- Report native request-body consumption with bounded progress events. Require native ABI 18 and native artifacts 0.2.26.
+
 ## 0.2.26
 
 - Extract selected JSON/base64 WebSocket fields into native-owned payloads.

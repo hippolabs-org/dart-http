@@ -1,3 +1,7 @@
+## 0.3.28
+
+- Require the runtime with binary upload decoding and configurable CORS response-header exposure.
+
 ## 0.3.27
 
 - Require `dart_http_server_runtime` 0.3.53 for WebSocket route keepalive.

@@ -51,6 +51,7 @@ DecodedNativeTransportRequest decodeNativeTransportRequest(
         1 => TransportRequestBodyKind.text,
         2 => TransportRequestBodyKind.json,
         3 => TransportRequestBodyKind.multipart,
+        4 => TransportRequestBodyKind.binary,
         _ => TransportRequestBodyKind.none,
       },
     ),

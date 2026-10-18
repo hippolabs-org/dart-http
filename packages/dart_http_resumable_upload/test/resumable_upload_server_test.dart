@@ -54,7 +54,7 @@ void main() {
     );
   });
 
-  test('accepts sequential chunks and invokes completion once', () async {
+  test('accepts chunks and finalizes separately with a replayable result', () async {
     final router = Router<void>();
     final store = InMemoryResumableUploadStore(idGenerator: () => 'one');
     var completionCount = 0;
@@ -103,7 +103,18 @@ void main() {
       HttpMethod.patch,
       _appendRequest(offset: 3, complete: true, bytes: <int>[4, 5]),
     );
-    expect(completed.status, 200);
+    expect(completed.status, 204);
+    expect(completionCount, 0);
+    final finalizeRoute =
+        router.routeRegistry.registrations
+                .firstWhere((r) => (r.httpPath?.endsWith('/complete') ?? false))
+                .route
+            as HttpRouteDefinition<void, RawResponse>;
+    final finalization = await finalizeRoute.handle(
+      RequestContext<void>(services: null, req: _resourceRequest()),
+    );
+    expect(finalization.status, 200);
+    await finalizeRoute.handle(RequestContext<void>(services: null, req: _resourceRequest()));
     expect(_header(completed, 'upload-offset'), '5');
     expect(_header(completed, 'upload-complete'), '?1');
     expect(completionCount, 1);

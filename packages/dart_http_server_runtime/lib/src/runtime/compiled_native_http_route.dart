@@ -74,7 +74,11 @@ final class CompiledNativeHttpRoute implements CompiledOpenApiRoute {
     'headersSchemaId': jsonSchemaRouteId(options.headers),
     'requestBody': switch (options.body) {
       null => null,
-      final body => {'contentType': body.contentType, 'schemaId': jsonSchemaRouteId(body.schema)},
+      final body => {
+        'contentType': body.contentType,
+        'binary': body.isBinary,
+        'schemaId': jsonSchemaRouteId(body.schema),
+      },
     },
     'nativeHandle': mount.nativeHandle,
     'nativeHandlerAddress': mount.nativeHandlerAddress,

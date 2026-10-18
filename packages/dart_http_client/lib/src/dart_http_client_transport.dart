@@ -1,6 +1,10 @@
 import 'package:dart_http_core/dart_http_core.dart';
 import 'package:http/http.dart' as http;
 
+import 'upload_progress_stub.dart'
+    if (dart.library.js_interop) 'upload_progress_web.dart'
+    as upload_progress;
+
 typedef DartHttpClientSend = Future<DartHttpClientResponse> Function(DartHttpClientRequest request);
 
 typedef DartHttpClientInterceptor = Future<DartHttpClientResponse> Function(
@@ -21,6 +25,7 @@ typedef DartHttpClientStreamedInterceptor = Future<DartHttpClientStreamedRespons
 final class DartHttpClientTransport implements HttpClientTransport {
   DartHttpClientTransport({
     http.Client? client,
+    this.browserUploadWithCredentials = false,
     List<DartHttpClientInterceptor> interceptors = const [],
     List<DartHttpClientStreamedInterceptor> streamedInterceptors = const [],
   }) : _client = client ?? http.Client(),
@@ -30,6 +35,11 @@ final class DartHttpClientTransport implements HttpClientTransport {
          streamedInterceptors,
        );
 
+  /// Credential mode for browser XHR requests with upload progress. Those
+  /// requests use XHR instead of the injected package:http client.
+  final bool browserUploadWithCredentials;
+  final _uploadAborts = <void Function()>{};
+  var _closed = false;
   final http.Client _client;
   final bool _ownsClient;
   final List<DartHttpClientInterceptor> _interceptors;
@@ -56,19 +66,26 @@ final class DartHttpClientTransport implements HttpClientTransport {
   }
 
   Future<DartHttpClientResponse> _sendWithoutInterceptors(DartHttpClientRequest request) async {
-    final streamed = await _client.send(_httpRequestFrom(request));
-    final response = await http.Response.fromStream(streamed);
+    final streamed = await _sendStreamWithoutInterceptors(request);
+    final responseBytes = await http.ByteStream(streamed.bodyStream).toBytes();
     return DartHttpClientResponse.ownedBytes(
-      status: response.statusCode,
-      contentType: response.headers['content-type'] ?? '',
-      headers: response.headers,
-      bodyBytes: response.bodyBytes,
+      status: streamed.status,
+      contentType: streamed.contentType,
+      headers: streamed.headers,
+      bodyBytes: responseBytes,
     );
   }
 
   Future<DartHttpClientStreamedResponse> _sendStreamWithoutInterceptors(
     DartHttpClientRequest request,
   ) async {
+    final measured = upload_progress.sendWithUploadProgress(
+      request,
+      aborts: _uploadAborts,
+      closed: _closed,
+      withCredentials: browserUploadWithCredentials,
+    );
+    if (measured != null) return measured;
     final response = await _client.send(_httpRequestFrom(request));
     return DartHttpClientStreamedResponse(
       status: response.statusCode,
@@ -128,6 +145,11 @@ final class DartHttpClientTransport implements HttpClientTransport {
   }
 
   void close() {
+    _closed = true;
+    for (final abort in _uploadAborts.toList()) {
+      abort();
+    }
+    _uploadAborts.clear();
     if (_ownsClient) {
       _client.close();
     }

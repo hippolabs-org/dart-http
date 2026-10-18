@@ -2,17 +2,22 @@ use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::io;
 use std::mem::size_of;
+use std::pin::Pin;
 use std::ptr;
 use std::str;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::task::{Context, Poll};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
+use http_body::{Body as HttpBody, Frame as HttpFrame, SizeHint};
+#[cfg(test)]
+use http_body_util::BodyExt;
 use native_exchange_abi::{
     NEX_ABI_VERSION, NEX_CAPABILITY_CONCURRENT_CANCEL, NEX_CAPABILITY_THREAD_SAFE,
     NEX_STREAM_READ_CANCELED, NEX_STREAM_READ_CHUNK, NEX_STREAM_READ_DONE, NEX_STREAM_READ_ERROR,
@@ -37,7 +42,7 @@ use tokio_tungstenite::tungstenite::protocol::{
 use tokio_tungstenite::{Connector, connect_async_tls_with_config};
 use tokio_util::sync::CancellationToken;
 
-const ABI_VERSION: i32 = 17;
+const ABI_VERSION: i32 = 18;
 const RESPONSE_MODE_NATIVE_STREAM: i32 = 0;
 const RESPONSE_MODE_BUFFERED: i32 = 1;
 const RESPONSE_MODE_DIRECT_STREAM: i32 = 2;
@@ -839,6 +844,7 @@ pub unsafe extern "C" fn dart_http_native_client_start(
     native_suffix_length: isize,
     redirect_policy: i32,
     response_mode: i32,
+    upload_progress_port: i64,
 ) -> i64 {
     let Some(state) = client_state(client_id) else {
         return 0;
@@ -881,9 +887,16 @@ pub unsafe extern "C" fn dart_http_native_client_start(
             native_suffix_length,
         )
     };
-    let Ok((request, native_body_cancel)) = request else {
+    let Ok((mut request, native_body_cancel)) = request else {
         return 0;
     };
+    let upload_progress =
+        (upload_progress_port > 0).then(|| Arc::new(UploadProgress::new(upload_progress_port)));
+    if let Some(progress) = &upload_progress {
+        if let Some(body) = request.body_mut().take() {
+            *request.body_mut() = Some(measured_request_body(body, Arc::clone(progress)));
+        }
+    }
     let request_id = state.next_request_id.fetch_add(1, Ordering::Relaxed);
     let cancellation = CancellationToken::new();
     if let Ok(mut tasks) = state.tasks.lock() {
@@ -916,6 +929,9 @@ pub unsafe extern "C" fn dart_http_native_client_start(
                 ).await
             } => result,
         };
+        if let Some(progress) = upload_progress {
+            progress.finish();
+        }
         complete_request(&task_state, request_id, result);
     });
     request_id
@@ -2908,6 +2924,96 @@ fn native_request_body(stream: AdoptedRequestStream, prefix: Vec<u8>, suffix: Ve
     Body::wrap_stream(ReceiverStream::new(receiver))
 }
 
+/// Counts frames only when reqwest/hyper polls the body, never when Dart or a
+/// Native Exchange producer queues them. This is consumption, not peer receipt.
+struct UploadProgress {
+    port: NativeCompletionPort,
+    bytes: AtomicU64,
+    last_report: Mutex<(u64, Instant)>,
+}
+
+impl UploadProgress {
+    fn new(port: i64) -> Self {
+        Self {
+            port: NativeCompletionPort(port),
+            bytes: AtomicU64::new(0),
+            last_report: Mutex::new((0, Instant::now())),
+        }
+    }
+    fn consumed(&self, length: usize) {
+        let bytes = self.bytes.fetch_add(length as u64, Ordering::Relaxed) + length as u64;
+        if let Ok(mut last) = self.last_report.lock() {
+            if last.0 == 0 || last.1.elapsed() >= Duration::from_millis(50) {
+                if self.port.0 > 0 {
+                    self.port.post(bytes as i64);
+                }
+                *last = (bytes, Instant::now());
+            }
+        }
+    }
+    fn finish(&self) {
+        if self.port.0 > 0 {
+            self.port.post(self.bytes.load(Ordering::Relaxed) as i64);
+            self.port.post(-1);
+        }
+    }
+}
+
+struct MeasuredRequestBody {
+    inner: Pin<Box<Body>>,
+    pending: Bytes,
+    progress: Arc<UploadProgress>,
+}
+
+impl HttpBody for MeasuredRequestBody {
+    type Data = Bytes;
+    type Error = reqwest::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<HttpFrame<Bytes>, Self::Error>>> {
+        if !self.pending.is_empty() {
+            let length = self.pending.len().min(64 * 1024);
+            let bytes = self.pending.split_to(length);
+            self.progress.consumed(length);
+            return Poll::Ready(Some(Ok(HttpFrame::data(bytes))));
+        }
+        match self.inner.as_mut().poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
+                Ok(bytes) if !bytes.is_empty() => {
+                    self.pending = bytes;
+                    self.poll_frame(cx)
+                }
+                Ok(bytes) => Poll::Ready(Some(Ok(HttpFrame::data(bytes)))),
+                Err(frame) => Poll::Ready(Some(Ok(frame))),
+            },
+            other => other,
+        }
+    }
+    fn size_hint(&self) -> SizeHint {
+        let inner = self.inner.size_hint();
+        let pending = self.pending.len() as u64;
+        let mut hint = SizeHint::new();
+        hint.set_lower(inner.lower() + pending);
+        if let Some(upper) = inner.upper() {
+            hint.set_upper(upper + pending);
+        }
+        hint
+    }
+    fn is_end_stream(&self) -> bool {
+        self.pending.is_empty() && self.inner.is_end_stream()
+    }
+}
+
+fn measured_request_body(body: Body, progress: Arc<UploadProgress>) -> Body {
+    Body::wrap(MeasuredRequestBody {
+        inner: Box::pin(body),
+        pending: Bytes::new(),
+        progress,
+    })
+}
+
 async fn send_request(
     state: Arc<ClientState>,
     request: reqwest::Request,
@@ -3577,5 +3683,76 @@ async fn next_keep_alive(state: &mut Option<KeepAliveState>) -> KeepAliveDue {
     match state {
         Some(state) => state.next().await,
         None => std::future::pending().await,
+    }
+}
+
+#[cfg(test)]
+mod upload_progress_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn queued_body_bytes_do_not_count_until_network_body_is_polled() {
+        let progress = Arc::new(UploadProgress::new(0));
+        let (sender, receiver) = mpsc::channel(2);
+        sender
+            .send(Ok::<_, io::Error>(Bytes::from_static(b"abc")))
+            .await
+            .unwrap();
+        sender.send(Ok(Bytes::from_static(b"defg"))).await.unwrap();
+        drop(sender);
+        let body = measured_request_body(
+            Body::wrap_stream(ReceiverStream::new(receiver)),
+            Arc::clone(&progress),
+        );
+        assert_eq!(progress.bytes.load(Ordering::Relaxed), 0);
+        let mut frames = body.into_data_stream();
+        assert_eq!(
+            frames.next().await.unwrap().unwrap(),
+            Bytes::from_static(b"abc")
+        );
+        assert_eq!(progress.bytes.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            frames.next().await.unwrap().unwrap(),
+            Bytes::from_static(b"defg")
+        );
+        assert_eq!(progress.bytes.load(Ordering::Relaxed), 7);
+        assert!(frames.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn buffered_body_preserves_content_and_exact_size() {
+        let progress = Arc::new(UploadProgress::new(0));
+        let body = measured_request_body(
+            Body::from(Bytes::from_static(b"native")),
+            Arc::clone(&progress),
+        );
+        assert_eq!(body.size_hint().exact(), Some(6));
+        let collected = body.collect().await.unwrap().to_bytes();
+        assert_eq!(collected, Bytes::from_static(b"native"));
+        assert_eq!(progress.bytes.load(Ordering::Relaxed), 6);
+    }
+
+    #[tokio::test]
+    async fn splits_large_native_frames_without_counting_the_buffered_tail() {
+        let progress = Arc::new(UploadProgress::new(0));
+        let body = measured_request_body(Body::from(vec![0; 256 * 1024]), Arc::clone(&progress));
+        assert_eq!(body.size_hint().exact(), Some(256 * 1024));
+        let mut frames = body.into_data_stream();
+        assert_eq!(frames.next().await.unwrap().unwrap().len(), 64 * 1024);
+        assert_eq!(progress.bytes.load(Ordering::Relaxed), 64 * 1024);
+        while frames.next().await.is_some() {}
+        assert_eq!(progress.bytes.load(Ordering::Relaxed), 256 * 1024);
+    }
+
+    #[tokio::test]
+    async fn failed_body_does_not_report_unsent_tail() {
+        let progress = Arc::new(UploadProgress::new(0));
+        let chunks = futures_util::stream::iter([
+            Ok(Bytes::from_static(b"ok")),
+            Err(io::Error::other("interrupted")),
+        ]);
+        let body = measured_request_body(Body::wrap_stream(chunks), Arc::clone(&progress));
+        assert!(body.collect().await.is_err());
+        assert_eq!(progress.bytes.load(Ordering::Relaxed), 2);
     }
 }

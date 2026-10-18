@@ -32,10 +32,7 @@ abstract base class DartHttpClientBase {
       abortTrigger: invocation.abortTrigger,
       timeout: invocation.timeout,
     );
-    final encodedBody = await _encodeRequestBody(
-      body: invocation.body,
-      onMultipartUploadProgress: invocation.onMultipartUploadProgress,
-    );
+    final encodedBody = await _encodeRequestBody(body: invocation.body);
     final request = DartHttpClientRequest(
       method: invocation.method,
       uri: _buildUri(invocation.pathTemplate, params: invocation.params, query: invocation.query),
@@ -48,6 +45,17 @@ abstract base class DartHttpClientBase {
       bodyStream: encodedBody?.bodyStream,
       bodyStreamLength: encodedBody?.bodyStreamLength,
       abortTrigger: abortTrigger,
+      onUploadProgress:
+          invocation.onMultipartUploadProgress == null ||
+              !_isMultipartFormDataContentType(invocation.body?.contentType.toLowerCase() ?? '')
+          ? null
+          : (progress) => invocation.onMultipartUploadProgress!(
+              DartHttpMultipartUploadProgress(
+                bytesSent: progress.bytes,
+                totalBytes: progress.totalBytes,
+                measurement: progress.measurement,
+              ),
+            ),
     );
 
     final response = await transport.send(request);
@@ -192,10 +200,7 @@ abstract base class DartHttpClientBase {
       abortTrigger: invocation.abortTrigger,
       timeout: invocation.timeout,
     );
-    final encodedBody = await _encodeRequestBody(
-      body: invocation.body,
-      onMultipartUploadProgress: invocation.onMultipartUploadProgress,
-    );
+    final encodedBody = await _encodeRequestBody(body: invocation.body);
     return DartHttpClientRequest(
       method: invocation.method,
       uri: _buildUri(invocation.pathTemplate, params: invocation.params, query: invocation.query),
@@ -208,6 +213,17 @@ abstract base class DartHttpClientBase {
       bodyStream: encodedBody?.bodyStream,
       bodyStreamLength: encodedBody?.bodyStreamLength,
       abortTrigger: abortTrigger,
+      onUploadProgress:
+          invocation.onMultipartUploadProgress == null ||
+              !_isMultipartFormDataContentType(invocation.body?.contentType.toLowerCase() ?? '')
+          ? null
+          : (progress) => invocation.onMultipartUploadProgress!(
+              DartHttpMultipartUploadProgress(
+                bytesSent: progress.bytes,
+                totalBytes: progress.totalBytes,
+                measurement: progress.measurement,
+              ),
+            ),
       responseMode: responseMode,
     );
   }
@@ -248,7 +264,6 @@ abstract base class DartHttpClientBase {
 
   Future<_EncodedClientRequestBody?> _encodeRequestBody<TBody>({
     required DartHttpClientRequestBody<TBody>? body,
-    required void Function(DartHttpMultipartUploadProgress progress)? onMultipartUploadProgress,
   }) async {
     if (body == null || body.value == null) {
       return null;
@@ -294,11 +309,7 @@ abstract base class DartHttpClientBase {
       final encoded = _encodeMultipartFormData(form);
       return _EncodedClientRequestBody(
         contentType: 'multipart/form-data; boundary=${encoded.boundary}',
-        bodyStream: _trackMultipartUploadProgress(
-          encoded.bodyStream,
-          totalBytes: encoded.bodyStreamLength,
-          onProgress: onMultipartUploadProgress,
-        ),
+        bodyStream: encoded.bodyStream,
         bodyStreamLength: encoded.bodyStreamLength,
       );
     }
@@ -605,24 +616,6 @@ int? _multipartFormDataContentLength(MultipartFormData form, String boundary) {
 
   length += asciiLength('--$boundary--\r\n');
   return length;
-}
-
-Stream<List<int>> _trackMultipartUploadProgress(
-  Stream<List<int>> stream, {
-  required int? totalBytes,
-  required void Function(DartHttpMultipartUploadProgress progress)? onProgress,
-}) async* {
-  if (onProgress == null) {
-    yield* stream;
-    return;
-  }
-
-  var bytesSent = 0;
-  await for (final chunk in stream) {
-    bytesSent += chunk.length;
-    onProgress(DartHttpMultipartUploadProgress(bytesSent: bytesSent, totalBytes: totalBytes));
-    yield chunk;
-  }
 }
 
 Future<void>? _combinedAbortTrigger({

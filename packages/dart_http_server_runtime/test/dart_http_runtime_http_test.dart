@@ -447,6 +447,7 @@ void main() {
         RustMiddleware.cors(
           allowOrigins: const ['http://localhost:5173'],
           allowHeaders: const ['content-type', 'authorization'],
+          exposeHeaders: const ['location', 'upload-offset', 'upload-finalization-location'],
         ),
       ],
     );
@@ -498,6 +499,10 @@ void main() {
     final postResponse = await postRequest.close();
 
     expect(postResponse.statusCode, HttpStatus.ok);
+    expect(
+      _csvHeaderValues(postResponse.headers.value('access-control-expose-headers')),
+      containsAll(['location', 'upload-offset', 'upload-finalization-location']),
+    );
     expect(
       postResponse.headers.value(HttpHeaders.accessControlAllowOriginHeader),
       'http://localhost:5173',

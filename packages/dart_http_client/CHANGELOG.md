@@ -1,3 +1,7 @@
+## 0.2.2
+
+- Report browser XMLHttpRequest transmission progress and support cancellation during preparation and transfer.
+
 ## 0.2.1
 
 - Honor `DartHttpClientWebSocketRequest.keepAlive` as the ping interval; on

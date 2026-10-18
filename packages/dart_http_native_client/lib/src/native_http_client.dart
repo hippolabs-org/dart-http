@@ -15,7 +15,7 @@ import 'native_http_response.dart';
 part 'native_http_web_socket.dart';
 part 'native_http_response_reader.dart';
 
-const _nativeAbiVersion = 17;
+const _nativeAbiVersion = 18;
 const _responseModeNativeStream = 0;
 const _responseModeBuffered = 1;
 const _responseModeDirectStream = 2;
@@ -164,6 +164,29 @@ final class NativeHttpClientTransport
   }) async {
     _ensureOpen();
     final prepared = _prepareRequest(request);
+    final progressPort = request.onUploadProgress == null ? null : ReceivePort();
+    final progressDone = Completer<void>();
+    var lastProgress = -1;
+    final totalBytes =
+        prepared.bodyStreamLength ??
+        prepared.nativeBody?.contentLength ??
+        prepared.nativeBuffer?.length ??
+        prepared.bytes?.length;
+    final progressSubscription = progressPort?.listen((message) {
+      if (message is! int) return;
+      if (message == -1) {
+        if (!progressDone.isCompleted) progressDone.complete();
+      } else if (message > lastProgress) {
+        lastProgress = message;
+        request.onUploadProgress!(
+          DartHttpClientUploadProgress(
+            bytes: message,
+            totalBytes: totalBytes,
+            measurement: DartHttpClientUploadMeasurement.transportConsumed,
+          ),
+        );
+      }
+    });
     final method = request.method.wireName.toNativeUtf8();
     final url = request.uri.toString().toNativeUtf8();
     final headers = calloc<native.NativeHttpHeader>(request.headers.length);
@@ -231,6 +254,7 @@ final class NativeHttpClientTransport
         nativeSuffix?.length ?? 0,
         request.redirectPolicy.index,
         responseMode,
+        progressPort?.sendPort.nativePort ?? 0,
       );
       if (requestId <= 0) {
         await upload?.close();
@@ -264,6 +288,7 @@ final class NativeHttpClientTransport
           uploadFuture,
         ], eagerError: true);
         response = completed.first! as _NativeResponseData;
+        if (progressPort != null) await progressDone.future;
       } on Object {
         native.dart_http_native_client_cancel(_clientId, requestId);
         await uploadIterator?.cancel();
@@ -281,6 +306,8 @@ final class NativeHttpClientTransport
       }
       return response;
     } finally {
+      await progressSubscription?.cancel();
+      progressPort?.close();
       await uploadIterator?.cancel();
       await upload?.close();
       calloc

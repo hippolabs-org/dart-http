@@ -8,6 +8,9 @@ abstract final class ResumableUploadProtocol {
   static const offsetHeader = 'upload-offset';
   static const lengthHeader = 'upload-length';
   static const completeHeader = 'upload-complete';
+
+  /// Optional Dart HTTP extension advertising an idempotent POST finalizer.
+  static const finalizationLocationHeader = 'upload-finalization-location';
   static const limitHeader = 'upload-limit';
 
   static String encodeBoolean(bool value) => value ? '?1' : '?0';

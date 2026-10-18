@@ -1,5 +1,7 @@
 import 'dart:typed_data';
 
+import '../client/dart_http_client_upload_progress.dart';
+
 /// One decoded UTF-8 text field from a multipart form payload.
 final class MultipartFormField {
   const MultipartFormField({required this.name, required this.value});
@@ -79,9 +81,15 @@ final class MultipartUploadFile {
 
 /// Upload progress for a generated multipart form-data request body.
 final class DartHttpMultipartUploadProgress {
-  const DartHttpMultipartUploadProgress({required this.bytesSent, required this.totalBytes});
+  const DartHttpMultipartUploadProgress({
+    required this.bytesSent,
+    required this.totalBytes,
+    this.measurement,
+  });
 
-  /// Multipart request body bytes emitted to the client transport.
+  final DartHttpClientUploadMeasurement? measurement;
+
+  /// Multipart body bytes measured by the transport, never source-read bytes.
   final int bytesSent;
 
   /// Total multipart request body bytes, when known before sending.

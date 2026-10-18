@@ -222,3 +222,19 @@ transfers owning payloads keyed by concrete pointer once. Close the message
 to release unclaimed payloads. Invalid selected base64 is a transport error.
 Unselected control frames keep their original JSON. This layer contains no
 provider-specific protocol rules. Update the native asset with the Dart API.
+
+## Upload progress
+
+Set `DartHttpClientRequest.onUploadProgress` to measure native request-body
+consumption. The native HTTP engine counts body frames when reqwest/hyper polls
+them, including Dart streams, buffered bytes, native buffers, and Native Exchange
+streams. Source reads and writes into the Dart-to-Rust queue do not count.
+Measurements are throttled in Rust and delivered on the caller's isolate; the
+last count is drained before a successful response is returned.
+
+Events use `DartHttpClientUploadMeasurement.transportConsumed`. They describe the
+native networking engine's progress, not socket acknowledgments or durable server
+receipt; use resumable upload checkpoints for the latter. Known body lengths are
+preserved. Requests without a callback keep the existing body/ownership path.
+This API requires the matching ABI 18 native asset; regenerate bindings with
+`dart run ffigen --config tool/ffigen.yaml` from this package.

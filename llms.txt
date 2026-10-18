@@ -11,7 +11,10 @@ for Dart maintained by Hippolabs.
   back to byte sends while ownership-aware transports can consume native
   payloads directly.
 - `packages/dart_http_resumable_upload`: resumable upload protocol, client,
-  routes, and storage contracts.
+  routes, durable finalization contracts, and confirmed/transport progress.
+  Applications provide persistent stores; callbacks require idempotent finalization.
+- HTTP upload progress is transport-measured: browser XHR transmission or native
+  engine consumption. Source reads are preparation, never network progress.
 - `packages/dart_http_shelf`: adapts Shelf handlers to Dart HTTP routes while
   preserving request metadata and streaming response bodies.
 - `packages/dart_http_jaspr`: mounts Jaspr applications through the Shelf

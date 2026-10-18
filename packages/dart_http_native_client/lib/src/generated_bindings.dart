@@ -79,6 +79,7 @@ external bool dart_http_native_client_result_take_body_buffer(
     ffi.IntPtr,
     ffi.Int32,
     ffi.Int32,
+    ffi.Int64,
   )
 >()
 external int dart_http_native_client_start(
@@ -100,6 +101,7 @@ external int dart_http_native_client_start(
   int native_suffix_length,
   int redirect_policy,
   int response_mode,
+  int upload_progress_port,
 );
 
 @ffi.Native<ffi.Pointer<NativeHttpResult> Function(ffi.Int64, ffi.Int64)>()

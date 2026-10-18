@@ -28,10 +28,15 @@ final class RustMiddleware {
   static RustMiddleware cors({
     List<String> allowOrigins = const <String>[],
     List<String> allowHeaders = const <String>[],
+    List<String> exposeHeaders = const <String>[],
   }) {
     return RustMiddleware._(
       'cors',
-      RustCorsMiddlewareConfiguration(allowOrigins: allowOrigins, allowHeaders: allowHeaders),
+      RustCorsMiddlewareConfiguration(
+        allowOrigins: allowOrigins,
+        allowHeaders: allowHeaders,
+        exposeHeaders: exposeHeaders,
+      ),
     );
   }
 
@@ -62,6 +67,7 @@ final class RustCorsMiddlewareConfiguration extends RustMiddlewareConfiguration 
   const RustCorsMiddlewareConfiguration({
     this.allowOrigins = const <String>[],
     this.allowHeaders = const <String>[],
+    this.exposeHeaders = const <String>[],
   });
 
   /// Allowed CORS origins.
@@ -69,6 +75,9 @@ final class RustCorsMiddlewareConfiguration extends RustMiddlewareConfiguration 
 
   /// Allowed CORS headers.
   final List<String> allowHeaders;
+
+  /// Response headers readable by cross-origin browser clients.
+  final List<String> exposeHeaders;
 }
 
 /// Configuration for the native request body limit middleware.

@@ -31,7 +31,27 @@ void mountResumableUploadRoutes<TServices>(
   ResumableUploadLimits limits = const ResumableUploadLimits(),
   List<Guard<TServices>> guards = const [],
   String operationIdPrefix = 'resumableUpload',
+  bool allowCreation = true,
 }) {
+  if (onCompleted != null && store is! ResumableUploadFinalizationStore) {
+    throw ArgumentError('onCompleted requires a ResumableUploadFinalizationStore.');
+  }
+  List<HttpHeader> headersFor(
+    RequestContext<TServices> context,
+    ResumableUploadResource resource, {
+    Uri? location,
+  }) {
+    final uploadUri = locationFor(context, resource);
+    return _resourceHeaders(
+      resource,
+      limits: limits,
+      location: location,
+      finalizationLocation: onCompleted == null
+          ? null
+          : uploadUri.replace(path: '${uploadUri.path.replaceAll(RegExp(r'/+$'), '')}/complete'),
+    );
+  }
+
   router.options<RawResponse>(
     path,
     guards: guards,
@@ -47,59 +67,61 @@ void mountResumableUploadRoutes<TServices>(
     },
   );
 
-  router.post<RawResponse>(
-    path,
-    guards: guards,
-    options: RouteOptions(
-      operationId: '${operationIdPrefix}Create',
-      summary: 'Create a resumable upload resource.',
-      success: const ResponseSpec.text(status: 201),
-    ),
-    handler: (context) async {
-      final versionError = _validateVersion(context.req);
-      if (versionError != null) return versionError;
-      final length = ResumableUploadProtocol.parseNonNegativeInteger(
-        context.req.header(ResumableUploadProtocol.lengthHeader),
-      );
-      final complete = ResumableUploadProtocol.parseBoolean(
-        context.req.header(ResumableUploadProtocol.completeHeader),
-      );
-      if (length == null || complete != false) {
-        return _problem(
-          status: 400,
-          type: 'invalid-upload-creation',
-          detail: 'Careful creation requires Upload-Length and Upload-Complete: ?0.',
+  if (allowCreation) {
+    router.post<RawResponse>(
+      path,
+      guards: guards,
+      options: RouteOptions(
+        operationId: '${operationIdPrefix}Create',
+        summary: 'Create a resumable upload resource.',
+        success: const ResponseSpec.text(status: 201),
+      ),
+      handler: (context) async {
+        final versionError = _validateVersion(context.req);
+        if (versionError != null) return versionError;
+        final length = ResumableUploadProtocol.parseNonNegativeInteger(
+          context.req.header(ResumableUploadProtocol.lengthHeader),
         );
-      }
-      if (limits.maxSize case final maxSize? when length > maxSize) {
-        return _problem(
-          status: 413,
-          type: 'upload-too-large',
-          detail: 'Upload length $length exceeds the maximum size $maxSize.',
-          headers: _limitHeaders(limits),
+        final complete = ResumableUploadProtocol.parseBoolean(
+          context.req.header(ResumableUploadProtocol.completeHeader),
         );
-      }
-      if (limits.minSize case final minSize? when length < minSize) {
-        return _problem(
-          status: 400,
-          type: 'upload-too-small',
-          detail: 'Upload length $length is below the minimum size $minSize.',
-          headers: _limitHeaders(limits),
-        );
-      }
+        if (length == null || complete != false) {
+          return _problem(
+            status: 400,
+            type: 'invalid-upload-creation',
+            detail: 'Careful creation requires Upload-Length and Upload-Complete: ?0.',
+          );
+        }
+        if (limits.maxSize case final maxSize? when length > maxSize) {
+          return _problem(
+            status: 413,
+            type: 'upload-too-large',
+            detail: 'Upload length $length exceeds the maximum size $maxSize.',
+            headers: _limitHeaders(limits),
+          );
+        }
+        if (limits.minSize case final minSize? when length < minSize) {
+          return _problem(
+            status: 400,
+            type: 'upload-too-small',
+            detail: 'Upload length $length is below the minimum size $minSize.',
+            headers: _limitHeaders(limits),
+          );
+        }
 
-      final resource = await store.create(
-        length: length,
-        metadata: await metadataFor?.call(context) ?? const <String, String>{},
-        maxAge: limits.maxAge,
-      );
-      final location = locationFor(context, resource);
-      return RawResponse.text(
-        status: 201,
-        headers: _resourceHeaders(resource, limits: limits, location: location),
-      );
-    },
-  );
+        final resource = await store.create(
+          length: length,
+          metadata: await metadataFor?.call(context) ?? const <String, String>{},
+          maxAge: limits.maxAge,
+        );
+        final location = locationFor(context, resource);
+        return RawResponse.text(
+          status: 201,
+          headers: headersFor(context, resource, location: location),
+        );
+      },
+    );
+  }
 
   final resourcePath = '$path/<uploadId>';
   router.head<RawResponse>(
@@ -115,7 +137,7 @@ void mountResumableUploadRoutes<TServices>(
       if (versionError != null) return versionError;
       final resource = await _readResource(context.req, store);
       if (resource == null) return _notFound();
-      return RawResponse.text(status: 204, headers: _resourceHeaders(resource, limits: limits));
+      return RawResponse.text(status: 204, headers: headersFor(context, resource));
     },
   );
 
@@ -168,7 +190,7 @@ void mountResumableUploadRoutes<TServices>(
           status: 400,
           type: 'inconsistent-upload-length',
           detail: 'Upload-Length does not match the created upload resource.',
-          headers: _resourceHeaders(existing, limits: limits),
+          headers: headersFor(context, existing),
         );
       }
       final nativeStream = context.req.nativeBodyOrNull;
@@ -181,7 +203,7 @@ void mountResumableUploadRoutes<TServices>(
           status: 411,
           type: 'upload-append-length-required',
           detail: 'Streamed upload appends require Content-Length.',
-          headers: _resourceHeaders(existing, limits: limits),
+          headers: headersFor(context, existing),
         );
       }
       if (contentLength > limits.maxAppendSize) {
@@ -189,7 +211,7 @@ void mountResumableUploadRoutes<TServices>(
           status: 413,
           type: 'upload-append-too-large',
           detail: 'Append length $contentLength exceeds ${limits.maxAppendSize}.',
-          headers: _resourceHeaders(existing, limits: limits),
+          headers: headersFor(context, existing),
         );
       }
       final minAppendSize = limits.minAppendSize;
@@ -198,7 +220,7 @@ void mountResumableUploadRoutes<TServices>(
           status: 400,
           type: 'upload-append-too-small',
           detail: 'Non-final append length $contentLength is below $minAppendSize.',
-          headers: _resourceHeaders(existing, limits: limits),
+          headers: headersFor(context, existing),
         );
       }
       final content = nativeStream is DartHttpServerNativeBodyStream
@@ -215,18 +237,14 @@ void mountResumableUploadRoutes<TServices>(
           content: content,
           complete: complete,
         );
-        if (resource.complete && onCompleted != null) {
-          final response = await onCompleted(context, resource);
-          return _withHeaders(response, _resourceHeaders(resource, limits: limits));
-        }
-        return RawResponse.text(status: 204, headers: _resourceHeaders(resource, limits: limits));
+        return RawResponse.text(status: 204, headers: headersFor(context, resource));
       } on ResumableUploadOffsetMismatchException catch (error) {
         final current = await store.read(id) ?? existing;
         return _problem(
           status: 400,
           type: 'mismatching-upload-offset',
           detail: error.message,
-          headers: _resourceHeaders(current, limits: limits),
+          headers: headersFor(context, current),
         );
       } on ResumableUploadLengthException catch (error) {
         final current = await store.read(id) ?? existing;
@@ -234,7 +252,7 @@ void mountResumableUploadRoutes<TServices>(
           status: 409,
           type: 'inconsistent-upload-length',
           detail: error.message,
-          headers: _resourceHeaders(current, limits: limits),
+          headers: headersFor(context, current),
         );
       } on ResumableUploadAlreadyCompleteException catch (error) {
         final current = await store.read(id) ?? existing;
@@ -242,13 +260,44 @@ void mountResumableUploadRoutes<TServices>(
           status: 409,
           type: 'upload-already-complete',
           detail: error.message,
-          headers: _resourceHeaders(current, limits: limits),
+          headers: headersFor(context, current),
         );
       } on ResumableUploadNotFoundException {
         return _notFound();
       }
     },
   );
+
+  if (onCompleted != null) {
+    router.post<RawResponse>(
+      '$resourcePath/complete',
+      guards: guards,
+      options: RouteOptions(
+        operationId: '${operationIdPrefix}Finalize',
+        summary: 'Idempotently finalize an uploaded resource.',
+        success: const ResponseSpec.json(),
+      ),
+      handler: (context) async {
+        final versionError = _validateVersion(context.req);
+        if (versionError != null) return versionError;
+        final resource = await _readResource(context.req, store);
+        if (resource == null) return _notFound();
+        if (!resource.complete) {
+          return _problem(
+            status: 409,
+            type: 'upload-incomplete',
+            detail: 'Upload bytes must be complete before finalization.',
+            headers: headersFor(context, resource),
+          );
+        }
+        final response = await (store as ResumableUploadFinalizationStore).finalize(
+          resource.id,
+          () => onCompleted(context, resource),
+        );
+        return _withHeaders(response, headersFor(context, resource));
+      },
+    );
+  }
 
   router.delete<RawResponse>(
     resourcePath,
@@ -295,6 +344,7 @@ List<HttpHeader> _resourceHeaders(
   ResumableUploadResource resource, {
   required ResumableUploadLimits limits,
   Uri? location,
+  Uri? finalizationLocation,
 }) => <HttpHeader>[
   HttpHeader('Upload-Draft-Interop-Version', '${ResumableUploadProtocol.draftInteropVersion}'),
   HttpHeader('Upload-Offset', '${resource.offset}'),
@@ -303,6 +353,8 @@ List<HttpHeader> _resourceHeaders(
   HttpHeader('Upload-Limit', limits.toHeaderValue()),
   const HttpHeader('Cache-Control', 'no-store'),
   if (location != null) HttpHeader('Location', location.toString()),
+  if (finalizationLocation != null)
+    HttpHeader(ResumableUploadProtocol.finalizationLocationHeader, finalizationLocation.toString()),
 ];
 
 List<HttpHeader> _limitHeaders(ResumableUploadLimits limits) => <HttpHeader>[
@@ -342,5 +394,31 @@ RawResponse _withHeaders(RawResponse response, List<HttpHeader> headers) {
     body: response.body,
     headers: <HttpHeader>[...response.headers, ...headers],
     isEncodedBody: response.isEncodedBody,
+  );
+}
+
+/// Installs the complete resumable upload protocol as one route group.
+extension ResumableUploadRouter<TServices> on Router<TServices> {
+  void resumableUploads({
+    required String path,
+    required ResumableUploadStore store,
+    required ResumableUploadLocationBuilder<TServices> locationFor,
+    ResumableUploadCompletionHandler<TServices>? onCompleted,
+    ResumableUploadMetadataBuilder<TServices>? metadataFor,
+    ResumableUploadLimits limits = const ResumableUploadLimits(),
+    List<Guard<TServices>> guards = const [],
+    String operationIdPrefix = 'resumableUpload',
+    bool allowCreation = true,
+  }) => mountResumableUploadRoutes(
+    this,
+    path: path,
+    store: store,
+    locationFor: locationFor,
+    onCompleted: onCompleted,
+    metadataFor: metadataFor,
+    limits: limits,
+    guards: guards,
+    operationIdPrefix: operationIdPrefix,
+    allowCreation: allowCreation,
   );
 }

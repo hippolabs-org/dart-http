@@ -104,3 +104,34 @@ Handle errors/end-of-stream and deliberately restore application protocol state
 when opening a replacement connection. Callers that depend on the previous
 transparent retry/reconnect policy must explicitly set `reconnect: true`.
 HTTP request behavior is unchanged.
+
+## Upload progress
+
+`DartHttpClientRequest.onUploadProgress` reports transport measurements, never
+bytes merely read from the source. On web, buffered-response requests with this
+callback use XMLHttpRequest upload events (`transmitted`) instead of the injected
+`package:http` client. Interceptors still run. Set
+`browserUploadWithCredentials: true` when cross-origin cookie credentials are
+needed. Content-Length is managed by the browser. Upload event listeners require
+CORS preflight permission for cross-origin requests.
+
+XHR prepares the request body before sending; use bounded chunks for large files.
+Cancellation also works during preparation, and closing the transport aborts
+outstanding XHR uploads. XHR cannot disable redirect following, so that combination
+throws. Stream/SSE response requests retain the streaming package:http transport
+and leave the upload callback silent. Non-browser package:http transports also
+leave it silent rather than report preparation as transmission.
+
+Generated multipart `onUploadProgress` callbacks now use the same transport
+measurements. Check `measurement`; receiving all transport bytes is not proof
+that the server has durably stored them. Resumable uploads should use their
+confirmed checkpoints for recovery.
+
+Run the real browser tests with:
+
+```sh
+dart test --platform chrome test/browser_upload_progress_test.dart
+```
+
+The tests start a local upload server through the test runner's hybrid-isolate
+support, and cover preparation, CORS, transmitted byte counts, and cancellation.
