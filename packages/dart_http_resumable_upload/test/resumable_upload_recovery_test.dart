@@ -68,6 +68,18 @@ void main() {
     expect(jsonDecode(result.response.body), {'object_id': 'one'});
   });
 
+  test('a 5xx after a committed finalization retries into the replayed result', () async {
+    // Finalization is idempotent on the server: it is keyed by the upload and
+    // replays the first successful response, so the client may retry an
+    // ambiguous failure without repeating application side effects.
+    final transport = _RouterTransport(failCommittedFinalizationWith503: true);
+    final result = await _client(transport).start(creationUri: _uri, source: _source());
+    expect(transport.finalizations, 2);
+    expect(transport.callbackCalls, 1);
+    expect(result.response.status, 200);
+    expect(jsonDecode(result.response.body), {'object_id': 'one'});
+  });
+
   test('finalization failure retries without uploading bytes again', () async {
     final transport = _RouterTransport(callbackFailures: 1);
     final events = <ResumableUploadEvent>[];
@@ -243,6 +255,7 @@ class _RouterTransport implements HttpClientTransport {
     this.rejectAppend = false,
     this.loseAppendResponse = false,
     this.loseFinalizationResponse = false,
+    this.failCommittedFinalizationWith503 = false,
     this.callbackFailures = 0,
     this.errorOnCompletedAppend = false,
     this.onBeforeAppend,
@@ -268,6 +281,7 @@ class _RouterTransport implements HttpClientTransport {
       rejectAppend,
       loseAppendResponse,
       loseFinalizationResponse,
+      failCommittedFinalizationWith503,
       errorOnCompletedAppend;
   final void Function(DartHttpClientRequest)? onBeforeAppend;
   int callbackFailures;
@@ -323,6 +337,9 @@ class _RouterTransport implements HttpClientTransport {
     if ((loseAppendResponse && request.method == HttpMethod.patch && patches == 1) ||
         (loseFinalizationResponse && isFinalize && finalizations == 1)) {
       throw StateError('response lost');
+    }
+    if (failCommittedFinalizationWith503 && isFinalize && finalizations == 1) {
+      return const DartHttpClientResponse(status: 503, contentType: '', body: '');
     }
     return DartHttpClientResponse(
       status: errorOnCompletedAppend && request.method == HttpMethod.patch ? 500 : raw.status,

@@ -39,6 +39,35 @@ void main() {
     );
   });
 
+  test('reports a server offset behind the checkpoint as going backwards', () async {
+    final transport = _InterruptedUploadTransport(
+      acceptedBytes: <int>[0, 1],
+      interruptFirstPatch: false,
+    );
+    final client = ResumableUploadClient(transport: transport, chunkSize: 4);
+
+    await expectLater(
+      client.resume(
+        checkpoint: ResumableUploadCheckpoint(
+          uploadUri: Uri.parse('https://example.test/uploads/upload-1'),
+          offset: 6,
+          totalBytes: 10,
+        ),
+        source: ResumableUploadSource.bytes(List<int>.generate(10, (index) => index)),
+      ),
+      throwsA(
+        isA<ResumableUploadProtocolException>().having(
+          (error) => error.toString(),
+          'message',
+          allOf(
+            contains('Server offset 2 is behind the confirmed offset 6'),
+            isNot(contains('exceeds')),
+          ),
+        ),
+      ),
+    );
+  });
+
   test('resumes a serialized checkpoint from the authoritative server offset', () async {
     final transport = _InterruptedUploadTransport(
       acceptedBytes: <int>[0, 1, 2, 3],
