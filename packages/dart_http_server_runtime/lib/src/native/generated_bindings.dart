@@ -128,9 +128,6 @@ external bool dart_http_server_runtime_send_response(
   ffi.Pointer<NativePair> headers,
 );
 
-@ffi.Native<ffi.Bool Function(ffi.Int64, ffi.Pointer<ffi.Char>)>()
-external bool dart_http_server_runtime_send_sse_chunk(int request_id, ffi.Pointer<ffi.Char> chunk);
-
 @ffi.Native<ffi.Int64 Function(ffi.Int64, NativeBytes)>()
 external int dart_http_server_runtime_start_binary_stream_chunk(int request_id, NativeBytes chunk);
 

@@ -155,10 +155,6 @@ bool dart_http_server_runtime_start_sse_response(
     intptr_t header_count,
     const NativePair* headers);
 
-bool dart_http_server_runtime_send_sse_chunk(
-    int64_t request_id,
-    const char* chunk);
-
 bool dart_http_server_runtime_finish_sse_response(int64_t request_id);
 
 bool dart_http_server_runtime_start_binary_stream_response(

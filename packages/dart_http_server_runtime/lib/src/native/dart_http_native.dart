@@ -71,8 +71,8 @@ abstract final class DartHttpNative {
     required String middlewaresJson,
     required Pointer<NativeFunction<NativeTransportEvent>> callback,
   }) {
-    if (abiVersion != 25) {
-      throw StateError('Dart HTTP runtime requires native ABI 25; loaded $abiVersion.');
+    if (abiVersion != 26) {
+      throw StateError('Dart HTTP runtime requires native ABI 26; loaded $abiVersion.');
     }
     final hostPtr = host.toNativeUtf8();
     final routesJsonPtr = routesJson.toNativeUtf8();
@@ -198,16 +198,6 @@ abstract final class DartHttpNative {
         headerStorage,
       ),
     );
-  }
-
-  /// Sends one encoded SSE chunk for an active streaming response.
-  static bool sendSseChunk(int requestId, String chunk) {
-    final chunkPtr = chunk.toNativeUtf8();
-    try {
-      return gen.dart_http_server_runtime_send_sse_chunk(requestId, chunkPtr.cast<Char>());
-    } finally {
-      calloc.free(chunkPtr);
-    }
   }
 
   /// Finishes an active SSE response.

@@ -1,3 +1,12 @@
+## Unreleased
+
+- **Breaking:** Remove the unused `DartHttpNative.sendSseChunk` and its
+  `dart_http_server_runtime_send_sse_chunk` export; SSE responses stream
+  through the backpressured binary chunk path. Native ABI 26.
+- Remove the unused `copyNativeOwnedBytes` helper and the dead job-pool,
+  Dart API DL, slice, status, string and owned-bytes helpers from the internal
+  `dart_http_core` Rust crate.
+
 ## 0.3.55
 
 - Preserve declared binary request bodies without UTF-8 decoding and expose configured response headers through CORS. Native artifacts 0.1.34.

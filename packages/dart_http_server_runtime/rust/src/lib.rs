@@ -48,7 +48,7 @@ use wtransport::{
     ServerConfig as WebTransportServerConfig, VarInt,
 };
 
-const DART_HTTP_SERVER_RUNTIME_NATIVE_ABI_VERSION: i32 = 25;
+const DART_HTTP_SERVER_RUNTIME_NATIVE_ABI_VERSION: i32 = 26;
 const MAX_BINARY_STREAM_CHUNK_BYTES: usize = 64 * 1024;
 const RESERVED_BLOCKING_WORKERS: usize = 16;
 const SCHEMA_REGISTRY_URI: &str = "urn:dart-http:schema-registry";
@@ -356,7 +356,6 @@ enum PendingResponseMessage {
         status: u16,
         headers: Vec<(String, String)>,
     },
-    SseChunk(String),
     BinaryStart {
         status: u16,
         content_type: String,
@@ -1677,18 +1676,6 @@ pub extern "C" fn dart_http_server_runtime_start_sse_response(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn dart_http_server_runtime_send_sse_chunk(
-    request_id: i64,
-    chunk: *const c_char,
-) -> bool {
-    let Some(chunk) = (unsafe { read_c_string(chunk) }) else {
-        return false;
-    };
-
-    send_pending_response_message(request_id, PendingResponseMessage::SseChunk(chunk), false)
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn dart_http_server_runtime_finish_sse_response(request_id: i64) -> bool {
     send_pending_response_message(request_id, PendingResponseMessage::Close, true)
 }
@@ -2878,9 +2865,6 @@ async fn handle_http_request(
                             completion.0.complete(true);
                             yield Ok::<Bytes, std::convert::Infallible>(Bytes::from(bytes));
                         }
-                        PendingResponseMessage::SseChunk(chunk) => {
-                            yield Ok::<Bytes, std::convert::Infallible>(Bytes::from(chunk));
-                        }
                         PendingResponseMessage::Close => break,
                         PendingResponseMessage::Http(_)
                         | PendingResponseMessage::SseStart { .. }
@@ -2925,7 +2909,6 @@ async fn handle_http_request(
                         PendingResponseMessage::Close => break,
                         PendingResponseMessage::Http(_)
                         | PendingResponseMessage::SseStart { .. }
-                        | PendingResponseMessage::SseChunk(_)
                         | PendingResponseMessage::BinaryStart { .. }
                         | PendingResponseMessage::NativeBinaryStart { .. }
                         | PendingResponseMessage::WebSocketAccept { .. } => break,
@@ -3020,11 +3003,6 @@ async fn handle_http_request(
             StatusCode::INTERNAL_SERVER_ERROR,
             "text/plain; charset=utf-8",
             "Request handling failed".to_string(),
-        ),
-        Some(PendingResponseMessage::SseChunk(_)) => response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "text/plain; charset=utf-8",
-            "Unexpected SSE chunk before SSE start".to_string(),
         ),
         Some(PendingResponseMessage::BinaryChunk { .. }) => response(
             StatusCode::INTERNAL_SERVER_ERROR,
