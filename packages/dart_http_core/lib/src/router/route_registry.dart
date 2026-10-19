@@ -6,7 +6,6 @@ import '../webtransport/web_transport_route_mount.dart';
 import 'guard.dart';
 import 'http_route_definition.dart';
 import 'http_route_mount.dart';
-import 'native_http_route_mount.dart';
 import 'route_exposure.dart';
 import 'route_path.dart';
 
@@ -67,26 +66,6 @@ final class RouteRegistry<TServices> {
         guards: guards,
         exposure: exposure,
         route: mount.route,
-        httpPath: mount.path,
-      ),
-    );
-  }
-
-  void registerNativeHttp({
-    required String prefix,
-    required List<String> tags,
-    required List<Guard<TServices>> guards,
-    required RouteExposure exposure,
-    required NativeHttpRouteMount mount,
-  }) {
-    registrations.add(
-      RouteRegistration(
-        prefix: prefix,
-        tags: tags,
-        guards: guards,
-        exposure: exposure,
-        route: mount,
-        httpMethod: mount.method,
         httpPath: mount.path,
       ),
     );

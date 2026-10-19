@@ -118,10 +118,7 @@ class DartHttp<TServices> extends Router<TServices> {
   Map<String, Object?> buildOpenApiDocumentJson() {
     final compiledRoutes = _compileRoutes();
     return openApiDocument.toJson(
-      routes: [
-        ...compiledRoutes.routes.where((route) => route.options.exposure.openApi),
-        ...compiledRoutes.nativeRoutes.where((route) => route.options.exposure.openApi),
-      ],
+      routes: [...compiledRoutes.routes.where((route) => route.options.exposure.openApi)],
       schemaRegistry: _schemaRegistry,
     );
   }

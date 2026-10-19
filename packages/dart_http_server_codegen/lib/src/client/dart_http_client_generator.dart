@@ -80,28 +80,6 @@ final class DartHttpClientLibrarySpec {
                   ),
             ),
           );
-        case final NativeHttpRouteMount route:
-          final routeOptions = _effectiveRouteOptions(registration, route.options.normalized());
-          if (!routeOptions.exposure.client ||
-              options.ignoresOperation(routeOptions.operationId!)) {
-            continue;
-          }
-          discoveredSchemas.addRouteOptions(routeOptions);
-          operations.add(
-            _operationFromOptions(
-              method: route.method,
-              path: fullPath,
-              options: routeOptions,
-              schemaTypes: schemaTypes,
-              methodName:
-                  _prefixedMethodName(registration.prefix, routeOptions.operationId!) ??
-                  _pathPrefixedMethodName(
-                    fullPath,
-                    routeOptions.operationId!,
-                    options.methodNamePathPrefixes,
-                  ),
-            ),
-          );
         case final WebSocketRouteDefinition<dynamic> route:
           final webSocketOptions = _effectiveWebSocketOptions(
             registration,

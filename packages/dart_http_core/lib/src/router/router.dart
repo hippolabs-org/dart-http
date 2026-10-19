@@ -11,7 +11,6 @@ import 'guard.dart';
 import 'handler_http_route_definition.dart';
 import 'http_route_definition.dart';
 import 'http_route_mount.dart';
-import 'native_http_route_mount.dart';
 import 'route_exposure.dart';
 import 'route_options.dart';
 import 'route_path.dart';
@@ -112,17 +111,6 @@ class Router<TServices> {
     List<Guard<TServices>>? guards,
   }) {
     _registerWebTransportRouteMount(route, guards: guards);
-  }
-
-  /// Mounts one native HTTP route.
-  void mountNativeHttpRoute(NativeHttpRouteMount route, {List<Guard<TServices>>? guards}) {
-    routeRegistry.registerNativeHttp(
-      prefix: prefix,
-      tags: tags,
-      guards: [...this.guards, ...?guards],
-      exposure: exposure,
-      mount: route,
-    );
   }
 
   /// Registers an inline `GET` handler.

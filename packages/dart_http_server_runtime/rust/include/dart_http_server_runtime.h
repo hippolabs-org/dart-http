@@ -6,7 +6,6 @@
 #include <stdint.h>
 
 #include <dart_http_core_ffi.h>
-#include <dart_http_server_core.h>
 
 typedef void (*dart_http_server_runtime_transport_event_callback_t)(
     int32_t event_kind,

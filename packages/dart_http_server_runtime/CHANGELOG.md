@@ -2,7 +2,10 @@
 
 - **Breaking:** Remove the unused `DartHttpNative.sendSseChunk` and its
   `dart_http_server_runtime_send_sse_chunk` export; SSE responses stream
-  through the backpressured binary chunk path. Native ABI 26.
+  through the backpressured binary chunk path.
+- **Breaking:** Remove native-code HTTP route handler dispatch (`nativeHttp`
+  route manifest entries, the `NativeHttpRequest`/`NativeHttpResponse` ABI and
+  the internal `dart_http_server_core` Rust crate). Native ABI 26.
 - Remove the unused `copyNativeOwnedBytes` helper and the dead job-pool,
   Dart API DL, slice, status, string and owned-bytes helpers from the internal
   `dart_http_core` Rust crate.

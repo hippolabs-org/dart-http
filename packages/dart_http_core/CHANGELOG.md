@@ -3,6 +3,10 @@
 - **Breaking:** Remove the unused `DartHttpIsolateWorker`,
   `DartHttpIsolateWorkerPool`, and `DartHttpIsolateWorkerPoolStrategy` APIs,
   and drop the `meta` dependency they required.
+- **Breaking:** Remove the unused native-code HTTP route handler API:
+  `NativeHttpRouteMount`, `NativeHttpRouteDescriptor`,
+  `NativeHttpRouteManifest`, `Router.mountNativeHttpRoute` and
+  `RouteRegistry.registerNativeHttp`.
 - Export `jsonSchemaRouteId`, previously duplicated in the server runtime and
   codegen packages.
 

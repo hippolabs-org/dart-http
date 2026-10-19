@@ -6,7 +6,6 @@ headers:
     - ../rust/include/dart_http_server_runtime.h
 compiler-opts:
   - -Irust/crates/dart_http_core/include
-  - -Irust/crates/dart_http_server_core/include
 functions:
   include:
     - dart_http_server_runtime_.*
@@ -25,8 +24,6 @@ structs:
     - NativeMultipartField
     - NativeMultipartFile
     - NativeMultipartForm
-    - NativeHttpRequest
-    - NativeHttpResponse
     - NativeTransportRequest
     - NativeWebSocketConnection
     - NativeWebSocketMessage

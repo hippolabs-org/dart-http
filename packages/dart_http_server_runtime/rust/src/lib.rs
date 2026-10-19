@@ -25,10 +25,7 @@ use axum::response::IntoResponse;
 use axum::routing::any;
 use dart_http_core::{
     NativeBytes, NativePair, OwnedBytes, OwnedPair, boxed_pairs_ptr, native_pairs_from_owned,
-    owned_pairs_from_map, read_native_bytes, read_native_string, read_pairs_vec,
-};
-use dart_http_server_core::{
-    NativeHttpFreeResponse, NativeHttpHandler, NativeHttpMethod, NativeHttpRequest,
+    owned_pairs_from_map, read_native_bytes, read_pairs_vec,
 };
 use futures_util::{SinkExt, StreamExt};
 use native_exchange_rust::abi::{
@@ -1060,7 +1057,6 @@ struct RouteManifest {
 enum RouteTransportKind {
     #[default]
     Http,
-    NativeHttp,
     WebSocket,
     WebTransport,
 }
@@ -1071,16 +1067,12 @@ struct RouteManifestEntry {
     #[serde(default)]
     kind: RouteTransportKind,
     route_id: String,
-    method: NativeHttpMethod,
+    method: RouteMethod,
     path_segments: Vec<RouteSegmentManifest>,
-    handler_path_segments: Option<Vec<RouteSegmentManifest>>,
     params_schema_id: Option<String>,
     query_schema_id: Option<String>,
     headers_schema_id: Option<String>,
     request_body: Option<RequestBodyManifest>,
-    native_handle: Option<i64>,
-    native_handler_address: Option<usize>,
-    native_free_response_address: Option<usize>,
     #[serde(default = "default_realtime_max_pending_messages")]
     max_pending_messages: usize,
     #[serde(default = "default_realtime_max_pending_bytes")]
@@ -1115,24 +1107,42 @@ struct RequestBodyManifest {
 struct CompiledRoute {
     kind: RouteTransportKind,
     route_id: String,
-    method: NativeHttpMethod,
+    method: RouteMethod,
     path_segments: Vec<CompiledRouteSegment>,
     params_schema_id: Option<String>,
     query_schema_id: Option<String>,
     headers_schema_id: Option<String>,
     request_body: Option<RequestBodyValidation>,
-    native_handler: Option<CompiledNativeHttpHandler>,
     max_pending_messages: usize,
     max_pending_bytes: usize,
     keep_alive: Option<WebSocketKeepAlive>,
 }
 
-#[derive(Clone)]
-struct CompiledNativeHttpHandler {
-    handle: i64,
-    handler: NativeHttpHandler,
-    free_response: NativeHttpFreeResponse,
-    handler_path_segments: Option<Vec<CompiledRouteSegment>>,
+/// HTTP method of a route in the Dart route manifest.
+#[derive(Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "UPPERCASE")]
+enum RouteMethod {
+    Get,
+    Post,
+    Put,
+    Patch,
+    Delete,
+    Head,
+    Options,
+}
+
+impl RouteMethod {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Get => "GET",
+            Self::Post => "POST",
+            Self::Put => "PUT",
+            Self::Patch => "PATCH",
+            Self::Delete => "DELETE",
+            Self::Head => "HEAD",
+            Self::Options => "OPTIONS",
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1168,7 +1178,6 @@ struct NativeRouteMatch {
     query_schema_id: Option<String>,
     headers_schema_id: Option<String>,
     request_body: Option<RequestBodyValidation>,
-    native_handler: Option<CompiledNativeHttpHandler>,
     max_pending_messages: usize,
     max_pending_bytes: usize,
     keep_alive: Option<WebSocketKeepAlive>,
@@ -1177,8 +1186,6 @@ struct NativeRouteMatch {
 #[derive(Clone)]
 struct ValidatedRouteRequest {
     route_match: NativeRouteMatch,
-    method: String,
-    path: String,
     query: QueryPairs,
     headers: HashMap<String, String>,
     body: Option<ValidatedBody>,
@@ -2585,7 +2592,7 @@ async fn validate_request(
         RouteTransportKind::Http
     };
 
-    let (route_match, method) = match lookup_route(
+    let route_match = match lookup_route(
         &runtime_state,
         parts.method.as_str(),
         parts.uri.path(),
@@ -2608,7 +2615,6 @@ async fn validate_request(
             );
         }
     };
-    let path = parts.uri.path().to_string();
     let query = parse_query(parts.uri.query());
     let headers = collect_headers(&parts.headers);
 
@@ -2638,12 +2644,11 @@ async fn validate_request(
     }
 
     match route_match.kind {
-        RouteTransportKind::Http | RouteTransportKind::NativeHttp => {
-            let streams_body = route_match.kind == RouteTransportKind::Http
-                && route_match
-                    .request_body
-                    .as_ref()
-                    .is_some_and(|request_body| request_body.streaming);
+        RouteTransportKind::Http => {
+            let streams_body = route_match
+                .request_body
+                .as_ref()
+                .is_some_and(|request_body| request_body.streaming);
             if streams_body {
                 let request_body = route_match
                     .request_body
@@ -2663,8 +2668,6 @@ async fn validate_request(
                 let mut request = Request::from_parts(parts, body);
                 request.extensions_mut().insert(ValidatedRouteRequest {
                     route_match,
-                    method,
-                    path,
                     query,
                     headers,
                     body: None,
@@ -2723,8 +2726,6 @@ async fn validate_request(
             let mut request = Request::from_parts(parts, Body::empty());
             request.extensions_mut().insert(ValidatedRouteRequest {
                 route_match,
-                method,
-                path,
                 query,
                 headers,
                 body: Some(body),
@@ -2736,8 +2737,6 @@ async fn validate_request(
             let mut request = Request::from_parts(parts, body);
             request.extensions_mut().insert(ValidatedRouteRequest {
                 route_match,
-                method,
-                path,
                 query,
                 headers,
                 body: None,
@@ -2758,17 +2757,6 @@ async fn handle_validated_request(mut request: Request<Body>) -> Response<Body> 
     };
 
     match validated.route_match.kind {
-        RouteTransportKind::NativeHttp => {
-            handle_native_http_request(
-                validated.route_match,
-                &validated.method,
-                &validated.path,
-                validated.query,
-                validated.headers,
-                validated.body.unwrap_or_else(ValidatedBody::none),
-            )
-            .await
-        }
         RouteTransportKind::Http => {
             let streams_body = validated
                 .route_match
@@ -3015,144 +3003,6 @@ async fn handle_http_request(
             "Unexpected WebSocket response for HTTP request".to_string(),
         ),
     }
-}
-
-async fn handle_native_http_request(
-    route_match: NativeRouteMatch,
-    method: &str,
-    path: &str,
-    query: QueryPairs,
-    headers: HashMap<String, String>,
-    body: ValidatedBody,
-) -> Response<Body> {
-    let NativeRouteMatch {
-        native_handler,
-        path_params,
-        ..
-    } = route_match;
-    let Some(native_handler) = native_handler else {
-        return response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "text/plain; charset=utf-8",
-            "Native route is missing handler metadata".to_string(),
-        );
-    };
-
-    let handler_path = match native_handler_path(
-        path,
-        native_handler.handler_path_segments.as_deref(),
-        &path_params,
-    ) {
-        Ok(path) => path,
-        Err(message) => {
-            return response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "text/plain; charset=utf-8",
-                message,
-            );
-        }
-    };
-    let path = CString::new(handler_path).unwrap_or_default();
-    let query_pairs = owned_pairs_from_vec(query);
-    let query_storage = native_pairs_from_owned(&query_pairs);
-    let header_pairs = owned_pairs_from_map(headers);
-    let header_storage = native_pairs_from_owned(&header_pairs);
-    let body_bytes = body.bytes.unwrap_or_default();
-    let body_ptr = if body_bytes.is_empty() {
-        std::ptr::null()
-    } else {
-        body_bytes.as_ptr()
-    };
-
-    let Some(method) = NativeHttpMethod::from_name(method) else {
-        return response(
-            StatusCode::METHOD_NOT_ALLOWED,
-            "text/plain; charset=utf-8",
-            "Unsupported HTTP method".to_string(),
-        );
-    };
-    let request_body = NativeBytes {
-        ptr: body_ptr,
-        len: body_bytes.len() as isize,
-    };
-    let native_request = NativeHttpRequest {
-        method: method.code(),
-        path: path.as_ptr(),
-        query_count: query_storage.len() as isize,
-        query: boxed_pairs_ptr(&query_storage),
-        header_count: header_storage.len() as isize,
-        headers: boxed_pairs_ptr(&header_storage),
-        body: request_body,
-    };
-    let response_ptr = unsafe { (native_handler.handler)(native_handler.handle, &native_request) };
-    if response_ptr.is_null() {
-        return response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "text/plain; charset=utf-8",
-            "Native route handler failed".to_string(),
-        );
-    }
-
-    let native_response = unsafe { &*response_ptr };
-    let status =
-        StatusCode::from_u16(native_response.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    let content_type = unsafe { read_native_string(native_response.content_type) }
-        .unwrap_or_else(|| "application/octet-stream".to_string());
-    let response_body = unsafe { read_native_bytes(native_response.body) }
-        .map(|bytes| bytes.to_vec())
-        .unwrap_or_default();
-    let response_headers =
-        unsafe { read_pairs_vec(native_response.headers, native_response.header_count) };
-    unsafe {
-        (native_handler.free_response)(response_ptr);
-    }
-
-    response_body_with_headers(
-        status,
-        &content_type,
-        &response_headers,
-        Body::from(response_body),
-    )
-}
-
-fn native_handler_path(
-    public_path: &str,
-    handler_path_segments: Option<&[CompiledRouteSegment]>,
-    path_params: &HashMap<String, String>,
-) -> Result<String, String> {
-    let Some(handler_path_segments) = handler_path_segments else {
-        return Ok(public_path.to_string());
-    };
-
-    if handler_path_segments.is_empty() {
-        return Ok("/".to_string());
-    }
-
-    let mut path = String::new();
-    for segment in handler_path_segments {
-        path.push('/');
-        match segment {
-            CompiledRouteSegment::Literal(value) => path.push_str(value),
-            CompiledRouteSegment::Parameter(name) => {
-                let Some(value) = path_params.get(name) else {
-                    return Err(format!(
-                        "Native route handler path references missing parameter '{name}'."
-                    ));
-                };
-                path.push_str(value);
-            }
-            CompiledRouteSegment::Wildcard(name) => {
-                let Some(value) = path_params.get(name) else {
-                    return Err(format!(
-                        "Native route handler path references missing wildcard parameter '{name}'."
-                    ));
-                };
-                path.push_str(value);
-            }
-        }
-    }
-
-    Ok(path)
 }
 
 async fn handle_web_socket_request(
@@ -4689,54 +4539,20 @@ fn compile_route(
     )?;
 
     let request_body = match route.kind {
-        RouteTransportKind::Http | RouteTransportKind::NativeHttp => {
-            route
-                .request_body
-                .map(|request_body| RequestBodyValidation {
-                    kind: if request_body.binary {
-                        RequestBodyKind::Binary
-                    } else {
-                        body_kind(&request_body.content_type)
-                    },
-                    content_type: request_body.content_type,
-                    schema_id: request_body.schema_id,
-                    streaming: request_body.streaming,
-                })
-        }
+        RouteTransportKind::Http => route
+            .request_body
+            .map(|request_body| RequestBodyValidation {
+                kind: if request_body.binary {
+                    RequestBodyKind::Binary
+                } else {
+                    body_kind(&request_body.content_type)
+                },
+                content_type: request_body.content_type,
+                schema_id: request_body.schema_id,
+                streaming: request_body.streaming,
+            }),
         RouteTransportKind::WebSocket | RouteTransportKind::WebTransport => None,
     };
-    let handler_path_segments = route.handler_path_segments.map(compile_route_segments);
-    let native_handler = match route.kind {
-        RouteTransportKind::NativeHttp => {
-            let handle = route.native_handle.ok_or_else(|| {
-                format!("Native route '{}' is missing nativeHandle", route.route_id)
-            })?;
-            let handler_address = route.native_handler_address.ok_or_else(|| {
-                format!(
-                    "Native route '{}' is missing nativeHandlerAddress",
-                    route.route_id
-                )
-            })?;
-            let free_response_address = route.native_free_response_address.ok_or_else(|| {
-                format!(
-                    "Native route '{}' is missing nativeFreeResponseAddress",
-                    route.route_id
-                )
-            })?;
-            Some(CompiledNativeHttpHandler {
-                handle,
-                handler: unsafe {
-                    std::mem::transmute::<usize, NativeHttpHandler>(handler_address)
-                },
-                free_response: unsafe {
-                    std::mem::transmute::<usize, NativeHttpFreeResponse>(free_response_address)
-                },
-                handler_path_segments,
-            })
-        }
-        _ => None,
-    };
-
     Ok(CompiledRoute {
         kind: route.kind,
         route_id: route.route_id,
@@ -4746,7 +4562,6 @@ fn compile_route(
         query_schema_id: route.query_schema_id,
         headers_schema_id: route.headers_schema_id,
         request_body,
-        native_handler,
         max_pending_messages: route.max_pending_messages,
         max_pending_bytes: route.max_pending_bytes,
         keep_alive: WebSocketKeepAlive::from_millis(
@@ -5150,14 +4965,14 @@ fn lookup_route(
     method: &str,
     path: &str,
     requested_kind: RouteTransportKind,
-) -> Result<(NativeRouteMatch, String), RouteMiss> {
+) -> Result<NativeRouteMatch, RouteMiss> {
     if let Some(route_match) = match_route(runtime_state, method, path, requested_kind) {
-        return Ok((route_match, method.to_string()));
+        return Ok(route_match);
     }
     if method == "HEAD"
         && let Some(route_match) = match_route(runtime_state, "GET", path, requested_kind)
     {
-        return Ok((route_match, "GET".to_string()));
+        return Ok(route_match);
     }
 
     let request_segments = path_segments(path);
@@ -5208,7 +5023,6 @@ fn match_route(
             query_schema_id: route.query_schema_id.clone(),
             headers_schema_id: route.headers_schema_id.clone(),
             request_body: route.request_body.clone(),
-            native_handler: route.native_handler.clone(),
             max_pending_messages: route.max_pending_messages,
             max_pending_bytes: route.max_pending_bytes,
             keep_alive: route.keep_alive,
@@ -5260,13 +5074,7 @@ fn route_segment_count_matches(
 
 fn route_kind_matches(route_kind: RouteTransportKind, requested_kind: RouteTransportKind) -> bool {
     match requested_kind {
-        RouteTransportKind::Http => {
-            matches!(
-                route_kind,
-                RouteTransportKind::Http | RouteTransportKind::NativeHttp
-            )
-        }
-        RouteTransportKind::NativeHttp => false,
+        RouteTransportKind::Http => route_kind == RouteTransportKind::Http,
         RouteTransportKind::WebSocket => route_kind == RouteTransportKind::WebSocket,
         RouteTransportKind::WebTransport => route_kind == RouteTransportKind::WebTransport,
     }

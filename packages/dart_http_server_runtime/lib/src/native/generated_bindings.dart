@@ -333,39 +333,6 @@ final class NativeBytes extends ffi.Struct {
     ..ref.len = len;
 }
 
-final class NativeHttpRequest extends ffi.Struct {
-  @ffi.Int32()
-  external int method;
-
-  external ffi.Pointer<ffi.Char> path;
-
-  @ffi.IntPtr()
-  external int query_count;
-
-  external ffi.Pointer<NativePair> query;
-
-  @ffi.IntPtr()
-  external int header_count;
-
-  external ffi.Pointer<NativePair> headers;
-
-  external NativeBytes body;
-}
-
-final class NativeHttpResponse extends ffi.Struct {
-  @ffi.Uint16()
-  external int status;
-
-  external NativeBytes content_type;
-
-  @ffi.IntPtr()
-  external int header_count;
-
-  external ffi.Pointer<NativePair> headers;
-
-  external NativeBytes body;
-}
-
 final class NativeMultipartField extends ffi.Struct {
   external NativeBytes name;
 

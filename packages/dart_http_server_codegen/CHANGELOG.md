@@ -1,3 +1,8 @@
+## Unreleased
+
+- Stop generating client operations for native HTTP route mounts, which were
+  removed from `dart_http_core`.
+
 ## 0.4.3
 
 - Generate `decodeQuery` for schema-backed models with scalar query fields.
