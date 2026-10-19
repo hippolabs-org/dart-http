@@ -180,36 +180,3 @@ final class _DartHttpStreamedRequest extends http.BaseRequest with http.Abortabl
     return http.ByteStream(_bodyStream);
   }
 }
-
-/// Adds an `Authorization: Bearer <token>` header to generated client requests.
-final class DartHttpBearerTokenInterceptor {
-  const DartHttpBearerTokenInterceptor(this.token);
-
-  final Future<String?> Function() token;
-
-  Future<DartHttpClientResponse> call(
-    DartHttpClientRequest request,
-    DartHttpClientSend next,
-  ) async {
-    final resolvedToken = await token();
-    if (resolvedToken == null || resolvedToken.isEmpty) {
-      return next(request);
-    }
-    return next(
-      request.copyWith(headers: {...request.headers, 'authorization': 'Bearer $resolvedToken'}),
-    );
-  }
-
-  Future<DartHttpClientStreamedResponse> stream(
-    DartHttpClientRequest request,
-    DartHttpClientStreamedSend next,
-  ) async {
-    final resolvedToken = await token();
-    if (resolvedToken == null || resolvedToken.isEmpty) {
-      return next(request);
-    }
-    return next(
-      request.copyWith(headers: {...request.headers, 'authorization': 'Bearer $resolvedToken'}),
-    );
-  }
-}

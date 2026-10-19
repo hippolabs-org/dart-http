@@ -40,7 +40,11 @@ void main() {
           expect(request.headers['authorization'], 'Bearer test-token');
           return http.Response('ok', 200, headers: {'content-type': 'text/plain; charset=utf-8'});
         }),
-        interceptors: [DartHttpBearerTokenInterceptor(() async => 'test-token').call],
+        interceptors: [
+          (request, next) => next(
+            request.copyWith(headers: {...request.headers, 'authorization': 'Bearer test-token'}),
+          ),
+        ],
       );
 
       final response = await transport.send(
@@ -257,13 +261,16 @@ void main() {
     });
 
     test('applies streamed interceptors to streamed responses', () async {
-      final bearer = DartHttpBearerTokenInterceptor(() async => 'test-token');
       final transport = DartHttpClientTransport(
         client: MockClient.streaming((request, _) async {
           expect(request.headers['authorization'], 'Bearer test-token');
           return http.StreamedResponse(const Stream<List<int>>.empty(), 204);
         }),
-        streamedInterceptors: [bearer.stream],
+        streamedInterceptors: [
+          (request, next) => next(
+            request.copyWith(headers: {...request.headers, 'authorization': 'Bearer test-token'}),
+          ),
+        ],
       );
 
       final response = await transport.sendStream(
@@ -278,59 +285,7 @@ void main() {
   });
 
   group('DartHttpWebSocketClientTransport', () {
-    test('automatic reconnect requires explicit opt-in', () async {
-      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
-      addTearDown(() => server.close(force: true));
-      var connections = 0;
-      server.listen((request) async {
-        final socket = await WebSocketTransformer.upgrade(request);
-        final connection = ++connections;
-        socket.add('connection-$connection');
-        if (connection == 1) await socket.close(1000, 'reconnect test');
-      });
-      final socket =
-          await const DartHttpWebSocketClientTransport(
-            reconnect: true,
-            backoff: ConstantBackoff(Duration(milliseconds: 10)),
-          ).connect(
-            DartHttpClientWebSocketRequest(uri: Uri.parse('ws://127.0.0.1:${server.port}/socket')),
-          );
-      addTearDown(socket.close);
-      final iterator = StreamIterator<WebSocketMessage>(socket.messages);
-      addTearDown(iterator.cancel);
-      expect(await iterator.moveNext().timeout(const Duration(seconds: 5)), isTrue);
-      expect(iterator.current.text, 'connection-1');
-      expect(await iterator.moveNext().timeout(const Duration(seconds: 5)), isTrue);
-      expect(iterator.current.text, 'connection-2');
-      expect(connections, 2);
-    });
-
-    test('reconnection options cannot be silently ignored by the default', () async {
-      await expectLater(
-        const DartHttpWebSocketClientTransport(backoff: ConstantBackoff(Duration(seconds: 1)))
-            .connect(DartHttpClientWebSocketRequest(uri: Uri.parse('ws://unused.test/socket'))),
-        throwsArgumentError,
-      );
-    });
-
-    test('custom socketFactory keeps its public constructor name and requires opt-in', () async {
-      Never factory(
-        Uri uri, {
-        Iterable<String>? protocols,
-        Duration? pingInterval,
-        Map<String, dynamic>? headers,
-        Backoff? backoff,
-        Duration? timeout,
-        String? binaryType,
-      }) => throw StateError('A disabled factory must not be called.');
-      await expectLater(
-        DartHttpWebSocketClientTransport(socketFactory: factory)
-            .connect(DartHttpClientWebSocketRequest(uri: Uri.parse('ws://unused.test/socket'))),
-        throwsArgumentError,
-      );
-    });
-
-    test('connects through web_socket_client and maps messages', () async {
+    test('connects and maps messages', () async {
       final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
       addTearDown(server.close);
 
@@ -341,10 +296,7 @@ void main() {
         });
       });
 
-      final transport = DartHttpWebSocketClientTransport(
-        reconnect: true,
-        backoff: const ConstantBackoff(Duration.zero),
-      );
+      const transport = DartHttpWebSocketClientTransport();
       final socket = await transport.connect(
         DartHttpClientWebSocketRequest(
           uri: Uri.parse('ws://${server.address.host}:${server.port}/socket'),
@@ -375,10 +327,7 @@ void main() {
         socket.add('session.created');
       });
 
-      final transport = DartHttpWebSocketClientTransport(
-        reconnect: true,
-        backoff: const ConstantBackoff(Duration.zero),
-      );
+      const transport = DartHttpWebSocketClientTransport();
       final socket = await transport.connect(
         DartHttpClientWebSocketRequest(
           uri: Uri.parse('ws://${server.address.host}:${server.port}/immediate'),

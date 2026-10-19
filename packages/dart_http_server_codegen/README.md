@@ -18,7 +18,7 @@ normalized HTTP route metadata.
   metadata
 - `DartHttpClientBase` is exported by `dart_http_core`
 - `dart_http_client` provides concrete `package:http` and
-  `web_socket_client` transports for generated clients
+  `web_socket_channel` transports for generated clients
 
 `dart_http_server_codegen` does not export `FromSchema`. Import
 annotations and runtime contracts from `dart_http_core` or the app-facing

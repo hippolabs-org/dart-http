@@ -15,7 +15,6 @@ dependencies:
     version: ^0.3.64
   http: ^1.6.0
   web: ^1.1.1
-  web_socket_client: ^0.2.1
   web_socket_channel: ^3.0.3
 
 dev_dependencies:

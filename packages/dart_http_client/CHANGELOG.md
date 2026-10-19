@@ -1,3 +1,15 @@
+## Unreleased
+
+- **Breaking:** Remove the opt-in reconnecting WebSocket mode:
+  `DartHttpWebSocketClientTransport`'s `reconnect`, `backoff` and
+  `socketFactory` parameters, `DartHttpWebSocketClient`,
+  `DartHttpWebSocketFactory`, the `Backoff`/`BinaryExponentialBackoff`/
+  `ConstantBackoff`/`LinearBackoff` re-exports, and the `web_socket_client`
+  dependency. `const DartHttpWebSocketClientTransport()` keeps its
+  single-connection behavior.
+- **Breaking:** Remove `DartHttpBearerTokenInterceptor`; add the header with a
+  plain interceptor instead.
+
 ## 0.2.2
 
 - Report browser XMLHttpRequest transmission progress and support cancellation during preparation and transfer.
