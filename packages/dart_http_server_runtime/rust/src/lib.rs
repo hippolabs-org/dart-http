@@ -2513,6 +2513,34 @@ async fn validate_request_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response<Body> {
+    let is_head = request.method() == Method::HEAD;
+    let response = validate_request(runtime_state, request, next).await;
+    if is_head {
+        strip_head_response_body(response)
+    } else {
+        response
+    }
+}
+
+/// Drops a HEAD response body while keeping the length a GET would report.
+fn strip_head_response_body(response: Response<Body>) -> Response<Body> {
+    let (mut parts, body) = response.into_parts();
+    if !parts.headers.contains_key(header::CONTENT_LENGTH)
+        && let Some(length) = axum::body::HttpBody::size_hint(&body).exact()
+    {
+        parts
+            .headers
+            .insert(header::CONTENT_LENGTH, HeaderValue::from(length));
+    }
+    drop(body);
+    Response::from_parts(parts, Body::empty())
+}
+
+async fn validate_request(
+    runtime_state: ServerRuntimeState,
+    request: Request<Body>,
+    next: Next,
+) -> Response<Body> {
     let (parts, body) = request.into_parts();
     if parts
         .headers
@@ -2530,14 +2558,22 @@ async fn validate_request_middleware(
         RouteTransportKind::Http
     };
 
-    let route_match = match match_route(
+    let (route_match, method) = match lookup_route(
         &runtime_state,
         parts.method.as_str(),
         parts.uri.path(),
         requested_kind,
     ) {
-        Some(route_match) => route_match,
-        None => {
+        Ok(matched) => matched,
+        Err(RouteMiss::MethodNotAllowed { allow }) => {
+            return response_with_headers(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "text/plain; charset=utf-8",
+                &[("allow".to_string(), allow)],
+                "Method not allowed".to_string(),
+            );
+        }
+        Err(RouteMiss::NotFound) => {
             return response(
                 StatusCode::NOT_FOUND,
                 "text/plain; charset=utf-8",
@@ -2545,7 +2581,6 @@ async fn validate_request_middleware(
             );
         }
     };
-    let method = parts.method.as_str().to_string();
     let path = parts.uri.path().to_string();
     let query = parse_query(parts.uri.query());
     let headers = collect_headers(&parts.headers);
@@ -5074,6 +5109,52 @@ impl NativeMultipartFormHandle {
     }
 }
 
+/// Why no route answers a request.
+enum RouteMiss {
+    MethodNotAllowed { allow: String },
+    NotFound,
+}
+
+/// Resolves a request to a route, answering HEAD from the GET route when no
+/// HEAD route exists and telling a wrong method apart from an unknown path.
+///
+/// The returned method is the route's own, which is GET when HEAD falls back.
+fn lookup_route(
+    runtime_state: &ServerRuntimeState,
+    method: &str,
+    path: &str,
+    requested_kind: RouteTransportKind,
+) -> Result<(NativeRouteMatch, String), RouteMiss> {
+    if let Some(route_match) = match_route(runtime_state, method, path, requested_kind) {
+        return Ok((route_match, method.to_string()));
+    }
+    if method == "HEAD"
+        && let Some(route_match) = match_route(runtime_state, "GET", path, requested_kind)
+    {
+        return Ok((route_match, "GET".to_string()));
+    }
+
+    let request_segments = path_segments(path);
+    let mut allowed: Vec<&'static str> = Vec::new();
+    for route in runtime_state.routes.iter() {
+        if route_kind_matches(route.kind, requested_kind)
+            && match_route_path(route, &request_segments).is_some()
+            && !allowed.contains(&route.method.as_str())
+        {
+            allowed.push(route.method.as_str());
+        }
+    }
+    if allowed.is_empty() {
+        return Err(RouteMiss::NotFound);
+    }
+    if allowed.contains(&"GET") && !allowed.contains(&"HEAD") {
+        allowed.push("HEAD");
+    }
+    Err(RouteMiss::MethodNotAllowed {
+        allow: allowed.join(", "),
+    })
+}
+
 fn match_route(
     runtime_state: &ServerRuntimeState,
     method: &str,
@@ -5089,53 +5170,54 @@ fn match_route(
         if route.method.as_str() != method {
             continue;
         }
-        if !route_segment_count_matches(&route.path_segments, request_segments.len()) {
+        let Some(path_params) = match_route_path(route, &request_segments) else {
             continue;
-        }
+        };
 
-        let mut path_params = HashMap::new();
-        let mut matched = true;
-
-        for (index, route_segment) in route.path_segments.iter().enumerate() {
-            match route_segment {
-                CompiledRouteSegment::Literal(literal)
-                    if request_segments.get(index) == Some(&literal.as_str()) => {}
-                CompiledRouteSegment::Literal(_) => {
-                    matched = false;
-                    break;
-                }
-                CompiledRouteSegment::Parameter(name) => {
-                    let Some(request_segment) = request_segments.get(index) else {
-                        matched = false;
-                        break;
-                    };
-                    path_params.insert(name.clone(), (*request_segment).to_string());
-                }
-                CompiledRouteSegment::Wildcard(name) => {
-                    path_params.insert(name.clone(), request_segments[index..].join("/"));
-                    break;
-                }
-            }
-        }
-
-        if matched {
-            return Some(NativeRouteMatch {
-                kind: route.kind,
-                route_id: route.route_id.clone(),
-                path_params,
-                params_schema_id: route.params_schema_id.clone(),
-                query_schema_id: route.query_schema_id.clone(),
-                headers_schema_id: route.headers_schema_id.clone(),
-                request_body: route.request_body.clone(),
-                native_handler: route.native_handler.clone(),
-                max_pending_messages: route.max_pending_messages,
-                max_pending_bytes: route.max_pending_bytes,
-                keep_alive: route.keep_alive,
-            });
-        }
+        return Some(NativeRouteMatch {
+            kind: route.kind,
+            route_id: route.route_id.clone(),
+            path_params,
+            params_schema_id: route.params_schema_id.clone(),
+            query_schema_id: route.query_schema_id.clone(),
+            headers_schema_id: route.headers_schema_id.clone(),
+            request_body: route.request_body.clone(),
+            native_handler: route.native_handler.clone(),
+            max_pending_messages: route.max_pending_messages,
+            max_pending_bytes: route.max_pending_bytes,
+            keep_alive: route.keep_alive,
+        });
     }
 
     None
+}
+
+/// Matches [route]'s path pattern and returns its path parameters.
+fn match_route_path(
+    route: &CompiledRoute,
+    request_segments: &[&str],
+) -> Option<HashMap<String, String>> {
+    if !route_segment_count_matches(&route.path_segments, request_segments.len()) {
+        return None;
+    }
+
+    let mut path_params = HashMap::new();
+    for (index, route_segment) in route.path_segments.iter().enumerate() {
+        match route_segment {
+            CompiledRouteSegment::Literal(literal)
+                if request_segments.get(index) == Some(&literal.as_str()) => {}
+            CompiledRouteSegment::Literal(_) => return None,
+            CompiledRouteSegment::Parameter(name) => {
+                let request_segment = request_segments.get(index)?;
+                path_params.insert(name.clone(), (*request_segment).to_string());
+            }
+            CompiledRouteSegment::Wildcard(name) => {
+                path_params.insert(name.clone(), request_segments[index..].join("/"));
+                break;
+            }
+        }
+    }
+    Some(path_params)
 }
 
 fn route_segment_count_matches(

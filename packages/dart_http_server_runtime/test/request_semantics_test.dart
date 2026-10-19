@@ -63,7 +63,65 @@ void main() {
       expect((jsonDecode(response.body) as Map<String, Object?>)['name'], 'Jürgen');
     });
   });
+
+  group('method routing', () {
+    late DartHttpServer server;
+
+    setUp(() async {
+      final app = DartHttp<void>(services: () {});
+      app.get('/thing', handler: (_) => RawResponse.text(status: 200, body: 'hello'));
+      app.put('/thing', handler: (_) => RawResponse.text(status: 200, body: 'put'));
+      app.post('/only-post', handler: (_) => RawResponse.text(status: 200, body: 'posted'));
+      server = await app.listen(port: 0);
+    });
+
+    tearDown(() => server.close());
+
+    test('answers HEAD from the GET route without a body', () async {
+      final response = await _rawRequest(
+        server.port,
+        'HEAD /thing HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n',
+      );
+
+      expect(response.status, HttpStatus.ok);
+      expect(response.headers['content-length'], '5');
+      expect(response.body, isEmpty);
+    });
+
+    test('answers a known path with the wrong method with 405 and Allow', () async {
+      final response = await _rawRequest(
+        server.port,
+        'DELETE /thing HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n',
+      );
+
+      expect(response.status, HttpStatus.methodNotAllowed);
+      expect(_csv(response.headers['allow']), unorderedEquals(['GET', 'HEAD', 'PUT']));
+    });
+
+    test('does not offer HEAD for a path without a GET route', () async {
+      final response = await _rawRequest(
+        server.port,
+        'HEAD /only-post HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n',
+      );
+
+      expect(response.status, HttpStatus.methodNotAllowed);
+      expect(_csv(response.headers['allow']), ['POST']);
+    });
+
+    test('still answers unknown paths with 404', () async {
+      final response = await _rawRequest(
+        server.port,
+        'GET /missing HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n',
+      );
+
+      expect(response.status, HttpStatus.notFound);
+    });
+  });
 }
+
+List<String> _csv(String? value) =>
+    value?.split(',').map((part) => part.trim()).where((part) => part.isNotEmpty).toList() ??
+    const <String>[];
 
 Future<_RawResponse> _rawRequest(int port, String request) async {
   final socket = await Socket.connect('127.0.0.1', port);
