@@ -366,10 +366,10 @@ packages:
     dependency: transitive
     description:
       name: jaspr
-      sha256: ce9fa2b852a07d538d39c3cf45487184a24a5d329a5c5ec2de47f251995be6aa
+      sha256: c4e7459389fadb3f48ed7c2d5165b000ad93f4aaa08f86a490eaf5d3b652bb3e
       url: "https://pub.dev"
     source: hosted
-    version: "0.23.4"
+    version: "0.23.5"
   json_annotation:
     dependency: transitive
     description:
