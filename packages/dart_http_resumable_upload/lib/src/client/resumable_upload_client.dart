@@ -437,6 +437,11 @@ final class ResumableUploadClient {
       onEvent?.call(
         ResumableUploadEvent(type: ResumableUploadEventType.finalizing, checkpoint: checkpoint),
       );
+      // Retrying the finalization POST after an ambiguous failure (lost
+      // response, network error, 5xx) is safe: the server serializes
+      // finalization per upload and durably replays the first successful
+      // response (see ResumableUploadFinalizationStore), so a retry never runs
+      // the application's completion side effects twice.
       var attempt = 0;
       var aborted = false;
       abortTrigger?.then<void>((_) => aborted = true, onError: (Object _, StackTrace _) {});
@@ -550,11 +555,19 @@ final class ResumableUploadClient {
         'Server upload length changed from $expectedLength to $length.',
       );
     }
-    if (offset < minimumOffset ||
-        offset > expectedLength ||
-        (complete && offset != expectedLength)) {
+    if (offset < minimumOffset) {
+      throw ResumableUploadProtocolException(
+        'Server offset $offset is behind the confirmed offset $minimumOffset.',
+      );
+    }
+    if (offset > expectedLength) {
       throw ResumableUploadProtocolException(
         'Server offset $offset exceeds upload length $expectedLength.',
+      );
+    }
+    if (complete && offset != expectedLength) {
+      throw ResumableUploadProtocolException(
+        'Server reported a complete upload at offset $offset of $expectedLength bytes.',
       );
     }
     return _Inspection(

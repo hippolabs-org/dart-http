@@ -104,7 +104,7 @@ final class NativeHttpWebSocket
   final int _socketId;
   final Completer<void> _connected = Completer<void>();
   final Map<int, Completer<void>> _pendingOperations = {};
-  final List<int> _deferredStreamNotifications = [];
+  final ListQueue<int> _deferredStreamNotifications = ListQueue<int>();
   late final StreamController<WebSocketMessage> _controller;
   String? _selectedProtocol;
   DartHttpClientWebSocketCloseDetails? _closeDetails;
@@ -114,6 +114,13 @@ final class NativeHttpWebSocket
   var _discardData = false;
   var _terminal = false;
   var _closing = false;
+
+  /// The peer closed or failed the socket while received frames were still
+  /// waiting for a listener. Sending is over; the stream ends once those
+  /// frames have been delivered (or discarded).
+  var _peerEnded = false;
+  Object? _peerEndError;
+  StackTrace? _peerEndStackTrace;
   var _queuedOperations = 0;
   Timer? _closeTimer;
   _NativeHttpWebSocketAdoptedStream? _byteStream;
@@ -276,7 +283,7 @@ final class NativeHttpWebSocket
 
   @override
   void enqueueByteLease(ByteLease lease, {List<int> prefix = const <int>[]}) {
-    if (_terminal || !_connected.isCompleted) {
+    if (_outgoingClosed || !_connected.isCompleted) {
       lease.close();
       throw const NativeHttpClientException('Native WebSocket is not connected.');
     }
@@ -368,7 +375,7 @@ final class NativeHttpWebSocket
         'Queued base64 WebSocket sends require a Native Exchange payload lease.',
       );
     }
-    if (_terminal || !_connected.isCompleted || _closing) {
+    if (_outgoingClosed || !_connected.isCompleted || _closing) {
       lease.close();
       throw const NativeHttpClientException('Native WebSocket cannot accept a queued send.');
     }
@@ -418,7 +425,7 @@ final class NativeHttpWebSocket
 
   @override
   void setJsonBase64Decoding(List<WebSocketJsonBase64Rule> rules) {
-    if (_terminal || _closing) throw StateError('Native WebSocket is closed.');
+    if (_outgoingClosed || _closing) throw StateError('Native WebSocket is closed.');
     final json = jsonEncode(rules.map((rule) => rule.toJson()).toList()).toNativeUtf8();
     try {
       if (!native.dart_http_native_client_websocket_set_json_base64_rules(
@@ -446,7 +453,7 @@ final class NativeHttpWebSocket
   }
 
   void _adoptByteStream(ByteStreamLease stream) {
-    if (_terminal || !_connected.isCompleted || _closing) {
+    if (_outgoingClosed || !_connected.isCompleted || _closing) {
       unawaited(Future<void>.sync(stream.close));
       throw const NativeHttpClientException('Native WebSocket cannot adopt a byte stream.');
     }
@@ -485,6 +492,17 @@ final class NativeHttpWebSocket
   @override
   Future<void> close([int? code, String? reason]) async {
     if (_terminal || _closing) return;
+    if (_peerEnded) {
+      // The peer already closed; drop undelivered frames and end the stream.
+      _closing = true;
+      _discardData = true;
+      _flushDeferredData();
+      return;
+    }
+    // Only commit to closing once the close operation is accepted, so a full
+    // send queue leaves the socket open and usable instead of half-closed.
+    final rejection = _operationRejection(allowClosing: true);
+    if (rejection != null) throw rejection;
     _closing = true;
     _discardData = true;
     _flushDeferredData();
@@ -507,29 +525,34 @@ final class NativeHttpWebSocket
       }, allowClosing: true);
     } on Object {
       // The socket already ended, e.g. through the close deadline or the
-      // transport closing; closing it has succeeded.
-      if (!_terminal) rethrow;
+      // transport closing, or the peer closing first; closing it has succeeded.
+      if (!_outgoingClosed) rethrow;
     }
   }
 
-  Future<void> _scheduleOperation(int Function() start, {bool allowClosing = false}) {
-    if (_terminal || (!_connected.isCompleted)) {
-      return Future<void>.error(
-        const NativeHttpClientException('Native WebSocket is not connected.'),
-      );
+  bool get _outgoingClosed => _terminal || _peerEnded;
+
+  NativeHttpClientException? _operationRejection({required bool allowClosing}) {
+    if (_outgoingClosed || (!_connected.isCompleted)) {
+      return const NativeHttpClientException('Native WebSocket is not connected.');
     }
     if (_closing && !allowClosing) {
-      return Future<void>.error(const NativeHttpClientException('Native WebSocket is closing.'));
+      return const NativeHttpClientException('Native WebSocket is closing.');
     }
     if (_queuedOperations >= _transport._webSocketOutgoingCapacity) {
-      return Future<void>.error(
-        const NativeHttpClientException('Native WebSocket send queue is full.'),
-      );
+      return const NativeHttpClientException('Native WebSocket send queue is full.');
+    }
+    return null;
+  }
+
+  Future<void> _scheduleOperation(int Function() start, {bool allowClosing = false}) {
+    if (_operationRejection(allowClosing: allowClosing) case final rejection?) {
+      return Future<void>.error(rejection);
     }
     _queuedOperations++;
     final previous = _operationTail;
     final operation = previous.then((_) async {
-      if (_terminal) {
+      if (_outgoingClosed) {
         throw const NativeHttpClientException('Native WebSocket is closed.');
       }
       final operationId = start();
@@ -552,17 +575,14 @@ final class NativeHttpWebSocket
       return;
     }
     if (kind == _webSocketEventText || kind == _webSocketEventBinary) {
-      if (!_discardData && (!_listening || _paused)) {
+      if (!_discardData && (!_listening || _paused || _deferredStreamNotifications.isNotEmpty)) {
         _deferredStreamNotifications.add(kind);
         return;
       }
     }
-    if ((kind == _webSocketEventClosed || kind == _webSocketEventError) &&
-        !_discardData &&
-        _deferredStreamNotifications.isNotEmpty) {
-      _deferredStreamNotifications.add(kind);
-      return;
-    }
+    // Close and error events travel on their own native queue, so they are
+    // taken immediately: a socket that is only sent on must still learn that
+    // it closed. Frames received before them are delivered first.
     _takeNativeEvent(kind);
   }
 
@@ -643,16 +663,15 @@ final class NativeHttpWebSocket
             code: value.close_code < 0 ? null : value.close_code,
             reason: text,
           );
-          _finish();
+          _peerEnd();
         case _webSocketEventError:
           final error = NativeHttpClientException(text ?? 'Native WebSocket failed.');
-          final failedWhileConnecting = !_connected.isCompleted;
-          if (failedWhileConnecting) {
+          if (!_connected.isCompleted) {
             _connected.completeError(error);
-          } else if (!_controller.isClosed) {
-            _controller.addError(error);
+            _finish(error);
+          } else {
+            _peerEnd(error);
           }
-          _finish(error);
         case _webSocketEventSent:
           _pendingOperations.remove(value.operation_id)?.complete();
         default:
@@ -706,7 +725,7 @@ final class NativeHttpWebSocket
         while (_deferredStreamNotifications.isNotEmpty &&
             !_terminal &&
             (_discardData || (_listening && !_paused))) {
-          _takeNativeEvent(_deferredStreamNotifications.removeAt(0));
+          _takeNativeEvent(_deferredStreamNotifications.removeFirst());
         }
       } finally {
         _flushing = false;
@@ -714,14 +733,58 @@ final class NativeHttpWebSocket
             !_terminal &&
             (_discardData || (_listening && !_paused))) {
           _flushDeferredData();
+        } else {
+          _finishPeerEndIfDrained();
         }
       }
     });
   }
 
+  /// Records that the peer closed or failed the socket. Sending stops at once;
+  /// the message stream ends after frames received earlier are delivered.
+  void _peerEnd([Object? error, StackTrace? stackTrace]) {
+    if (_terminal || _peerEnded) return;
+    _peerEnded = true;
+    _peerEndError = error;
+    _peerEndStackTrace = stackTrace;
+    _closeTimer?.cancel();
+    _byteStream?._socketClosed();
+    _failPendingOperations(
+      error ?? const NativeHttpClientException('Native WebSocket closed.'),
+      stackTrace,
+    );
+    _finishPeerEndIfDrained();
+  }
+
+  void _finishPeerEndIfDrained() {
+    if (!_peerEnded || _terminal || _flushing) return;
+    if (_deferredStreamNotifications.isNotEmpty && !_discardData) return;
+    _deferredStreamNotifications.clear();
+    final error = _peerEndError;
+    if (error != null && !_controller.isClosed) {
+      _controller.addError(error, _peerEndStackTrace);
+    }
+    _finish(error, _peerEndStackTrace);
+  }
+
+  void _failPendingOperations(Object failure, StackTrace? stackTrace) {
+    for (final completer in _pendingOperations.values) {
+      if (!completer.isCompleted) completer.completeError(failure, stackTrace);
+    }
+    _pendingOperations.clear();
+  }
+
   void _transportClosed() {
-    // The caller already closed this socket; ending its stream is expected.
+    // The caller already closed this socket, or the peer did; ending its
+    // stream is expected.
     if (_closing) return _finish();
+    if (_peerEnded) {
+      final error = _peerEndError;
+      if (error != null && !_controller.isClosed) {
+        _controller.addError(error, _peerEndStackTrace);
+      }
+      return _finish(error, _peerEndStackTrace);
+    }
     final error = const NativeHttpClientException('Native HTTP client closed.');
     final failedWhileConnecting = !_connected.isCompleted;
     if (failedWhileConnecting) {
@@ -738,11 +801,10 @@ final class NativeHttpWebSocket
     _closeTimer?.cancel();
     _byteStream?._socketClosed();
     _abortNative();
-    final failure = error ?? const NativeHttpClientException('Native WebSocket closed.');
-    for (final completer in _pendingOperations.values) {
-      if (!completer.isCompleted) completer.completeError(failure, stackTrace);
-    }
-    _pendingOperations.clear();
+    _failPendingOperations(
+      error ?? const NativeHttpClientException('Native WebSocket closed.'),
+      stackTrace,
+    );
     if (!_connected.isCompleted && error == null) _connected.complete();
     if (!_controller.isClosed) unawaited(_controller.close());
   }
@@ -841,7 +903,7 @@ abstract base class _NativeHttpWebSocketAdoptedStream {
   void _socketClosed() => _closed = true;
 
   void _ensureOpen() {
-    if (_closed || _socket._terminal || _socket._closing) {
+    if (_closed || _socket._outgoingClosed || _socket._closing) {
       throw StateError('Native WebSocket byte stream is closed.');
     }
   }

@@ -1332,7 +1332,7 @@ String _decodeSchemaValue(JsonSchema schema, String value, Map<String, String> s
     JsonNumberSchema _ => '$value as num',
     JsonBooleanSchema _ => '$value as bool',
     JsonArraySchema _ =>
-      '($value as List).map((item) => ${_decodeSchemaValue(schema.items ?? const JsonSchema.any(), 'item', schemaTypes)}).toList(growable: false)',
+      '($value as List).map((item) => ${_decodeArrayItemValue(schema.items ?? const JsonSchema.any(), schemaTypes)}).toList(growable: false)',
     JsonCompositeSchema(:final dartType) => _decodeClientCustomValue(dartType, value),
     JsonObjectSchema(:final id?) => _decodeClientModelValue(
       _schemaTypeFromId(id, schemaTypes),
@@ -1343,6 +1343,14 @@ String _decodeSchemaValue(JsonSchema schema, String value, Map<String, String> s
     JsonRawSchema _ => value,
     _ => value,
   };
+}
+
+String _decodeArrayItemValue(JsonSchema items, Map<String, String> schemaTypes) {
+  final decoded = _decodeSchemaValue(items, 'item', schemaTypes);
+  if (!items.nullable || decoded == 'item') {
+    return decoded;
+  }
+  return 'item == null ? null : $decoded';
 }
 
 String _decodeClientModelValue(String? type, String value) {
@@ -1425,7 +1433,7 @@ String _encodeClientStringValue(
 }) {
   if (dartType == null) {
     if (format == 'date-time') {
-      return nullable ? '$value?.toIso8601String()' : '$value.toIso8601String()';
+      return nullable ? '$value?.toUtc().toIso8601String()' : '$value.toUtc().toIso8601String()';
     }
     return value;
   }
@@ -1530,7 +1538,12 @@ String _encodeArrayValue(
   required bool nullable,
   required Map<String, String> schemaTypes,
 }) {
-  final encoded = _encodeSchemaValue(items, 'item', nullable: false, schemaTypes: schemaTypes);
+  final encoded = _encodeSchemaValue(
+    items,
+    'item',
+    nullable: items.nullable,
+    schemaTypes: schemaTypes,
+  );
   if (encoded == 'item') {
     return value;
   }

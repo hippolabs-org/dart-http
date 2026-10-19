@@ -7,6 +7,8 @@ import 'package:dart_http_core/dart_http_core.dart';
 import 'package:http/http.dart' as http;
 import 'package:web/web.dart' as web;
 
+import 'xhr_response_headers.dart';
+
 /// XHR upload events are measured after send(), unlike source stream reads.
 Future<DartHttpClientStreamedResponse>? sendWithUploadProgress(
   DartHttpClientRequest request, {
@@ -79,15 +81,7 @@ Future<DartHttpClientStreamedResponse> _send(
     }).toJS;
     xhr.onload = ((web.Event _) {
       if (!active || result.isCompleted) return;
-      final headers = <String, String>{};
-      for (final line in xhr.getAllResponseHeaders().split('\r\n')) {
-        final separator = line.indexOf(':');
-        if (separator > 0) {
-          headers[line.substring(0, separator).toLowerCase()] = line
-              .substring(separator + 1)
-              .trim();
-        }
-      }
+      final headers = parseXhrResponseHeaders(xhr.getAllResponseHeaders());
       final response = xhr.response;
       final bytes = response == null
           ? Uint8List(0)

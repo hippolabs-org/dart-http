@@ -6,11 +6,31 @@ import 'dart:typed_data';
 import 'package:dart_http_core/dart_http_core.dart';
 import 'package:dart_http_client/dart_http_client.dart';
 import 'package:dart_http_client/src/web_socket_message_converter.dart';
+import 'package:dart_http_client/src/xhr_response_headers.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:test/test.dart';
 
 void main() {
+  group('parseXhrResponseHeaders', () {
+    test('combines repeated headers instead of keeping the last value', () {
+      final headers = parseXhrResponseHeaders(
+        'Content-Type: text/plain\r\n'
+        'Vary: accept\r\n'
+        'vary: origin\r\n'
+        'Set-Cookie: a=1; Expires=Wed, 21 Oct 2026 07:28:00 GMT\r\n'
+        'set-cookie: b=2\r\n',
+      );
+
+      expect(headers['content-type'], 'text/plain');
+      expect(headers['vary'], 'accept, origin');
+      expect(headers['set-cookie']!.split('\n'), [
+        'a=1; Expires=Wed, 21 Oct 2026 07:28:00 GMT',
+        'b=2',
+      ]);
+    });
+  });
+
   group('DartHttpClientTransport', () {
     test('sends requests through package:http and applies interceptors', () async {
       final transport = DartHttpClientTransport(
