@@ -1,3 +1,7 @@
+## 0.1.1
+
+- Require `dart_http_server` 0.4.0.
+
 ## 0.1.0
 
 - Add generic Shelf handler mounting for Dart HTTP routers.

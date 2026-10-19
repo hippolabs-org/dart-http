@@ -1,6 +1,6 @@
 name: sse_helpers
 description: Bounded Server-Sent Events encoding and decoding helpers for Dart byte streams.
-version: 0.1.1
+version: 0.1.2
 homepage: https://hippolabs.org
 repository: https://github.com/hippolabs-org/dart-http/tree/main/packages/sse_helpers
 publish_to: "https://pub.hippolabs.org"
@@ -12,7 +12,7 @@ environment:
 dependencies:
   dart_http_core:
     hosted: "https://pub.hippolabs.org"
-    version: ^0.3.47
+    version: ^0.4.0
 
 dev_dependencies:
   hippo_analysis:

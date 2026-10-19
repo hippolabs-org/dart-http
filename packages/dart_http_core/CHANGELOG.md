@@ -1,5 +1,15 @@
-## Unreleased
+## 0.4.0
 
+- Add `RequestInput.queryAllMap` and `RequestInput.queryParamValues` to read
+  every value of a repeated query key in request order (like
+  `Uri.queryParametersAll`); `queryMap` keeps last-value semantics.
+- Streamed client response bodies now fail with an error instead of ending
+  silently when the transport aborts, times out or closes mid-body. Client
+  invocation timeouts use a cancellable timer, and a timeout during a streamed
+  body ends it with a `TimeoutException`.
+- `DartHttpClientResponseObject` and `DartHttpClientError` keep the raw bytes
+  and decode `rawBody` lazily on first access; JSON is decoded straight from
+  bytes. Constructors stay source compatible (`rawBody` is now optional).
 - Generated clients encode JSON request bodies with `JsonUtf8Encoder` straight
   to bytes. Behaviour change: such requests now carry `bodyBytes` instead of a
   `body` string, so transports and tests that read `request.body` must read

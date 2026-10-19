@@ -1,5 +1,9 @@
-## Unreleased
+## 0.3.0
 
+- Combine repeated response headers in the browser upload-progress transport
+  (", " for ordinary fields, "\n" for `set-cookie`) instead of keeping the
+  last value.
+- Require `dart_http_core` 0.4.0.
 - `sendBinary` on the single-connection WebSocket transport hands a
   `Uint8List` to the channel without copying it; do not modify it after
   sending. Other `List<int>` values are still copied.

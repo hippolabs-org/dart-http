@@ -1,5 +1,19 @@
-## Unreleased
+## 0.3.0
 
+- Combine repeated response headers (", " for ordinary fields, "\n" for
+  `set-cookie`) instead of keeping the last value.
+- Return a response the server sends before reading the whole streamed
+  request body (for example 413 or 401) instead of failing with "receiver
+  closed".
+- Streamed response bodies fail with `NativeHttpClientException` instead of a
+  silent EOF when an abort, invocation timeout or transport close interrupts
+  them.
+- Fix leaks: unlistened streamed bodies are finalized, request setup failures
+  release their port, strings and upload, and orphaned native results are
+  freed.
+- WebSocket: deliver close and error events immediately even while received
+  frames wait for a listener, and keep the socket usable when `close()` is
+  rejected because the send queue is full.
 - Copy Dart request bodies (bytes, any `List<int>`, JSON from generated
   clients, non-transferable leases) and WebSocket binary sends exactly once,
   into an uninitialized Rust allocation that Rust adopts without another copy
@@ -18,6 +32,8 @@
 - Add `NativeHttpOwnedBufferView.takeOwnedView()` to turn a `sendLeased` body
   (or any transferable Native Exchange lease) into a self-owning `Uint8List`
   without copying.
+- Require `dart_http_core` 0.4.0.
+- Require native ABI 19 and native artifacts 0.2.27.
 
 ## 0.2.27
 

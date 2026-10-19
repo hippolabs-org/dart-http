@@ -1,5 +1,9 @@
-## Unreleased
+## 0.4.0
 
+- **Breaking:** Require `dart_http_server_runtime` 0.4.0 (re-exported): native
+  ABI 27, removed native route handlers and SSE chunk FFI, repeated
+  header/query values, HEAD from GET routes and 405 for wrong methods, and
+  credit-windowed binary/SSE streams.
 - Move `json_schema` to dev dependencies; the library never imports it.
 
 ## 0.3.28

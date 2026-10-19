@@ -1,5 +1,27 @@
-## Unreleased
+## 0.4.0
 
+- Keep repeated request headers (joined with ", ", `Cookie` with "; ") and
+  decode header values outside visible ASCII as UTF-8 or ISO-8859-1 instead of
+  replacing them with an empty string. Query parameters reach Dart as ordered
+  pairs; add `TransportRequest.queryAll` and populate
+  `RequestInput.queryAllMap`.
+- Answer HEAD requests without their own route from the matching GET route
+  (body dropped, `Content-Length` kept), and answer a known path requested
+  with an unregistered method with 405 and an `Allow` header instead of 404.
+- Release the request context of accepted WebSocket and WebTransport
+  handshakes that never open (new `HandshakeAbandoned` transport event 16;
+  native ABI 25).
+- Harden server lifetime: WebTransport runs as its own task only for servers
+  with WebTransport routes and a bind failure no longer stops HTTP, graceful
+  shutdown keeps in-flight responses (10 s grace period), and the server is
+  registered before it accepts connections.
+- An invalid handler-supplied response header now yields 500 instead of an
+  empty 200, and handler `Content-Type`/`Content-Length` replace the runtime
+  defaults instead of duplicating them.
+- A client disconnect during an SSE response removes the pending request and
+  cancels the Dart event subscription (native ABI 24).
+- Enable only the axum features the runtime uses.
+- Use the shared `jsonSchemaRouteId` from `dart_http_core`.
 - Dart-produced binary stream and SSE bodies are credit windowed instead of
   stop-and-wait with one 64 KiB chunk in flight: up to
   `listen(streamWindowChunks: 16, streamWindowBytes: 1 MiB)` (configurable)
@@ -46,6 +68,8 @@
   Dart API DL, slice, status, string and owned-bytes helpers from the internal
   `dart_http_core` Rust crate, and fold its remaining byte/pair views into the
   runtime crate.
+- Require `dart_http_core` 0.4.0.
+- Require native ABI 27 and native artifacts 0.1.35.
 
 ## 0.3.55
 

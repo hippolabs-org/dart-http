@@ -1,6 +1,6 @@
 name: dart_http_server
 description: App-facing HTTP server package for the Dart HTTP monorepo.
-version: 0.3.28
+version: 0.4.0
 publish_to: "https://pub.hippolabs.org"
 repository: https://github.com/hippolabs-org/dart-http/tree/main/packages/dart_http_server
 
@@ -12,12 +12,12 @@ resolution: workspace
 dependencies:
   dart_http_server_runtime:
     hosted: "https://pub.hippolabs.org"
-    version: ^0.3.55
+    version: ^0.4.0
 
 dev_dependencies:
   dart_http_observability:
     hosted: "https://pub.hippolabs.org"
-    version: ^0.1.0
+    version: ^0.1.1
   json_schema:
     hosted: https://pub.hippolabs.org
     version: ^0.1.2

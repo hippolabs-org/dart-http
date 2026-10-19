@@ -31,11 +31,11 @@ annotations are imported from the app-facing server package.
 
 ```yaml
 dependencies:
-  dart_http_server: ^0.3.2
+  dart_http_server: ^0.4.0
 
 dev_dependencies:
-  build_runner: ^2.16.1
-  dart_http_server_codegen: ^0.3.3
+  build_runner: ^2.16.2
+  dart_http_server_codegen: ^0.5.0
 ```
 
 Define const schemas and type aliases:

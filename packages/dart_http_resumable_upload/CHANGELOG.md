@@ -1,3 +1,9 @@
+## 0.1.2
+
+- Report a server offset behind the confirmed checkpoint and one beyond the
+  upload length as separate errors instead of "exceeds upload length".
+- Require `dart_http_core` 0.4.0.
+
 ## 0.1.1
 
 - Recover interrupted transfers and completion results, distinguish transport progress from confirmed offsets, add the router extension and persistent filesystem upload store.

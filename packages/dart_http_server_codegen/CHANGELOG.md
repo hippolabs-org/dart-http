@@ -1,5 +1,13 @@
-## Unreleased
+## 0.5.0
 
+- **Breaking:** Require `dart_http_core` 0.4.0.
+- Fix generated client models for nullable array items: decode them with a
+  null check and encode them as nullable.
+- Behaviour change: encode date-time fields as UTC
+  (`toUtc().toIso8601String()`) in generated clients and `@FromHttpSchema`
+  models, so local `DateTime` values keep their instant.
+- Use the shared `jsonSchemaRouteId` from `dart_http_core`.
+- Require `analyzer` 14.5 and `source_gen` 4.3.
 - Stop generating client operations for native HTTP route mounts, which were
   removed from `dart_http_core`.
 
