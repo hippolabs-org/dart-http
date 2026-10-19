@@ -1,4 +1,6 @@
 import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
 import 'dart:isolate';
 
 import 'package:dart_http_core/dart_http_core.dart';
@@ -62,6 +64,49 @@ void main() {
     await expectLater(worker.request<int>('hello'), throwsA(isA<StateError>()));
   });
 
+  for (final target in ['worker', 'pool']) {
+    test('a $target spawn failure releases its ports so the process can exit', () async {
+      final process = await Process.start(Platform.resolvedExecutable, [
+        'run',
+        'test/fixtures/isolate_worker_spawn_failure.dart',
+        target,
+      ]);
+      final stdoutText = process.stdout.transform(utf8.decoder).join();
+      unawaited(process.stderr.drain<void>());
+
+      final exitCode = await process.exitCode.timeout(
+        const Duration(seconds: 60),
+        onTimeout: () {
+          process.kill(ProcessSignal.sigkill);
+          return -1;
+        },
+      );
+
+      expect(await stdoutText, contains('spawn failed: ArgumentError'));
+      expect(exitCode, 0, reason: 'open ports kept the failed spawn process alive');
+    });
+  }
+
+  test('fails the spawn when the worker dies before it is ready', () async {
+    await expectLater(
+      DartHttpIsolateWorker.spawnWithEntryPoint(
+        _dieOnStartup,
+        debugName: 'dying-worker',
+      ).timeout(const Duration(seconds: 10)),
+      throwsA(isA<RemoteError>()),
+    );
+  });
+
+  test('fails the spawn when the worker exits before it is ready', () async {
+    await expectLater(
+      DartHttpIsolateWorker.spawnWithEntryPoint(
+        _exitOnStartup,
+        debugName: 'exiting-worker',
+      ).timeout(const Duration(seconds: 10)),
+      throwsA(isA<StateError>()),
+    );
+  });
+
   test('worker pool handles concurrent requests', () async {
     final pool = await DartHttpIsolateWorkerPool.spawn(
       handler: _delayedEcho,
@@ -92,6 +137,10 @@ void main() {
 }
 
 int _echoLength(Object? request) => (request as String).length;
+
+void _dieOnStartup(Object? _) => throw StateError('startup failure');
+
+void _exitOnStartup(Object? _) => Isolate.exit();
 
 Never _throwRequest(Object? _) => throw StateError('worker failure');
 

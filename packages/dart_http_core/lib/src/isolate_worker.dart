@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'dart:isolate';
 
+import 'package:meta/meta.dart' show visibleForTesting;
+
 typedef DartHttpIsolateRequestHandler = FutureOr<Object?> Function(Object? request);
 
 /// Selection strategy used by [DartHttpIsolateWorkerPool].
@@ -17,28 +19,22 @@ final class DartHttpIsolateWorker {
     required this.debugName,
     required this.maxPendingRequests,
     required this.defaultTimeout,
-    required this._isolate,
-    required this._sendPort,
-    required ReceivePort receivePort,
-    required ReceivePort errorPort,
-    required ReceivePort exitPort,
-  }) : _receivePort = receivePort,
-       _errorPort = errorPort,
-       _exitPort = exitPort {
-    _subscription = receivePort.listen(_handleResponse);
-    _errorSubscription = errorPort.listen(_handleWorkerError);
-    _exitSubscription = exitPort.listen(_handleWorkerExit);
+  }) {
+    _subscription = _receivePort.listen(_handleResponse);
+    _errorSubscription = _errorPort.listen(_handleWorkerError);
+    _exitSubscription = _exitPort.listen(_handleWorkerExit);
   }
 
   final String debugName;
   final int? maxPendingRequests;
   final Duration? defaultTimeout;
 
-  final Isolate _isolate;
-  final SendPort _sendPort;
-  final ReceivePort _receivePort;
-  final ReceivePort _errorPort;
-  final ReceivePort _exitPort;
+  Isolate? _isolate;
+  late final SendPort _sendPort;
+  final _ready = Completer<void>();
+  final _receivePort = ReceivePort();
+  final _errorPort = ReceivePort();
+  final _exitPort = ReceivePort();
   late final StreamSubscription<Object?> _subscription;
   late final StreamSubscription<Object?> _errorSubscription;
   late final StreamSubscription<Object?> _exitSubscription;
@@ -54,6 +50,28 @@ final class DartHttpIsolateWorker {
     String debugName = 'DartHttpIsolateWorker',
     int? maxPendingRequests,
     Duration? defaultTimeout,
+  }) => _spawn(
+    _workerMain,
+    handler: handler,
+    debugName: debugName,
+    maxPendingRequests: maxPendingRequests,
+    defaultTimeout: defaultTimeout,
+  );
+
+  /// Spawns a worker whose isolate runs [entryPoint] instead of the worker
+  /// loop, so tests can exercise startup failures.
+  @visibleForTesting
+  static Future<DartHttpIsolateWorker> spawnWithEntryPoint(
+    void Function(Object? message) entryPoint, {
+    String debugName = 'DartHttpIsolateWorker',
+  }) => _spawn(entryPoint, handler: (_) => null, debugName: debugName);
+
+  static Future<DartHttpIsolateWorker> _spawn(
+    void Function(Object? message) entryPoint, {
+    required DartHttpIsolateRequestHandler handler,
+    required String debugName,
+    int? maxPendingRequests,
+    Duration? defaultTimeout,
   }) async {
     if (maxPendingRequests case final value? when value < 1) {
       throw ArgumentError.value(
@@ -63,35 +81,46 @@ final class DartHttpIsolateWorker {
       );
     }
 
-    final readyPort = ReceivePort();
-    final responsePort = ReceivePort();
-    final errorPort = ReceivePort();
-    final exitPort = ReceivePort();
-    final isolate = await Isolate.spawn(
-      _workerMain,
-      _WorkerStartMessage(
-        readyPort: readyPort.sendPort,
-        responsePort: responsePort.sendPort,
-        handler: handler,
-      ),
-      debugName: debugName,
-      errorsAreFatal: true,
-      onError: errorPort.sendPort,
-      onExit: exitPort.sendPort,
-    );
-    final sendPort = await readyPort.first as SendPort;
-    readyPort.close();
-
-    return DartHttpIsolateWorker._(
+    final worker = DartHttpIsolateWorker._(
       debugName: debugName,
       maxPendingRequests: maxPendingRequests,
       defaultTimeout: defaultTimeout,
-      isolate: isolate,
-      sendPort: sendPort,
-      receivePort: responsePort,
-      errorPort: errorPort,
-      exitPort: exitPort,
     );
+    // A startup failure can arrive before the spawn awaits readiness; keep it
+    // from surfacing as an unhandled error meanwhile.
+    worker._ready.future.ignore();
+    final readyPort = ReceivePort();
+    final readySubscription = readyPort.listen((message) {
+      if (worker._ready.isCompleted) return;
+      worker._sendPort = message! as SendPort;
+      worker._ready.complete();
+    });
+    try {
+      worker._isolate = await Isolate.spawn<Object?>(
+        entryPoint,
+        _WorkerStartMessage(
+          readyPort: readyPort.sendPort,
+          responsePort: worker._receivePort.sendPort,
+          handler: handler,
+        ),
+        debugName: debugName,
+        errorsAreFatal: true,
+        onError: worker._errorPort.sendPort,
+        onExit: worker._exitPort.sendPort,
+      );
+      // An error or exit before the ready message fails this future instead
+      // of leaving the spawn waiting forever.
+      await worker._ready.future;
+      return worker;
+    } catch (_) {
+      // Open ports keep the spawning isolate alive, so a failed spawn must
+      // release every one of them.
+      await worker._release();
+      rethrow;
+    } finally {
+      await readySubscription.cancel();
+      readyPort.close();
+    }
   }
 
   Future<T> request<T>(Object? request, {Duration? timeout}) async {
@@ -131,16 +160,20 @@ final class DartHttpIsolateWorker {
     if (_closed) {
       return;
     }
-    _closed = true;
     _sendPort.send(const _WorkerCloseMessage());
+    await _release();
+    _failPending(StateError('$debugName is closed.'));
+  }
+
+  Future<void> _release() async {
+    _closed = true;
     await _subscription.cancel();
     await _errorSubscription.cancel();
     await _exitSubscription.cancel();
     _receivePort.close();
     _errorPort.close();
     _exitPort.close();
-    _isolate.kill(priority: Isolate.immediate);
-    _failPending(StateError('$debugName is closed.'));
+    _isolate?.kill(priority: Isolate.immediate);
   }
 
   void _handleResponse(Object? message) {
@@ -162,12 +195,12 @@ final class DartHttpIsolateWorker {
   void _handleWorkerError(Object? message) {
     _failed = true;
     final values = message as List<Object?>;
-    _failPending(
-      RemoteError(
-        values.isEmpty ? '$debugName failed.' : values[0].toString(),
-        values.length < 2 ? '' : values[1].toString(),
-      ),
+    final error = RemoteError(
+      values.isEmpty ? '$debugName failed.' : values[0].toString(),
+      values.length < 2 ? '' : values[1].toString(),
     );
+    if (!_ready.isCompleted) _ready.completeError(error);
+    _failPending(error);
   }
 
   void _handleWorkerExit(Object? _) {
@@ -175,6 +208,9 @@ final class DartHttpIsolateWorker {
       return;
     }
     _failed = true;
+    if (!_ready.isCompleted) {
+      _ready.completeError(StateError('$debugName exited before it was ready.'));
+    }
     _failPending(StateError('$debugName exited.'));
   }
 
@@ -218,15 +254,21 @@ final class DartHttpIsolateWorkerPool {
       throw ArgumentError.value(size, 'size', 'size must be at least 1.');
     }
 
-    final workers = await Future.wait([
-      for (var index = 0; index < size; index++)
-        DartHttpIsolateWorker.spawn(
-          handler: handler,
-          debugName: '$debugName#$index',
-          maxPendingRequests: maxPendingRequestsPerWorker,
-          defaultTimeout: defaultTimeout,
-        ),
-    ]);
+    // When one worker fails to spawn, close every worker that did start,
+    // including those that finish spawning after the failure.
+    final workers = await Future.wait(
+      [
+        for (var index = 0; index < size; index++)
+          DartHttpIsolateWorker.spawn(
+            handler: handler,
+            debugName: '$debugName#$index',
+            maxPendingRequests: maxPendingRequestsPerWorker,
+            defaultTimeout: defaultTimeout,
+          ),
+      ],
+      eagerError: true,
+      cleanUp: (worker) => unawaited(worker.close()),
+    );
     return DartHttpIsolateWorkerPool._(
       workers,
       debugName: debugName,
@@ -315,7 +357,8 @@ final class _WorkerCloseMessage {
   const _WorkerCloseMessage();
 }
 
-void _workerMain(_WorkerStartMessage start) {
+void _workerMain(Object? message) {
+  final start = message! as _WorkerStartMessage;
   final commandPort = ReceivePort();
   start.readyPort.send(commandPort.sendPort);
   commandPort.listen((message) async {
