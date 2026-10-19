@@ -329,10 +329,13 @@ enum NativeRequestKind {
     WebTransport = 2,
 }
 
+/// Query parameters in request order. Repeated keys keep every value.
+type QueryPairs = Vec<(String, String)>;
+
 struct TransportRequest {
     route_id: String,
     path_params: HashMap<String, String>,
-    query: HashMap<String, String>,
+    query: QueryPairs,
     headers: HashMap<String, String>,
     body: Option<Vec<u8>>,
     body_stream: Option<ProducedIncomingBodyStream>,
@@ -842,7 +845,7 @@ struct WebSocketConnection {
     request_id: i64,
     route_id: String,
     path_params: HashMap<String, String>,
-    query: HashMap<String, String>,
+    query: QueryPairs,
     headers: HashMap<String, String>,
 }
 
@@ -871,7 +874,7 @@ struct WebTransportConnectionInfo {
     request_id: i64,
     route_id: String,
     path_params: HashMap<String, String>,
-    query: HashMap<String, String>,
+    query: QueryPairs,
     headers: HashMap<String, String>,
 }
 
@@ -1140,7 +1143,7 @@ struct ValidatedRouteRequest {
     route_match: NativeRouteMatch,
     method: String,
     path: String,
-    query: HashMap<String, String>,
+    query: QueryPairs,
     headers: HashMap<String, String>,
     body: Option<ValidatedBody>,
     runtime_state: ServerRuntimeState,
@@ -2556,7 +2559,7 @@ async fn validate_request_middleware(
         return error_response;
     }
     if let Err(error_response) = validate_string_map(
-        &query,
+        &query_map(&query),
         route_match.query_schema_id.as_deref(),
         "Query parameters",
         &runtime_state,
@@ -2742,7 +2745,7 @@ async fn handle_validated_request(mut request: Request<Body>) -> Response<Body> 
 
 async fn handle_http_request(
     route_match: NativeRouteMatch,
-    query: HashMap<String, String>,
+    query: QueryPairs,
     headers: HashMap<String, String>,
     body: ValidatedBody,
     body_stream: Option<Body>,
@@ -2965,7 +2968,7 @@ async fn handle_native_http_request(
     route_match: NativeRouteMatch,
     method: &str,
     path: &str,
-    query: HashMap<String, String>,
+    query: QueryPairs,
     headers: HashMap<String, String>,
     body: ValidatedBody,
 ) -> Response<Body> {
@@ -2997,7 +3000,7 @@ async fn handle_native_http_request(
         }
     };
     let path = CString::new(handler_path).unwrap_or_default();
-    let query_pairs = owned_pairs_from_map(query);
+    let query_pairs = owned_pairs_from_vec(query);
     let query_storage = native_pairs_from_owned(&query_pairs);
     let header_pairs = owned_pairs_from_map(headers);
     let header_storage = native_pairs_from_owned(&header_pairs);
@@ -3102,7 +3105,7 @@ fn native_handler_path(
 async fn handle_web_socket_request(
     mut parts: http::request::Parts,
     route_match: NativeRouteMatch,
-    query: HashMap<String, String>,
+    query: QueryPairs,
     headers: HashMap<String, String>,
     runtime_state: ServerRuntimeState,
 ) -> Response<Body> {
@@ -3178,7 +3181,7 @@ async fn handle_web_socket_session(
     request_id: i64,
     route_id: String,
     path_params: HashMap<String, String>,
-    query: HashMap<String, String>,
+    query: QueryPairs,
     headers: HashMap<String, String>,
     max_pending_messages: usize,
     max_pending_bytes: usize,
@@ -3392,7 +3395,7 @@ async fn handle_web_transport_incoming_session(
     )
     .is_err()
         || validate_string_map(
-            &query,
+            &query_map(&query),
             route_match.query_schema_id.as_deref(),
             "Query parameters",
             &runtime_state,
@@ -3471,7 +3474,7 @@ async fn handle_web_transport_session(
     request_id: i64,
     route_id: String,
     path_params: HashMap<String, String>,
-    query: HashMap<String, String>,
+    query: QueryPairs,
     headers: HashMap<String, String>,
     max_pending_messages: usize,
     max_pending_bytes: usize,
@@ -4756,7 +4759,7 @@ impl NativeTransportRequestHandle {
         let route_id = OwnedBytes::from_vec(request.route_id.into_bytes());
         let path_params = owned_pairs_from_map(request.path_params);
         let path_param_pairs = native_pairs_from_owned(&path_params);
-        let query = owned_pairs_from_map(request.query);
+        let query = owned_pairs_from_vec(request.query);
         let query_pairs = native_pairs_from_owned(&query);
         let headers = owned_pairs_from_map(request.headers);
         let header_pairs = native_pairs_from_owned(&headers);
@@ -4799,7 +4802,7 @@ impl NativeWebSocketConnectionHandle {
         let route_id = OwnedBytes::from_string(connection.route_id);
         let path_params = owned_pairs_from_map(connection.path_params);
         let path_param_pairs = native_pairs_from_owned(&path_params);
-        let query = owned_pairs_from_map(connection.query);
+        let query = owned_pairs_from_vec(connection.query);
         let query_pairs = native_pairs_from_owned(&query);
         let headers = owned_pairs_from_map(connection.headers);
         let header_pairs = native_pairs_from_owned(&headers);
@@ -4851,7 +4854,7 @@ impl NativeWebTransportConnectionHandle {
         let route_id = OwnedBytes::from_string(connection.route_id);
         let path_params = owned_pairs_from_map(connection.path_params);
         let path_param_pairs = native_pairs_from_owned(&path_params);
-        let query = owned_pairs_from_map(connection.query);
+        let query = owned_pairs_from_vec(connection.query);
         let query_pairs = native_pairs_from_owned(&query);
         let headers = owned_pairs_from_map(connection.headers);
         let header_pairs = native_pairs_from_owned(&headers);
@@ -5369,18 +5372,32 @@ fn content_type_essence(value: &str) -> &str {
     value.split(';').next().unwrap_or_default().trim()
 }
 
-fn parse_query(query: Option<&str>) -> HashMap<String, String> {
-    let mut result = HashMap::new();
+fn parse_query(query: Option<&str>) -> QueryPairs {
+    let mut result = Vec::new();
     if let Some(query) = query {
         for pair in query.split('&') {
             if pair.is_empty() {
                 continue;
             }
             let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-            result.insert(decode_query_component(key), decode_query_component(value));
+            result.push((decode_query_component(key), decode_query_component(value)));
         }
     }
     result
+}
+
+/// Single-valued query view used for schema validation; the last repeated
+/// value wins, matching the single-valued Dart query map.
+fn query_map(query: &[(String, String)]) -> HashMap<String, String> {
+    let mut result = HashMap::with_capacity(query.len());
+    for (key, value) in query {
+        result.insert(key.clone(), value.clone());
+    }
+    result
+}
+
+fn owned_pairs_from_vec(values: QueryPairs) -> Vec<OwnedPair> {
+    values.into_iter().map(OwnedPair::from).collect()
 }
 
 fn decode_query_component(value: &str) -> String {
@@ -5422,14 +5439,32 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
+/// Collects request headers into one value per name.
+///
+/// Repeated fields are joined as RFC 9110 allows (`, `), except `Cookie`,
+/// which RFC 6265 joins with `; `. Values that are not visible ASCII are kept:
+/// valid UTF-8 is decoded as such and anything else as ISO-8859-1.
 fn collect_headers(headers: &HeaderMap) -> HashMap<String, String> {
-    headers
-        .iter()
-        .map(|(name, value)| {
-            let value = value.to_str().unwrap_or_default().to_string();
-            (name.as_str().to_string(), value)
-        })
-        .collect()
+    let mut result = HashMap::with_capacity(headers.keys_len());
+    for name in headers.keys() {
+        let separator = if name == header::COOKIE { "; " } else { ", " };
+        let mut joined = String::new();
+        for (index, value) in headers.get_all(name).iter().enumerate() {
+            if index > 0 {
+                joined.push_str(separator);
+            }
+            push_header_value(&mut joined, value);
+        }
+        result.insert(name.as_str().to_string(), joined);
+    }
+    result
+}
+
+fn push_header_value(target: &mut String, value: &HeaderValue) {
+    match std::str::from_utf8(value.as_bytes()) {
+        Ok(text) => target.push_str(text),
+        Err(_) => target.extend(value.as_bytes().iter().map(|&byte| char::from(byte))),
+    }
 }
 
 fn boxed_ptr<T>(values: &[T]) -> *const T {
@@ -6312,9 +6347,9 @@ mod tests {
 
     #[test]
     fn parse_query_decodes_percent_encoded_components() {
-        let query = parse_query(Some(
+        let query = query_map(&parse_query(Some(
             "callbackURL=http%3A%2F%2F127.0.0.1%3A51663%2Fcallback&name=Ada+Lovelace",
-        ));
+        )));
 
         assert_eq!(
             query.get("callbackURL").map(String::as_str),
@@ -6325,9 +6360,45 @@ mod tests {
 
     #[test]
     fn parse_query_preserves_invalid_percent_escapes() {
-        let query = parse_query(Some("value=bad%zz%2"));
+        let query = query_map(&parse_query(Some("value=bad%zz%2")));
 
         assert_eq!(query.get("value").map(String::as_str), Some("bad%zz%2"));
+    }
+
+    #[test]
+    fn parse_query_keeps_every_repeated_value_in_order() {
+        let query = parse_query(Some("a=1&b=x&a=2"));
+
+        assert_eq!(
+            query,
+            vec![
+                ("a".to_string(), "1".to_string()),
+                ("b".to_string(), "x".to_string()),
+                ("a".to_string(), "2".to_string()),
+            ],
+        );
+        assert_eq!(query_map(&query).get("a").map(String::as_str), Some("2"));
+    }
+
+    #[test]
+    fn collect_headers_joins_repeated_fields_and_keeps_non_ascii_values() {
+        let mut headers = HeaderMap::new();
+        headers.append(header::COOKIE, HeaderValue::from_static("a=1"));
+        headers.append(header::COOKIE, HeaderValue::from_static("b=2"));
+        headers.append("x-forwarded-for", HeaderValue::from_static("10.0.0.1"));
+        headers.append("x-forwarded-for", HeaderValue::from_static("10.0.0.2"));
+        headers.append(
+            "x-utf8",
+            HeaderValue::from_bytes("J\u{fc}rgen".as_bytes()).unwrap(),
+        );
+        headers.append("x-latin1", HeaderValue::from_bytes(b"J\xfcrgen").unwrap());
+
+        let collected = collect_headers(&headers);
+
+        assert_eq!(collected["cookie"], "a=1; b=2");
+        assert_eq!(collected["x-forwarded-for"], "10.0.0.1, 10.0.0.2");
+        assert_eq!(collected["x-utf8"], "J\u{fc}rgen");
+        assert_eq!(collected["x-latin1"], "J\u{fc}rgen");
     }
 
     #[tokio::test]

@@ -29,7 +29,12 @@ DecodedNativeTransportRequest decodeNativeTransportRequest(
   final request = requestPtr.ref;
   final routeId = _decodeUtf8(request.route_id);
   final pathParams = _decodePairs(request.path_params, request.path_param_count);
-  final query = _decodePairs(request.query, request.query_count);
+  final queryPairs = core_ffi.copyNativePairs(request.query, request.query_count);
+  final query = {for (final pair in queryPairs) pair.key: pair.value};
+  final queryAll = <String, List<String>>{};
+  for (final pair in queryPairs) {
+    (queryAll[pair.key] ??= <String>[]).add(pair.value);
+  }
   final headers = _decodePairs(request.headers, request.header_count);
   final nativeBodyData = _nativeBodyData(request.body);
   final nativeBody = nativeBodyData?.body;
@@ -40,6 +45,7 @@ DecodedNativeTransportRequest decodeNativeTransportRequest(
       routeId: routeId,
       pathParams: pathParams,
       query: query,
+      queryAll: queryAll,
       headers: headers,
       nativeBody: nativeBody,
       requestKind: switch (request.request_kind) {

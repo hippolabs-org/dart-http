@@ -18,6 +18,7 @@ final class TransportRequest {
     required this.pathParams,
     required this.query,
     required this.headers,
+    this._queryAll,
     this.requestKind = TransportRequestKind.http,
     this._bodyBytes,
     this.nativeBody,
@@ -31,7 +32,18 @@ final class TransportRequest {
   final Map<String, String> pathParams;
 
   /// Raw query parameters.
+  ///
+  /// A repeated key maps to its last value; [queryAll] keeps every value.
   final Map<String, String> query;
+
+  final Map<String, List<String>>? _queryAll;
+
+  /// Raw query parameters with every value of a repeated key in request order.
+  Map<String, List<String>> get queryAll =>
+      _queryAll ??
+      {
+        for (final entry in query.entries) entry.key: <String>[entry.value],
+      };
 
   /// Raw request headers.
   final Map<String, String> headers;

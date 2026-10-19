@@ -140,6 +140,7 @@ Future<RequestInput> _decodeRequestInput(
     body: bodyValue,
     paramsMap: request.pathParams,
     queryMap: request.query,
+    queryAllMap: request.queryAll,
     headersMap: request.headers,
     multipartLoader: nativeRequest?.multipart,
     nativeBody: nativeRequest?.bodyStream ?? nativeRequest?.body,

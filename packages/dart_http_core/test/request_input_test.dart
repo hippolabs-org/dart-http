@@ -49,6 +49,29 @@ void main() {
     expect(input.headersMap, {'accept': 'application/json'});
   });
 
+  test('exposes every value of a repeated query parameter', () {
+    final input = RequestInput(
+      queryMap: const {'a': '2', 'b': 'x'},
+      queryAllMap: const {
+        'a': ['1', '2'],
+        'b': ['x'],
+      },
+    );
+
+    expect(input.queryParam('a'), '2');
+    expect(input.queryParamValues('a'), ['1', '2']);
+    expect(input.queryParamValues('missing'), isEmpty);
+  });
+
+  test('derives single-value query lists when no multi-value map is given', () {
+    final input = RequestInput(queryMap: const {'a': '1'});
+
+    expect(input.queryAllMap, {
+      'a': ['1'],
+    });
+    expect(RequestInput.empty.queryParamValues('a'), isEmpty);
+  });
+
   test('carries an opaque native body slot for runtime extensions', () {
     final input = RequestInput(nativeBody: const NativeBodyToken('body-1'));
 

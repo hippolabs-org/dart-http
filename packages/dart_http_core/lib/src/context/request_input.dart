@@ -10,9 +10,14 @@ final class RequestInput {
     Map<String, String>? headersMap,
     Future<Object?> Function()? multipartLoader,
     Object? nativeBody,
+    Map<String, List<String>>? queryAllMap,
   }) {
     final normalizedParamsMap = _normalizedStringMap(paramsMap, params);
     final normalizedQueryMap = _normalizedStringMap(queryMap, query);
+    final normalizedQueryAllMap = Map<String, List<String>>.unmodifiable({
+      for (final entry in (queryAllMap ?? _singleValueMap(normalizedQueryMap)).entries)
+        entry.key: List<String>.unmodifiable(entry.value),
+    });
     final normalizedHeadersMap = _normalizedStringMap(headersMap, headers);
 
     return RequestInput._(
@@ -22,6 +27,7 @@ final class RequestInput {
       bodyValue: body,
       paramsMap: normalizedParamsMap,
       queryMap: normalizedQueryMap,
+      queryAllMap: normalizedQueryAllMap,
       headersMap: normalizedHeadersMap,
       multipartLoader: multipartLoader,
       nativeBody: nativeBody,
@@ -35,6 +41,7 @@ final class RequestInput {
     this._bodyValue,
     this.paramsMap = const <String, String>{},
     this.queryMap = const <String, String>{},
+    this.queryAllMap = const <String, List<String>>{},
     this.headersMap = const <String, String>{},
     this._multipartLoader,
     this._nativeBody,
@@ -53,7 +60,14 @@ final class RequestInput {
   final Map<String, String> paramsMap;
 
   /// Raw query parameters as strings.
+  ///
+  /// A key repeated in the query string maps to its last value; use
+  /// [queryAllMap] or [queryParamValues] to read every value.
   final Map<String, String> queryMap;
+
+  /// Raw query parameters with every value of a repeated key, in request
+  /// order, like [Uri.queryParametersAll].
+  final Map<String, List<String>> queryAllMap;
 
   /// Raw request headers as strings.
   final Map<String, String> headersMap;
@@ -63,6 +77,10 @@ final class RequestInput {
 
   /// Returns one query parameter by [name], if present.
   String? queryParam(String name) => queryMap[name];
+
+  /// Returns every value of the query parameter [name] in request order, or an
+  /// empty list when it is absent.
+  List<String> queryParamValues(String name) => queryAllMap[name] ?? const <String>[];
 
   /// Returns one header by [name], if present.
   ///
@@ -157,4 +175,8 @@ final class RequestInput {
     }
     return const <String, String>{};
   }
+
+  static Map<String, List<String>> _singleValueMap(Map<String, String> values) => {
+    for (final entry in values.entries) entry.key: <String>[entry.value],
+  };
 }
