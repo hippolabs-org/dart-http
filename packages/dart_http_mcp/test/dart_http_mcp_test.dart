@@ -69,6 +69,41 @@ void main() {
     expect(await response.drain<List<int>>(<int>[]), isEmpty);
   });
 
+  test('answers a handler failure before the response starts with a 500 JSON-RPC error', () async {
+    final errors = <Object>[];
+    final app = DartHttp<void>(services: () {});
+    app.mountMcp(
+      '/mcp',
+      serverFactory: (_) => _UnencodableResultMcpServer.new,
+      allowedOrigins: const <String>{},
+      onError: (error, _) => errors.add(error),
+    );
+    final failingServer = await app.listen(host: '127.0.0.1', port: 0);
+    addTearDown(failingServer.close);
+
+    // The tool result cannot be JSON encoded, so the MCP transport throws
+    // while writing the answer, before any byte of the response exists.
+    final response = await _postMcp(
+      client,
+      failingServer,
+      method: 'tools/call',
+      name: 'unencodable',
+      params: <String, Object?>{
+        'name': 'unencodable',
+        'arguments': <String, Object?>{},
+        '_meta': _clientMeta,
+      },
+    );
+
+    expect(response.statusCode, HttpStatus.internalServerError);
+    expect(response.headers.contentType?.mimeType, ContentType.json.mimeType);
+    final body = jsonDecode(await utf8.decoder.bind(response).join()) as Map<String, Object?>;
+    expect(body['jsonrpc'], '2.0');
+    expect(body['id'], 1);
+    expect((body['error']! as Map<String, Object?>)['code'], -32603);
+    expect(errors.single, isA<JsonUnsupportedObjectError>());
+  });
+
   test('answers non-POST methods with 405', () async {
     final request = await client.getUrl(_endpoint(server));
     final response = await request.close();
@@ -146,6 +181,22 @@ base class _TestMcpServer extends MCPServer with ToolsSupport {
     }
     return CallToolResult(
       content: <Content>[TextContent(text: 'Hello, ${request.arguments!['name']}!')],
+    );
+  }
+}
+
+/// Answers its one tool with a result the transport cannot JSON encode.
+base class _UnencodableResultMcpServer extends MCPServer with ToolsSupport {
+  _UnencodableResultMcpServer(super.channel)
+    : super.fromStreamChannel(
+        implementation: Implementation(name: 'dart_http_mcp_test', version: '0.1.0'),
+      ) {
+    registerTool(
+      Tool(name: 'unencodable', inputSchema: Schema.object()),
+      (_) => CallToolResult(
+        content: const <Content>[],
+        structuredContent: <String, Object?>{'value': Object()},
+      ),
     );
   }
 }

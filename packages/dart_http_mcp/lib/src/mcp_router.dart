@@ -101,7 +101,7 @@ Future<Object> _handleMcpRequest<TServices>(
     keepAliveInterval: keepAliveInterval,
     maxRequestBodyBytes: maxRequestBodyBytes,
   );
-  response.track(handling, onError: onError);
+  response.track(handling, onError: onError, requestId: _jsonRpcRequestId(body));
 
   final result = await response.ready;
   return switch (result) {
@@ -119,6 +119,23 @@ Future<Object> _handleMcpRequest<TServices>(
       onDispose: response.disconnect,
     ),
   };
+}
+
+/// JSON-RPC 2.0 code for an internal error.
+const _jsonRpcInternalError = -32603;
+
+/// Reads the JSON-RPC request id from [body], or `null` when there is none.
+Object? _jsonRpcRequestId(Uint8List body) {
+  try {
+    final decoded = jsonDecode(utf8.decode(body));
+    if (decoded is Map<String, Object?>) {
+      final id = decoded['id'];
+      if (id is String || id is int) return id;
+    }
+  } on FormatException {
+    // Malformed requests have no id to answer with.
+  }
+  return null;
 }
 
 Uint8List _fallbackBody(Object? body) => switch (body) {
@@ -222,16 +239,43 @@ final class _DartHttpBackedResponse implements HttpResponse {
   @override
   Future<void> get done => _done.future;
 
-  void track(Future<void> handling, {DartHttpMcpErrorHandler? onError}) {
+  /// Completes the response when [handling] fails without having closed it.
+  ///
+  /// Before the response has started, the failure is answered with `500` and
+  /// a JSON-RPC internal error for [requestId], instead of an empty `200`.
+  /// Once a stream has started its status is sent, so the stream ends with
+  /// the error.
+  void track(Future<void> handling, {DartHttpMcpErrorHandler? onError, Object? requestId}) {
     unawaited(
       handling.catchError((Object error, StackTrace stackTrace) async {
         onError?.call(error, stackTrace);
-        if (!_closed) {
+        if (_closed) return;
+        if (!_streaming) {
+          _failBeforeStart(requestId);
+        } else {
           _stream.addError(error, stackTrace);
-          await close();
         }
+        await close();
       }),
     );
+  }
+
+  void _failBeforeStart(Object? requestId) {
+    statusCode = HttpStatus.internalServerError;
+    _headers
+      ..clear()
+      ..contentType = ContentType.json;
+    _body
+      ..clear()
+      ..add(
+        utf8.encode(
+          jsonEncode(<String, Object?>{
+            'jsonrpc': '2.0',
+            'id': requestId,
+            'error': <String, Object?>{'code': _jsonRpcInternalError, 'message': 'Internal error'},
+          }),
+        ),
+      );
   }
 
   @override
@@ -356,6 +400,9 @@ final class _MemoryHttpHeaders implements HttpHeaders {
   void removeAll(String name) {
     _values.remove(name.toLowerCase());
   }
+
+  @override
+  void clear() => _values.clear();
 
   @override
   void forEach(void Function(String name, List<String> values) action) {
