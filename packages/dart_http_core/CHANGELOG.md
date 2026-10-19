@@ -1,3 +1,9 @@
+## Unreleased
+
+- **Breaking:** Remove the unused `DartHttpIsolateWorker`,
+  `DartHttpIsolateWorkerPool`, and `DartHttpIsolateWorkerPoolStrategy` APIs,
+  and drop the `meta` dependency they required.
+
 ## 0.3.64
 
 - Add transport upload measurements and preserve multipart progress without treating source reads as transmitted bytes.

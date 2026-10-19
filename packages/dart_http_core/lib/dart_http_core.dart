@@ -12,7 +12,6 @@ export 'src/client/dart_http_client_transport.dart';
 export 'src/client/dart_http_client.dart';
 export 'src/context.dart';
 export 'src/http.dart';
-export 'src/isolate_worker.dart';
 export 'src/router.dart';
 export 'src/web_socket.dart';
 export 'src/web_transport.dart';
