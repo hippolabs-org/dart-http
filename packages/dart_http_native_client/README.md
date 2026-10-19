@@ -51,8 +51,11 @@ await for (final lease in response.bodyStream) {
 a generic Native Exchange byte-stream descriptor to another native consumer.
 
 Use `sendLeased` for a buffered native-owned body. The lease must be closed or
-transferred. Ordinary `send` wraps the same lease and creates Dart bytes only
-when `bodyBytes` is requested:
+transferred. Ordinary `send` wraps the same lease: Rust collects the body into
+one allocation sized from `Content-Length`, and `bodyBytes` is a zero-copy view
+of it that owns the allocation (through a native finalizer) and stays valid
+after `close()`. `copyBodyBytes()` makes an explicit Dart-heap copy, and
+`lease.takeOwnedView()` does the same zero-copy conversion for a leased body:
 
 ```dart
 final response = await transport.sendLeased(request);

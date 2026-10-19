@@ -233,10 +233,13 @@ for a larger application example that uses this runtime surface.
 native package directly into the Rust HTTP runtime. The runtime pulls one chunk
 at a time on its blocking worker pool, propagates disconnect cancellation, and
 never copies body chunks through Dart-managed memory. Use
-`BinaryStreamResponse` when the producer is a normal Dart stream. Its chunk
-acknowledgements are asynchronous: waiting for a slow client yields to other
-Dart request handlers. Large producer chunks are split into at most 64 KiB
-pieces, with one pending acknowledgement per response.
+`BinaryStreamResponse` when the producer is a normal Dart stream. Each chunk is
+copied into native memory once and the producer keeps running while a credit
+window has room: `app.listen(streamWindowChunks: 16, streamWindowBytes:
+1024 * 1024)` bounds how much may be queued ahead of the client. A full window
+waits (yielding to other Dart handlers) until the client drained half of it.
+Large producer chunks are split into at most 256 KiB pieces. SSE responses use
+the same window.
 
 `app.listen(nativeStreamWorkers: 64, streamStallTimeout: Duration(minutes: 1))`
 sets the native reader limit and the maximum time without source or transport
