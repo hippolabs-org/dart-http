@@ -88,7 +88,7 @@ pub unsafe fn read_native_string(value: NativeBytes) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::OwnedBytes;
+    use crate::native_values::OwnedBytes;
 
     #[test]
     fn owned_bytes_exposes_native_view() {

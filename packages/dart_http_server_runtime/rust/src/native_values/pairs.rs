@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
-use crate::bytes::{NativeBytes, read_native_string};
-use crate::owned::OwnedBytes;
+use super::bytes::{NativeBytes, read_native_string};
+use super::owned::OwnedBytes;
 
 /// Borrowed UTF-8 key/value pair represented as byte views.
 #[repr(C)]
@@ -27,16 +27,6 @@ impl OwnedPair {
             key: OwnedBytes::from_string(key),
             value: OwnedBytes::from_string(value),
         }
-    }
-
-    /// Returns the key bytes.
-    pub fn key(&self) -> &OwnedBytes {
-        &self.key
-    }
-
-    /// Returns the value bytes.
-    pub fn value(&self) -> &OwnedBytes {
-        &self.value
     }
 
     /// Returns a borrowed FFI view of this pair.

@@ -5,7 +5,15 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include <dart_http_core_ffi.h>
+typedef struct NativeBytes {
+  const uint8_t* ptr;
+  intptr_t len;
+} NativeBytes;
+
+typedef struct NativePair {
+  NativeBytes key;
+  NativeBytes value;
+} NativePair;
 
 typedef void (*dart_http_server_runtime_transport_event_callback_t)(
     int32_t event_kind,

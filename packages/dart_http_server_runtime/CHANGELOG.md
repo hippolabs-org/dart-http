@@ -8,7 +8,8 @@
   the internal `dart_http_server_core` Rust crate). Native ABI 26.
 - Remove the unused `copyNativeOwnedBytes` helper and the dead job-pool,
   Dart API DL, slice, status, string and owned-bytes helpers from the internal
-  `dart_http_core` Rust crate.
+  `dart_http_core` Rust crate, and fold its remaining byte/pair views into the
+  runtime crate.
 
 ## 0.3.55
 

@@ -6,6 +6,8 @@
 // Axum responses are returned directly to keep the request path allocation-free.
 #![allow(clippy::result_large_err)]
 
+mod native_values;
+
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString, c_char};
 use std::net::{IpAddr, SocketAddr};
@@ -23,10 +25,6 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Response, StatusCod
 use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
 use axum::routing::any;
-use dart_http_core::{
-    NativeBytes, NativePair, OwnedBytes, OwnedPair, boxed_pairs_ptr, native_pairs_from_owned,
-    owned_pairs_from_map, read_native_bytes, read_pairs_vec,
-};
 use futures_util::{SinkExt, StreamExt};
 use native_exchange_rust::abi::{
     NEX_ABI_VERSION, NEX_CAPABILITY_CONCURRENT_CANCEL, NEX_CAPABILITY_THREAD_SAFE,
@@ -34,6 +32,10 @@ use native_exchange_rust::abi::{
     NexUtf8View,
 };
 use native_exchange_rust::{AdoptedByteStream, ProducedBuffer, StreamCancelHandle, StreamRead};
+use native_values::{
+    NativeBytes, NativePair, OwnedBytes, OwnedPair, boxed_pairs_ptr, native_pairs_from_owned,
+    owned_pairs_from_map, read_native_bytes, read_pairs_vec,
+};
 use once_cell::sync::Lazy;
 use serde::Deserialize;
 use serde_json::Value;

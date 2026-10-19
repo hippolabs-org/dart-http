@@ -1,4 +1,4 @@
-use crate::bytes::NativeBytes;
+use super::bytes::NativeBytes;
 
 /// Rust-owned bytes that can expose a stable [`NativeBytes`] view.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -17,21 +17,6 @@ impl OwnedBytes {
     /// Creates owned bytes from a UTF-8 string.
     pub fn from_string(value: String) -> Self {
         Self::from_vec(value.into_bytes())
-    }
-
-    /// Returns the byte length.
-    pub fn len(&self) -> usize {
-        self.bytes.len()
-    }
-
-    /// Returns `true` if there are no bytes.
-    pub fn is_empty(&self) -> bool {
-        self.bytes.is_empty()
-    }
-
-    /// Returns the owned bytes as a Rust slice.
-    pub fn as_slice(&self) -> &[u8] {
-        &self.bytes
     }
 
     /// Returns a borrowed FFI view of this allocation.
