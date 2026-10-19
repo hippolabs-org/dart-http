@@ -3,6 +3,8 @@
 - **Breaking:** Remove the unused `DartHttpIsolateWorker`,
   `DartHttpIsolateWorkerPool`, and `DartHttpIsolateWorkerPoolStrategy` APIs,
   and drop the `meta` dependency they required.
+- Export `jsonSchemaRouteId`, previously duplicated in the server runtime and
+  codegen packages.
 
 ## 0.3.64
 

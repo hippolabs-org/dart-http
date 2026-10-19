@@ -4,6 +4,7 @@ export 'router/guard.dart';
 export 'router/handler_http_route_definition.dart';
 export 'router/http_route_definition.dart';
 export 'router/http_route_mount.dart';
+export 'router/json_schema_route_id.dart';
 export 'router/native_http_route_descriptor.dart';
 export 'router/native_http_route_mount.dart';
 export 'router/route_exposure.dart';

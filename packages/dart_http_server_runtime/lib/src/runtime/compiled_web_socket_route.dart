@@ -1,7 +1,6 @@
 import 'package:dart_http_core/dart_http_core.dart';
 
 import 'compiled_route.dart';
-import 'json_schema_route_id.dart';
 
 final class CompiledWebSocketRoute<TServices> {
   const CompiledWebSocketRoute({

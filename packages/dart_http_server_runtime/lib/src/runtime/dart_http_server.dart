@@ -18,7 +18,6 @@ import 'compiled_route.dart';
 import 'compiled_route_table.dart';
 import 'dart_http_codec.dart';
 import 'dart_http_server_instance.dart';
-import 'json_schema_route_id.dart';
 import 'native_binary_stream_response.dart';
 import 'open_api_document.dart';
 import 'request_decoder.dart';

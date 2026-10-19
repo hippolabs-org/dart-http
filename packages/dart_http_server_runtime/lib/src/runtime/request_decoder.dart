@@ -8,7 +8,6 @@ import 'dart:typed_data';
 import 'package:dart_http_core/dart_http_core.dart';
 
 import 'dart_http_codec.dart';
-import 'json_schema_route_id.dart';
 import 'native_request.dart';
 import 'transport_request.dart';
 

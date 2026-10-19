@@ -1,9 +1,10 @@
 import 'package:json_schema/json_schema.dart';
 
-/// Returns the generated route schema target only for explicit `$ref`s.
+/// Returns the route-level schema target only for explicit JSON Schema `$ref`s.
 ///
-/// A schema `$id` identifies an inline schema but does not mean generated
-/// clients should treat it as a referenced serializer/codec target.
+/// A schema `$id` identifies that schema but does not request lookup or
+/// decoding through a registry entry, and generated clients do not treat it as
+/// a referenced serializer/codec target.
 String? jsonSchemaRouteId(JsonSchema? schema) {
   return switch (schema) {
     null => null,

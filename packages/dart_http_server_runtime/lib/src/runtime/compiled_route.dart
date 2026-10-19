@@ -1,7 +1,5 @@
 import 'package:dart_http_core/dart_http_core.dart';
 
-import 'json_schema_route_id.dart';
-
 abstract interface class CompiledOpenApiRoute {
   HttpMethod get method;
   RouteOptions get options;

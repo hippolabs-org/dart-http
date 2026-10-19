@@ -6,8 +6,6 @@ import 'package:dart_http_core/dart_http_core.dart';
 import 'package:dart_style/dart_style.dart';
 import 'package:json_schema/json_schema.dart';
 
-import '../json_schema_route_id.dart';
-
 /// Build-time description of one generated client library.
 final class DartHttpClientLibrarySpec {
   const DartHttpClientLibrarySpec({

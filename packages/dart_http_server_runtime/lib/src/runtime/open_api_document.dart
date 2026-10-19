@@ -2,7 +2,6 @@ import 'package:dart_http_core/dart_http_core.dart';
 import 'package:json_schema/json_schema.dart';
 
 import 'compiled_route.dart';
-import 'json_schema_route_id.dart';
 
 /// Application-level OpenAPI metadata and document generation.
 final class OpenApiDocument {
