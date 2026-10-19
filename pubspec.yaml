@@ -8,7 +8,6 @@ environment:
 dev_dependencies:
   dart_http_client: any
   dart_http_core: any
-  dart_http_mcp: any
   dart_http_native_client: any
   hippo_analysis:
     hosted: https://pub.hippolabs.org
