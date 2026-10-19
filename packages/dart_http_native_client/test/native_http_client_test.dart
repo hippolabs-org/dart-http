@@ -657,6 +657,106 @@ void main() {
     await subscription.cancel().timeout(const Duration(seconds: 1));
   });
 
+  group('an early-ended streamed response body', () {
+    late Completer<void> keepOpen;
+
+    setUp(() {
+      keepOpen = Completer<void>();
+      addTearDown(() {
+        if (!keepOpen.isCompleted) keepOpen.complete();
+      });
+      server.listen((request) async {
+        request.response.bufferOutput = false;
+        request.response.write('first-');
+        await request.response.flush();
+        await keepOpen.future;
+        request.response.write('rest');
+        await request.response.close();
+      });
+    });
+
+    Uri slowUri() => Uri.parse('http://${server.address.host}:${server.port}/slow-body');
+
+    test('errors when the abort trigger fires mid-body', () async {
+      final abort = Completer<void>();
+      final response = await transport.sendStream(
+        DartHttpClientRequest(method: HttpMethod.get, uri: slowUri(), abortTrigger: abort.future),
+      );
+      final chunks = <List<int>>[];
+      final done = response.bodyStream.forEach((chunk) {
+        chunks.add(chunk);
+        if (!abort.isCompleted) abort.complete();
+      });
+
+      await expectLater(
+        done.timeout(const Duration(seconds: 5)),
+        throwsA(isA<NativeHttpClientException>()),
+      );
+      expect(utf8.decode(chunks.expand((chunk) => chunk).toList()), 'first-');
+    });
+
+    test('errors when the transport closes mid-body', () async {
+      final response = await transport.sendLeasedStream(
+        DartHttpClientRequest(method: HttpMethod.get, uri: slowUri()),
+      );
+      final done = response.bodyStream.forEach((lease) {
+        lease.close();
+        transport.close();
+      });
+
+      await expectLater(
+        done.timeout(const Duration(seconds: 5)),
+        throwsA(isA<NativeHttpClientException>()),
+      );
+    });
+
+    test('invokeStream surfaces a timeout instead of a truncated body', () async {
+      final client = _StreamingClient(
+        Uri.parse('http://${server.address.host}:${server.port}'),
+        transport,
+      );
+      final response = await client.invokeStream(
+        const DartHttpClientInvocation<Object?, Object?, Object?, Object?, Object?>(
+          method: HttpMethod.get,
+          pathTemplate: '/slow-body',
+          timeout: Duration(milliseconds: 300),
+          success: DartHttpClientResponseSpec<Object?>(
+            status: 200,
+            contentType: 'application/octet-stream',
+          ),
+        ),
+      );
+
+      await expectLater(
+        response.requireBodyStream.drain<void>().timeout(const Duration(seconds: 5)),
+        throwsA(isA<TimeoutException>()),
+      );
+    });
+
+    test('invokeStream does not abort a completed body after the timeout', () async {
+      keepOpen.complete();
+      final client = _StreamingClient(
+        Uri.parse('http://${server.address.host}:${server.port}'),
+        transport,
+      );
+      final response = await client.invokeStream(
+        const DartHttpClientInvocation<Object?, Object?, Object?, Object?, Object?>(
+          method: HttpMethod.get,
+          pathTemplate: '/slow-body',
+          timeout: Duration(milliseconds: 200),
+          success: DartHttpClientResponseSpec<Object?>(
+            status: 200,
+            contentType: 'application/octet-stream',
+          ),
+        ),
+      );
+      final body = await utf8.decoder.bind(response.requireBodyStream).join();
+      await Future<void>.delayed(const Duration(milliseconds: 400));
+
+      expect(body, 'first-rest');
+    });
+  });
+
   test('cancels an in-flight Tokio request', () async {
     final requestStarted = Completer<void>();
     server.listen((request) async {
@@ -1448,4 +1548,9 @@ final class _SilencingProxy {
     }
     await _server.close();
   }
+}
+
+final class _StreamingClient extends DartHttpClientBase {
+  _StreamingClient(Uri baseUri, NativeHttpClientTransport transport)
+    : super(baseUri: baseUri, transport: transport);
 }

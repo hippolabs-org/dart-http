@@ -28,10 +28,24 @@ abstract base class DartHttpClientBase {
     THeaders,
     TBody
   >(DartHttpClientInvocation<TResponse, TParams, TQuery, THeaders, TBody> invocation) async {
-    final abortTrigger = _combinedAbortTrigger(
+    final deadline = _InvocationAbort(
       abortTrigger: invocation.abortTrigger,
       timeout: invocation.timeout,
     );
+    try {
+      return await _invokeBuffered(invocation, deadline.trigger);
+    } finally {
+      // The response is fully buffered: a later timeout must neither fire nor
+      // keep the request and its body buffers reachable.
+      deadline.dispose();
+    }
+  }
+
+  Future<DartHttpClientResponseObject<TResponse>>
+  _invokeBuffered<TResponse, TParams, TQuery, THeaders, TBody>(
+    DartHttpClientInvocation<TResponse, TParams, TQuery, THeaders, TBody> invocation,
+    Future<void>? abortTrigger,
+  ) async {
     final encodedBody = await _encodeRequestBody(body: invocation.body);
     final request = DartHttpClientRequest(
       method: invocation.method,
@@ -64,7 +78,6 @@ abstract base class DartHttpClientBase {
         status: response.status,
         contentType: response.contentType,
         headers: response.headers,
-        rawBody: response.body,
         rawBodyBytes: response.bodyBytes,
         data: _decodeResponse<TResponse>(response, success: invocation.success),
       );
@@ -77,7 +90,6 @@ abstract base class DartHttpClientBase {
       status: response.status,
       contentType: response.contentType,
       headers: response.headers,
-      rawBody: response.body,
       rawBodyBytes: response.bodyBytes,
       error: DartHttpClientError(
         status: response.status,
@@ -87,7 +99,6 @@ abstract base class DartHttpClientBase {
             : DartHttpClientErrorKind.documented,
         contentType: response.contentType,
         headers: response.headers,
-        rawBody: response.body,
         rawBodyBytes: response.bodyBytes,
         body: _decodeErrorBody(response),
       ),
@@ -97,21 +108,37 @@ abstract base class DartHttpClientBase {
   Future<DartHttpClientStreamedResponseObject> invokeStream<TParams, TQuery, THeaders, TBody>(
     DartHttpClientInvocation<Object?, TParams, TQuery, THeaders, TBody> invocation,
   ) async {
-    final request = await _buildClientRequest(
-      invocation,
-      responseMode: invocation.success.responseMode,
+    final deadline = _InvocationAbort(
+      abortTrigger: invocation.abortTrigger,
+      timeout: invocation.timeout,
     );
-    final response = await transport.sendStream(request);
+    final DartHttpClientStreamedResponse response;
+    try {
+      final request = await _buildClientRequest(
+        invocation,
+        abortTrigger: deadline.trigger,
+        responseMode: invocation.success.responseMode,
+      );
+      response = await transport.sendStream(request);
+    } on Object {
+      deadline.dispose();
+      rethrow;
+    }
     if (response.status == invocation.success.status) {
       return DartHttpClientStreamedResponseObject(
         status: response.status,
         contentType: response.contentType,
         headers: response.headers,
-        bodyStream: response.bodyStream,
+        bodyStream: deadline.guardBody(response.bodyStream),
       );
     }
 
-    final bodyBytes = await _collectStreamBytes(response.bodyStream);
+    final Uint8List bodyBytes;
+    try {
+      bodyBytes = await _collectStreamBytes(deadline.guardBody(response.bodyStream));
+    } finally {
+      deadline.dispose();
+    }
     final bufferedResponse = DartHttpClientResponse(
       status: response.status,
       contentType: response.contentType,
@@ -134,7 +161,6 @@ abstract base class DartHttpClientBase {
             : DartHttpClientErrorKind.documented,
         contentType: response.contentType,
         headers: response.headers,
-        rawBody: bufferedResponse.body,
         rawBodyBytes: bufferedResponse.bodyBytes,
         body: _decodeErrorBody(bufferedResponse),
       ),
@@ -194,12 +220,9 @@ abstract base class DartHttpClientBase {
 
   Future<DartHttpClientRequest> _buildClientRequest<TResponse, TParams, TQuery, THeaders, TBody>(
     DartHttpClientInvocation<TResponse, TParams, TQuery, THeaders, TBody> invocation, {
+    required Future<void>? abortTrigger,
     DartHttpClientResponseMode responseMode = DartHttpClientResponseMode.buffered,
   }) async {
-    final abortTrigger = _combinedAbortTrigger(
-      abortTrigger: invocation.abortTrigger,
-      timeout: invocation.timeout,
-    );
     final encodedBody = await _encodeRequestBody(body: invocation.body);
     return DartHttpClientRequest(
       method: invocation.method,
@@ -322,7 +345,7 @@ abstract base class DartHttpClientBase {
     required DartHttpClientResponseSpec<T> success,
   }) {
     if (_isJsonContentType(success.contentType)) {
-      final decoded = response.body.isEmpty ? null : jsonDecode(response.body);
+      final decoded = _decodeJsonBytes(response.bodyBytes);
       if (success.decoder case final decoder?) {
         return decoder(decoded);
       }
@@ -345,11 +368,12 @@ abstract base class DartHttpClientBase {
   }
 
   Object? _decodeErrorBody(DartHttpClientResponse response) {
-    if (response.body.isEmpty) {
+    final bytes = response.bodyBytes;
+    if (bytes.isEmpty) {
       return null;
     }
     if (_isJsonContentType(response.contentType)) {
-      return jsonDecode(response.body);
+      return _decodeJsonBytes(bytes);
     }
     if (_isTextContentType(response.contentType)) {
       return response.body;
@@ -618,18 +642,114 @@ int? _multipartFormDataContentLength(MultipartFormData form, String boundary) {
   return length;
 }
 
-Future<void>? _combinedAbortTrigger({
-  required Future<void>? abortTrigger,
-  required Duration? timeout,
-}) {
-  final timeoutTrigger = timeout == null ? null : Future<void>.delayed(timeout);
-  if (abortTrigger == null) {
-    return timeoutTrigger;
+/// Abort trigger for one invocation, combining the caller's trigger with a
+/// cancellable timeout.
+final class _InvocationAbort {
+  _InvocationAbort({required Future<void>? abortTrigger, required this.timeout}) {
+    final timeout = this.timeout;
+    if (timeout == null) {
+      trigger = abortTrigger;
+      return;
+    }
+    final timedOut = Completer<void>();
+    _timedOut = timedOut;
+    _timer = Timer(timeout, () {
+      _timer = null;
+      if (_disposed) return;
+      didTimeOut = true;
+      timedOut.complete();
+    });
+    trigger = abortTrigger == null
+        ? timedOut.future
+        : Future.any(<Future<void>>[abortTrigger, timedOut.future]);
   }
-  if (timeoutTrigger == null) {
-    return abortTrigger;
+
+  final Duration? timeout;
+
+  /// Trigger handed to the transport, or `null` when nothing can abort.
+  late final Future<void>? trigger;
+
+  Completer<void>? _timedOut;
+  Timer? _timer;
+  var _disposed = false;
+
+  /// Whether the timeout elapsed before the invocation completed.
+  var didTimeOut = false;
+
+  /// Stops the timeout once the response is complete.
+  void dispose() {
+    if (_disposed) return;
+    _disposed = true;
+    _timer?.cancel();
+    _timer = null;
   }
-  return Future.any([abortTrigger, timeoutTrigger]);
+
+  /// Keeps the timeout armed while [body] streams and disposes it once the
+  /// body completes or is cancelled.
+  ///
+  /// When the timeout fires mid-stream the body ends with a
+  /// [TimeoutException] instead of looking like a complete body, regardless of
+  /// how the transport reacts to the abort.
+  Stream<List<int>> guardBody(Stream<List<int>> body) {
+    final timedOut = _timedOut;
+    if (timedOut == null) return body;
+    late final StreamController<List<int>> controller;
+    StreamSubscription<List<int>>? subscription;
+
+    void timeOutBody() {
+      if (_disposed || controller.isClosed) return;
+      dispose();
+      final pending = subscription;
+      subscription = null;
+      controller.addError(
+        TimeoutException('The HTTP response body did not complete in time.', timeout),
+      );
+      unawaited(controller.close());
+      if (pending != null) {
+        unawaited(pending.cancel().catchError((Object _) {}));
+      }
+    }
+
+    controller = StreamController<List<int>>(
+      sync: true,
+      onListen: () {
+        if (didTimeOut) {
+          unawaited(body.listen(null).cancel().catchError((Object _) {}));
+          timeOutBody();
+          return;
+        }
+        unawaited(timedOut.future.then((_) => timeOutBody()));
+        subscription = body.listen(
+          controller.add,
+          onError: (Object error, StackTrace stackTrace) {
+            if (didTimeOut) {
+              timeOutBody();
+              return;
+            }
+            controller.addError(error, stackTrace);
+          },
+          onDone: () {
+            if (didTimeOut) {
+              timeOutBody();
+              return;
+            }
+            dispose();
+            subscription = null;
+            unawaited(controller.close());
+          },
+        );
+      },
+      onPause: () => subscription?.pause(),
+      onResume: () => subscription?.resume(),
+      onCancel: () {
+        dispose();
+        final pending = subscription;
+        subscription = null;
+        return pending?.cancel();
+      },
+    );
+    return controller.stream;
+  }
 }
 
 String _escapeMultipartHeaderValue(String value) {
@@ -818,7 +938,7 @@ final class DartHttpClientResponseObject<T> {
     required this.status,
     required this.contentType,
     this.headers = const <String, String>{},
-    required this.rawBody,
+    this._rawBody,
     this._rawBodyBytes,
     this.data,
     this.error,
@@ -833,18 +953,17 @@ final class DartHttpClientResponseObject<T> {
   /// Actual HTTP response headers.
   final Map<String, String> headers;
 
-  /// Raw transport response body.
-  final String rawBody;
+  final String? _rawBody;
   final Uint8List? _rawBodyBytes;
 
+  /// Raw transport response body decoded as UTF-8 text.
+  ///
+  /// Decoded lazily on first access and cached, so binary responses never pay
+  /// for (or fail on) text decoding.
+  String get rawBody => _lazyRawBody(this, _rawBody, _rawBodyBytes);
+
   /// Raw transport response body bytes.
-  Uint8List get rawBodyBytes {
-    final bytes = _rawBodyBytes;
-    if (bytes != null) {
-      return bytes;
-    }
-    return Uint8List.fromList(utf8.encode(rawBody));
-  }
+  Uint8List get rawBodyBytes => _lazyRawBodyBytes(this, _rawBody, _rawBodyBytes);
 
   /// Decoded success payload when [isSuccess] is true.
   final T? data;
@@ -972,7 +1091,7 @@ final class DartHttpClientError {
     required this.kind,
     required this.contentType,
     this.headers = const <String, String>{},
-    required this.rawBody,
+    this._rawBody,
     this._rawBodyBytes,
     this.body,
   });
@@ -992,22 +1111,44 @@ final class DartHttpClientError {
   /// Actual HTTP response headers.
   final Map<String, String> headers;
 
-  /// Raw transport response body.
-  final String rawBody;
+  final String? _rawBody;
   final Uint8List? _rawBodyBytes;
 
+  /// Raw transport response body decoded as UTF-8 text.
+  ///
+  /// Decoded lazily on first access and cached, so binary responses never pay
+  /// for (or fail on) text decoding.
+  String get rawBody => _lazyRawBody(this, _rawBody, _rawBodyBytes);
+
   /// Raw transport response body bytes.
-  Uint8List get rawBodyBytes {
-    final bytes = _rawBodyBytes;
-    if (bytes != null) {
-      return bytes;
-    }
-    return Uint8List.fromList(utf8.encode(rawBody));
-  }
+  Uint8List get rawBodyBytes => _lazyRawBodyBytes(this, _rawBody, _rawBodyBytes);
 
   /// Generic decoded error body.
   final Object? body;
 }
+
+final Expando<String> _rawBodyTextCache = Expando<String>('DartHttpClient rawBody');
+final Expando<Uint8List> _rawBodyBytesCache = Expando<Uint8List>('DartHttpClient rawBodyBytes');
+
+String _lazyRawBody(Object owner, String? text, Uint8List? bytes) {
+  if (text != null) return text;
+  if (bytes == null || bytes.isEmpty) return '';
+  return _rawBodyTextCache[owner] ??= utf8.decode(bytes, allowMalformed: true);
+}
+
+Uint8List _lazyRawBodyBytes(Object owner, String? text, Uint8List? bytes) {
+  if (bytes != null) return bytes;
+  return _rawBodyBytesCache[owner] ??= utf8.encode(text ?? '');
+}
+
+/// Decodes JSON straight from UTF-8 bytes without materializing a String.
+Object? _decodeJsonBytes(Uint8List bytes) {
+  if (bytes.isEmpty) return null;
+  return _jsonUtf8Decoder.convert(bytes);
+}
+
+final Converter<List<int>, Object?> _jsonUtf8Decoder = const Utf8Decoder(allowMalformed: true)
+    .fuse(const JsonDecoder());
 
 Future<Uint8List> _collectStreamBytes(Stream<List<int>> stream) async {
   final builder = BytesBuilder(copy: false);

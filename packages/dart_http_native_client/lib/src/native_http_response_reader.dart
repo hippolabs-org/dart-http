@@ -35,21 +35,34 @@ final class _NativeHttpResponseReader {
   var _closing = false;
   Future<void>? _closeFuture;
 
+  /// Why the body ended early when it was closed by something other than its
+  /// consumer (abort trigger, timeout, transport close). Reported as a stream
+  /// error so a truncated body never looks like a normal EOF.
+  NativeHttpClientException? _closeReason;
+
   Stream<NativeBufferLease> leases() async* {
     if (_consumed) throw StateError('Native HTTP response stream has already been consumed.');
     _consumed = true;
     try {
       while (!_closing) {
         final lease = await _readLease();
-        if (lease == null) return;
+        if (lease == null) break;
         yield lease;
       }
+      if (_closeReason case final reason?) throw reason;
     } finally {
       await close();
     }
   }
 
   Future<void> close() => _closeFuture ??= _close();
+
+  /// Ends the body early because the request was aborted; a consumer still
+  /// reading the body receives [reason] as an error instead of EOF.
+  Future<void> abort(NativeHttpClientException reason) {
+    if (!_closing && !_terminal) _closeReason ??= reason;
+    return close();
+  }
 
   Future<NativeBufferLease?> _readLease() async {
     if (_closing || _terminal) return null;
@@ -107,6 +120,11 @@ final class _NativeHttpResponseReader {
   }
 
   void _transportClosed() {
+    if (!_closing && !_terminal) {
+      _closeReason ??= const NativeHttpClientException(
+        'Native HTTP client closed before the response body completed.',
+      );
+    }
     _closing = true;
     final completion = _pendingCompletion;
     if (completion != null && !completion.isCompleted) completion.complete();

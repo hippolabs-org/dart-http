@@ -299,7 +299,13 @@ final class NativeHttpClientTransport
         unawaited(
           abortTrigger.then<void>((_) {
             response.body?.close();
-            response.bodyReader?.close();
+            unawaited(
+              response.bodyReader?.abort(
+                const NativeHttpClientException(
+                  'Native HTTP response body was aborted before it completed.',
+                ),
+              ),
+            );
             response.bodyBuffer?.close();
           }, onError: (Object _, StackTrace _) {}),
         );
