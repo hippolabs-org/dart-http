@@ -25,14 +25,16 @@ final class SseDecoder extends StreamTransformerBase<List<int>, SseEvent> {
 
 Stream<SseEvent> _decode(Stream<List<int>> stream, SseDecodeLimits limits) async* {
   limits.validate();
-  final lineBytes = BytesBuilder(copy: false);
+  // Holds bytes of a line that spans chunk boundaries. Copying keeps the
+  // decoder independent of whether producers reuse chunk buffers.
+  final lineBytes = BytesBuilder();
   final frame = _SseFrameAccumulator(limits);
   var lineByteCount = 0;
   var firstLine = true;
   var previousWasCarriageReturn = false;
 
-  SseEvent? finishLine() {
-    var line = _decodeLine(lineBytes.takeBytes());
+  SseEvent? finishLine(Uint8List bytes) {
+    var line = _decodeLine(bytes);
     lineByteCount = 0;
     if (firstLine) {
       firstLine = false;
@@ -43,42 +45,85 @@ Stream<SseEvent> _decode(Stream<List<int>> stream, SseDecodeLimits limits) async
     return frame.addLine(line.value, line.encodedByteCount);
   }
 
-  await for (final chunk in stream) {
-    for (final byte in chunk) {
-      if (byte < 0 || byte > 255) {
-        throw const SseDecodeException(
-          code: SseDecodeErrorCode.invalidByte,
-          message: 'The SSE stream contains a value outside the byte range.',
-        );
+  void checkLineLimit(int additionalBytes) {
+    if (lineByteCount + additionalBytes > limits.maxLineBytes) {
+      throw const SseDecodeException(
+        code: SseDecodeErrorCode.lineTooLarge,
+        message: 'An SSE line exceeds the configured byte limit.',
+      );
+    }
+  }
+
+  await for (final input in stream) {
+    final Uint8List chunk;
+    var invalidByte = false;
+    if (input is Uint8List) {
+      chunk = input;
+    } else {
+      var validLength = 0;
+      while (validLength < input.length) {
+        final byte = input[validLength];
+        if (byte < 0 || byte > 255) {
+          invalidByte = true;
+          break;
+        }
+        validLength++;
       }
-      if (previousWasCarriageReturn) {
-        previousWasCarriageReturn = false;
-        if (byte == 0x0a) continue;
+      chunk = Uint8List.fromList(invalidByte ? input.sublist(0, validLength) : input);
+    }
+
+    final length = chunk.length;
+    var index = 0;
+    if (previousWasCarriageReturn && length > 0) {
+      previousWasCarriageReturn = false;
+      if (chunk[0] == 0x0a) index = 1;
+    }
+    while (index < length) {
+      var lineEnd = index;
+      while (lineEnd < length) {
+        final byte = chunk[lineEnd];
+        if (byte == 0x0a || byte == 0x0d) break;
+        lineEnd++;
       }
-      if (byte == 0x0d) {
-        final completed = finishLine();
-        previousWasCarriageReturn = true;
-        if (completed != null) yield completed;
-        continue;
+      final spanLength = lineEnd - index;
+      if (lineEnd == length) {
+        // No terminator in the rest of this chunk: retain the partial line.
+        if (spanLength > 0) {
+          checkLineLimit(spanLength);
+          lineBytes.add(Uint8List.sublistView(chunk, index, lineEnd));
+          lineByteCount += spanLength;
+        }
+        break;
       }
-      if (byte == 0x0a) {
-        final completed = finishLine();
-        if (completed != null) yield completed;
-        continue;
+      checkLineLimit(spanLength);
+      final SseEvent? completed;
+      if (lineByteCount == 0) {
+        completed = finishLine(Uint8List.sublistView(chunk, index, lineEnd));
+      } else {
+        if (spanLength > 0) lineBytes.add(Uint8List.sublistView(chunk, index, lineEnd));
+        completed = finishLine(lineBytes.takeBytes());
       }
-      if (lineByteCount >= limits.maxLineBytes) {
-        throw const SseDecodeException(
-          code: SseDecodeErrorCode.lineTooLarge,
-          message: 'An SSE line exceeds the configured byte limit.',
-        );
+      index = lineEnd + 1;
+      if (chunk[lineEnd] == 0x0d) {
+        if (index < length) {
+          if (chunk[index] == 0x0a) index++;
+        } else {
+          previousWasCarriageReturn = true;
+        }
       }
-      lineBytes.addByte(byte);
-      lineByteCount++;
+      if (completed != null) yield completed;
+    }
+
+    if (invalidByte) {
+      throw const SseDecodeException(
+        code: SseDecodeErrorCode.invalidByte,
+        message: 'The SSE stream contains a value outside the byte range.',
+      );
     }
   }
 
   if (lineByteCount > 0) {
-    final completed = finishLine();
+    final completed = finishLine(lineBytes.takeBytes());
     if (completed != null) yield completed;
   }
   final completed = frame.flush();

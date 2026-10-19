@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:typed_data';
 
 import 'package:dart_http_core/dart_http_core.dart' as core;
 import 'package:sse_helpers/sse_helpers.dart';
@@ -123,6 +124,51 @@ void main() {
       );
     });
 
+    test('decodes identically at every chunk boundary, including CR|LF splits', () async {
+      final source = utf8.encode(
+        '\uFEFFevent: first\r\nid: 1\r\ndata: Grüße 👋\r\n\r\n'
+        ': note\rdata: cr\r\rdata: lf\n\ndata: a\r\ndata: b\r\n\r\ndata: tail',
+      );
+      final expected = _describe(await decodeSseEvents(Stream<List<int>>.value(source)).toList());
+      expect(expected, hasLength(5));
+
+      expect(_describe(await decodeSseEvents(_oneByteChunks(source)).toList()), expected);
+      for (var first = 0; first <= source.length; first++) {
+        for (var second = first; second <= source.length; second++) {
+          final chunks = <List<int>>[
+            Uint8List.fromList(source.sublist(0, first)),
+            Uint8List.fromList(source.sublist(first, second)),
+            Uint8List.fromList(source.sublist(second)),
+          ];
+          final events = await decodeSseEvents(Stream<List<int>>.fromIterable(chunks)).toList();
+          expect(_describe(events), expected, reason: 'split at $first/$second');
+        }
+      }
+    });
+
+    test('emits frames preceding an out-of-range byte in the same chunk', () async {
+      final events = <SseEvent>[];
+      await expectLater(
+        decodeSseEvents(Stream<List<int>>.value(<int>[...utf8.encode('data: ok\n\n'), 256]))
+            .forEach(events.add),
+        throwsSseCode(SseDecodeErrorCode.invalidByte),
+      );
+      expect(events.single.data, 'ok');
+    });
+
+    test('enforces the line byte limit across chunk boundaries', () async {
+      const limits = SseDecodeLimits(maxLineBytes: 8);
+      final ok = await decodeSseEvents(
+        _oneByteChunks(utf8.encode('data: 12\n\n')),
+        limits: limits,
+      ).toList();
+      expect(ok.single.data, '12');
+      await expectLater(
+        decodeSseEvents(_oneByteChunks(utf8.encode('data: 123\n\n')), limits: limits).drain<void>(),
+        throwsSseCode(SseDecodeErrorCode.lineTooLarge),
+      );
+    });
+
     test('validates configured limits', () async {
       await expectLater(
         decodeSseEvents(
@@ -143,3 +189,9 @@ Future<List<SseEvent>> _decode(String source) =>
 
 Matcher throwsSseCode(SseDecodeErrorCode code) =>
     throwsA(isA<SseDecodeException>().having((error) => error.code, 'code', code));
+
+List<String> _describe(List<SseEvent> events) => [
+  for (final event in events)
+    'id=${event.id} event=${event.event} retry=${event.retry} '
+        'data=${event.data} comment=${event.comment}',
+];
