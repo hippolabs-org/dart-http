@@ -55,6 +55,85 @@ final class NativeTransportRequestLease {
   }
 }
 
+/// Result of [NativeResponseStream.write].
+enum NativeResponseStreamWrite {
+  /// The stream no longer accepts data (finished, aborted, or disconnected).
+  rejected,
+
+  /// Copied into the stream; write more right away.
+  accepted,
+
+  /// Copied, and the window is now full: wait for the stream's credit event
+  /// (transport event 13 with the request id) before writing again.
+  windowFull,
+}
+
+/// Writer for one response body produced chunk by chunk in Dart (binary
+/// streams and SSE), flow controlled by a credit window.
+///
+/// Up to [defaultWindowChunks] chunks and [defaultWindowBytes] bytes (or the
+/// configured window) may be queued in native memory ahead of the HTTP body;
+/// the runtime grants new credit once half the window drained, so the
+/// producer is woken once per half window rather than once per chunk.
+/// Exactly one of [finish] or [abort] must be called.
+final class NativeResponseStream {
+  NativeResponseStream._(this._handle);
+
+  /// Default number of chunks in flight.
+  static const defaultWindowChunks = 16;
+
+  /// Default number of bytes in flight.
+  static const defaultWindowBytes = 1024 * 1024;
+
+  /// Largest chunk accepted by [write]; split larger producer chunks.
+  static const maxChunkBytes = 256 * 1024;
+
+  static NativeResponseStream? _adopt(Pointer<Void> handle) =>
+      handle == nullptr ? null : NativeResponseStream._(handle);
+
+  /// Validates a window configuration.
+  static void checkWindow(int windowChunks, int windowBytes) {
+    RangeError.checkValueInInterval(windowChunks, 1, 1 << 16, 'windowChunks');
+    RangeError.checkValueInInterval(windowBytes, 1, 1 << 40, 'windowBytes');
+  }
+
+  Pointer<Void> _handle;
+
+  /// Copies [chunk] (at most [maxChunkBytes]) into the stream exactly once.
+  NativeResponseStreamWrite write(Uint8List chunk) {
+    final handle = _handle;
+    if (handle == nullptr) return NativeResponseStreamWrite.rejected;
+    final result = gen.dart_http_server_runtime_dart_stream_write(
+      handle,
+      chunk.address,
+      chunk.length,
+    );
+    return switch (result) {
+      1 => NativeResponseStreamWrite.accepted,
+      2 => NativeResponseStreamWrite.windowFull,
+      _ => NativeResponseStreamWrite.rejected,
+    };
+  }
+
+  /// Ends the body after every written chunk and releases the stream.
+  bool finish() {
+    final handle = _take();
+    return handle != nullptr && gen.dart_http_server_runtime_dart_stream_finish(handle);
+  }
+
+  /// Ends the body without sending unsent chunks and releases the stream.
+  void abort() {
+    final handle = _take();
+    if (handle != nullptr) gen.dart_http_server_runtime_dart_stream_abort(handle);
+  }
+
+  Pointer<Void> _take() {
+    final handle = _handle;
+    _handle = nullptr;
+    return handle;
+  }
+}
+
 abstract final class DartHttpNative {
   /// ABI version exposed by the bundled native runtime.
   static int get abiVersion => gen.dart_http_server_runtime_native_abi_version();
@@ -208,78 +287,65 @@ abstract final class DartHttpNative {
   }
 
   /// Starts an SSE response for a previously taken request.
-  static bool startSseResponse(
+  ///
+  /// Returns `null` when the request is no longer pending. See
+  /// [NativeResponseStream] for the credit window.
+  static NativeResponseStream? startSseResponse(
     int requestId, {
     required int status,
     List<HttpHeader> headers = const <HttpHeader>[],
+    int windowChunks = NativeResponseStream.defaultWindowChunks,
+    int windowBytes = NativeResponseStream.defaultWindowBytes,
   }) {
-    return _withNativeHeaders(
-      headers,
-      (headerStorage, headerCount) => gen.dart_http_server_runtime_start_sse_response(
-        requestId,
-        status,
-        headerCount,
-        headerStorage,
+    NativeResponseStream.checkWindow(windowChunks, windowBytes);
+    return NativeResponseStream._adopt(
+      _withNativeHeaders(
+        headers,
+        (headerStorage, headerCount) => gen.dart_http_server_runtime_start_sse_response(
+          requestId,
+          status,
+          headerCount,
+          headerStorage,
+          windowChunks,
+          windowBytes,
+        ),
       ),
     );
   }
 
-  /// Finishes an active SSE response.
-  static bool finishSseResponse(int requestId) {
-    return gen.dart_http_server_runtime_finish_sse_response(requestId);
-  }
-
-  /// Starts a backpressured binary stream for a previously taken request.
-  static bool startBinaryStreamResponse(
+  /// Starts a credit-windowed binary stream for a previously taken request.
+  ///
+  /// Returns `null` when the request is no longer pending.
+  static NativeResponseStream? startBinaryStreamResponse(
     int requestId, {
     required int status,
     required String contentType,
     int? contentLength,
     List<HttpHeader> headers = const <HttpHeader>[],
+    int windowChunks = NativeResponseStream.defaultWindowChunks,
+    int windowBytes = NativeResponseStream.defaultWindowBytes,
   }) {
+    NativeResponseStream.checkWindow(windowChunks, windowBytes);
     final contentTypePtr = contentType.toNativeUtf8();
     try {
-      return _withNativeHeaders(
-        headers,
-        (headerStorage, headerCount) => gen.dart_http_server_runtime_start_binary_stream_response(
-          requestId,
-          status,
-          contentTypePtr.cast<Char>(),
-          contentLength ?? -1,
-          headerCount,
-          headerStorage,
+      return NativeResponseStream._adopt(
+        _withNativeHeaders(
+          headers,
+          (headerStorage, headerCount) => gen.dart_http_server_runtime_start_binary_stream_response(
+            requestId,
+            status,
+            contentTypePtr.cast<Char>(),
+            contentLength ?? -1,
+            headerCount,
+            headerStorage,
+            windowChunks,
+            windowBytes,
+          ),
         ),
       );
     } finally {
       calloc.free(contentTypePtr);
     }
-  }
-
-  /// Starts one bounded chunk without waiting on the Dart isolate.
-  /// Transport event 13 acknowledges consumption or cancellation.
-  static int startBinaryStreamChunk(int requestId, List<int> chunk) {
-    final bytes = chunk is Uint8List ? chunk : Uint8List.fromList(chunk);
-    final bodyPtr = calloc<Uint8>(bytes.length);
-    final nativeBytesPtr = calloc<core_ffi.NativeBytes>();
-    try {
-      bodyPtr.asTypedList(bytes.length).setAll(0, bytes);
-      nativeBytesPtr.ref
-        ..ptr = bodyPtr
-        ..len = bytes.length;
-      return gen.dart_http_server_runtime_start_binary_stream_chunk(requestId, nativeBytesPtr.ref);
-    } finally {
-      calloc.free(nativeBytesPtr);
-      calloc.free(bodyPtr);
-    }
-  }
-
-  static void abortBinaryStreamResponse(int requestId) {
-    gen.dart_http_server_runtime_abort_binary_stream_response(requestId);
-  }
-
-  /// Finishes an active binary streaming response.
-  static bool finishBinaryStreamResponse(int requestId) {
-    return gen.dart_http_server_runtime_finish_binary_stream_response(requestId);
   }
 
   /// Transfers a native producer directly into the native HTTP body.

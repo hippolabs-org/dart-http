@@ -476,6 +476,114 @@ void main() {
     });
   });
 
+  for (final (chunks, bytes) in [(1, 1), (2, 300 * 1024), (16, 1024 * 1024)]) {
+    test('streams large producer chunks intact with a $chunks-chunk/$bytes-byte window', () async {
+      final app = DartHttp<void>(services: () {});
+      // 700 KiB chunks are split at the 256 KiB native limit; odd sizes and a
+      // reused buffer check that every piece is copied before the next write.
+      final buffer = Uint8List(700 * 1024 + 13);
+      Stream<List<int>> produce() async* {
+        for (var round = 0; round < 12; round++) {
+          for (var i = 0; i < buffer.length; i++) {
+            buffer[i] = (round * 31 + i) & 0xff;
+          }
+          yield buffer;
+          yield List<int>.generate(3, (i) => round + i);
+        }
+      }
+
+      app.get(
+        '/stream',
+        options: const RouteOptions(success: ResponseSpec.binary()),
+        handler: (_) => BinaryStreamResponse(
+          body: produce(),
+          contentType: 'application/octet-stream',
+          contentLength: 12 * (buffer.length + 3),
+        ),
+      );
+      final server = await app.listen(
+        port: 0,
+        streamWindowChunks: chunks,
+        streamWindowBytes: bytes,
+      );
+      final client = HttpClient();
+      addTearDown(() async {
+        client.close(force: true);
+        await server.close();
+      });
+
+      final response = await (await client.getUrl(Uri.http('127.0.0.1:${server.port}', '/stream')))
+          .close();
+      final body = BytesBuilder(copy: false);
+      await response.forEach(body.add);
+      final received = body.takeBytes();
+      expect(received.length, 12 * (buffer.length + 3));
+      var offset = 0;
+      for (var round = 0; round < 12; round++) {
+        for (var i = 0; i < buffer.length; i++) {
+          if (received[offset + i] != (round * 31 + i) & 0xff) {
+            fail('Byte ${offset + i} of round $round differs.');
+          }
+        }
+        offset += buffer.length;
+        expect(received.sublist(offset, offset + 3), [round, round + 1, round + 2]);
+        offset += 3;
+      }
+    });
+  }
+
+  test('bounds how far a Dart producer runs ahead of a paused client', () async {
+    final app = DartHttp<void>(services: () {});
+    var produced = 0;
+    const total = 1024;
+    final chunk = Uint8List(64 * 1024);
+    Stream<List<int>> produce() async* {
+      for (var i = 0; i < total; i++) {
+        produced++;
+        yield chunk;
+      }
+    }
+
+    app.get(
+      '/stream',
+      options: const RouteOptions(success: ResponseSpec.binary()),
+      handler: (_) => BinaryStreamResponse(
+        body: produce(),
+        contentType: 'application/octet-stream',
+        contentLength: total * chunk.length,
+      ),
+    );
+    final server = await app.listen(port: 0, streamWindowChunks: 8, streamWindowBytes: 512 * 1024);
+    addTearDown(server.close);
+
+    final socket = await Socket.connect('127.0.0.1', server.port);
+    addTearDown(socket.destroy);
+    var received = 0;
+    final firstBytes = Completer<void>();
+    final done = Completer<void>();
+    final subscription = socket.listen((data) {
+      received += data.length;
+      if (!firstBytes.isCompleted) firstBytes.complete();
+    }, onDone: done.complete);
+    socket.write('GET /stream HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n');
+    await firstBytes.future.timeout(const Duration(seconds: 5));
+    subscription.pause();
+    await Future<void>.delayed(const Duration(milliseconds: 500));
+    // Only socket buffers and the credit window may sit between the producer
+    // and the paused reader, far less than the 64 MiB body.
+    expect(produced, lessThan(total ~/ 2));
+    subscription.resume();
+    await done.future.timeout(const Duration(seconds: 30));
+    expect(produced, total);
+    expect(received, greaterThan(total * chunk.length));
+  });
+
+  test('rejects an empty streaming window', () async {
+    final app = DartHttp<void>(services: () {});
+    await expectLater(app.listen(port: 0, streamWindowChunks: 0), throwsRangeError);
+    await expectLater(app.listen(port: 0, streamWindowBytes: 0), throwsRangeError);
+  });
+
   test('streams binary responses in order with a content length', () async {
     final app = DartHttp<void>(services: () {});
     var disposeCount = 0;

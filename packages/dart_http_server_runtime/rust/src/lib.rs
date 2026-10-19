@@ -11,7 +11,7 @@ mod native_values;
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString, c_char};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -48,7 +48,7 @@ use wtransport::{
 };
 
 const DART_HTTP_SERVER_RUNTIME_NATIVE_ABI_VERSION: i32 = 27;
-const MAX_BINARY_STREAM_CHUNK_BYTES: usize = 64 * 1024;
+const MAX_BINARY_STREAM_CHUNK_BYTES: usize = 256 * 1024;
 const RESERVED_BLOCKING_WORKERS: usize = 16;
 const SCHEMA_REGISTRY_URI: &str = "urn:dart-http:schema-registry";
 const DEFAULT_REALTIME_MAX_PENDING_MESSAGES: usize = 256;
@@ -181,7 +181,6 @@ struct PendingRequest {
     request: Option<TransportRequest>,
     response_tx: mpsc::UnboundedSender<PendingResponseMessage>,
     runtime_state: ServerRuntimeState,
-    binary_chunk: Option<Arc<BinaryChunkCompletion>>,
 }
 
 struct ServerState {
@@ -448,17 +447,16 @@ enum PendingResponseMessage {
     SseStart {
         status: u16,
         headers: Vec<(String, String)>,
+        window: Arc<DartStreamWindow>,
     },
     BinaryStart {
         status: u16,
         content_type: String,
         content_length: Option<u64>,
         headers: Vec<(String, String)>,
+        window: Arc<DartStreamWindow>,
     },
-    BinaryChunk {
-        bytes: Vec<u8>,
-        completion: BinaryChunkAcknowledgement,
-    },
+    BinaryChunk(Bytes),
     NativeBinaryStart {
         status: u16,
         content_type: String,
@@ -472,61 +470,161 @@ enum PendingResponseMessage {
     Close,
 }
 
-struct BinaryChunkCompletion {
-    operation_id: i64,
+/// Credit-based flow control for one response body produced chunk by chunk
+/// in Dart (binary streams and SSE).
+///
+/// Dart writes without waiting while fewer than `max_chunks` chunks and
+/// `max_bytes` bytes are queued and not yet pulled by the HTTP body. When a
+/// write fills the window, Dart waits for one `BinaryStreamCredit` event,
+/// which the body sends once the queue drained to half the window: one wake
+/// per half window instead of one acknowledgement per chunk.
+struct DartStreamWindow {
     request_id: i64,
-    runtime_state: ServerRuntimeState,
-    completed: AtomicBool,
+    response_tx: mpsc::UnboundedSender<PendingResponseMessage>,
+    events: Arc<ServerEvents>,
+    max_chunks: usize,
+    max_bytes: usize,
+    queued_chunks: AtomicUsize,
+    queued_bytes: AtomicUsize,
+    /// Dart got `WINDOW_FULL` and waits for a credit event.
+    writer_waiting: AtomicBool,
+    /// Writes are rejected (finished, aborted, or the client went away).
+    closed: AtomicBool,
+    /// Queued chunks must not be sent any more.
+    aborted: AtomicBool,
 }
 
-impl BinaryChunkCompletion {
-    fn complete(&self, consumed: bool) {
-        if self.completed.swap(true, Ordering::AcqRel) {
-            return;
+/// `dart_http_server_runtime_dart_stream_write` results.
+const DART_STREAM_WRITE_REJECTED: i32 = 0;
+const DART_STREAM_WRITE_ACCEPTED: i32 = 1;
+const DART_STREAM_WRITE_WINDOW_FULL: i32 = 2;
+
+impl DartStreamWindow {
+    fn new(
+        request_id: i64,
+        response_tx: mpsc::UnboundedSender<PendingResponseMessage>,
+        events: Arc<ServerEvents>,
+        max_chunks: i64,
+        max_bytes: i64,
+    ) -> Self {
+        Self {
+            request_id,
+            response_tx,
+            events,
+            max_chunks: usize::try_from(max_chunks).unwrap_or(1).max(1),
+            max_bytes: usize::try_from(max_bytes).unwrap_or(1).max(1),
+            queued_chunks: AtomicUsize::new(0),
+            queued_bytes: AtomicUsize::new(0),
+            writer_waiting: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
+            aborted: AtomicBool::new(false),
         }
-        PENDING_REQUESTS.with(self.request_id, |request| {
-            if request
-                .binary_chunk
-                .as_ref()
-                .is_some_and(|chunk| chunk.operation_id == self.operation_id)
-            {
-                request.binary_chunk = None;
-            }
-        });
-        notify_transport_event(
-            &self.runtime_state,
-            TransportEventKind::BinaryStreamChunkCompleted,
-            if consumed {
-                self.operation_id
-            } else {
-                -self.operation_id
-            },
-        );
     }
-}
 
-struct BinaryChunkAcknowledgement(Arc<BinaryChunkCompletion>);
+    fn drained_to_low_watermark(&self) -> bool {
+        self.queued_chunks.load(Ordering::SeqCst) * 2 <= self.max_chunks
+            && self.queued_bytes.load(Ordering::SeqCst) * 2 <= self.max_bytes
+    }
 
-impl Drop for BinaryChunkAcknowledgement {
-    fn drop(&mut self) {
-        self.0.complete(false);
+    /// Queues one chunk. Never blocks and never calls into Dart.
+    fn write(&self, bytes: Bytes) -> i32 {
+        if self.closed.load(Ordering::Acquire) {
+            return DART_STREAM_WRITE_REJECTED;
+        }
+        let length = bytes.len();
+        if length == 0 {
+            return DART_STREAM_WRITE_ACCEPTED;
+        }
+        let chunks = self.queued_chunks.fetch_add(1, Ordering::SeqCst) + 1;
+        let queued = self.queued_bytes.fetch_add(length, Ordering::SeqCst) + length;
+        if self
+            .response_tx
+            .send(PendingResponseMessage::BinaryChunk(bytes))
+            .is_err()
+        {
+            self.closed.store(true, Ordering::Release);
+            return DART_STREAM_WRITE_REJECTED;
+        }
+        if chunks < self.max_chunks && queued < self.max_bytes {
+            return DART_STREAM_WRITE_ACCEPTED;
+        }
+        self.writer_waiting.store(true, Ordering::SeqCst);
+        // The body may have drained before it could see the flag; whoever
+        // clears the flag owns the wake-up.
+        if self.drained_to_low_watermark() && self.writer_waiting.swap(false, Ordering::SeqCst) {
+            return DART_STREAM_WRITE_ACCEPTED;
+        }
+        DART_STREAM_WRITE_WINDOW_FULL
+    }
+
+    /// Records that the HTTP body pulled one chunk and grants credit to a
+    /// waiting writer once half the window is free.
+    fn consumed(&self, length: usize) {
+        self.queued_chunks.fetch_sub(1, Ordering::SeqCst);
+        self.queued_bytes.fetch_sub(length, Ordering::SeqCst);
+        if self.drained_to_low_watermark() && self.writer_waiting.swap(false, Ordering::SeqCst) {
+            self.events
+                .post(TransportEventKind::BinaryStreamCredit, self.request_id);
+        }
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+    }
+
+    fn abort(&self) {
+        self.aborted.store(true, Ordering::Release);
+        self.close();
     }
 }
 
 struct BinaryResponseLifetime {
     request_id: i64,
     runtime_state: ServerRuntimeState,
+    window: Arc<DartStreamWindow>,
 }
 
 impl Drop for BinaryResponseLifetime {
     fn drop(&mut self) {
-        cancel_binary_response(self.request_id);
+        self.window.close();
+        if let Some(request) = PENDING_REQUESTS.remove(self.request_id) {
+            let _ = request.response_tx.send(PendingResponseMessage::Close);
+        }
         notify_transport_event(
             &self.runtime_state,
             TransportEventKind::BinaryStreamClosed,
             self.request_id,
         );
     }
+}
+
+/// Streams the chunks Dart writes through `window` until Dart finishes or
+/// aborts, the client disconnects, or the server stops.
+fn dart_stream_body(
+    mut response_rx: mpsc::UnboundedReceiver<PendingResponseMessage>,
+    lifetime: BinaryResponseLifetime,
+) -> Body {
+    let window = Arc::clone(&lifetime.window);
+    Body::from_stream(async_stream::stream! {
+        let _lifetime = lifetime;
+        while let Some(message) = response_rx.recv().await {
+            match message {
+                PendingResponseMessage::BinaryChunk(bytes) => {
+                    if window.aborted.load(Ordering::Acquire) {
+                        break;
+                    }
+                    window.consumed(bytes.len());
+                    yield Ok::<Bytes, std::convert::Infallible>(bytes);
+                }
+                PendingResponseMessage::Close
+                | PendingResponseMessage::Http(_)
+                | PendingResponseMessage::SseStart { .. }
+                | PendingResponseMessage::BinaryStart { .. }
+                | PendingResponseMessage::NativeBinaryStart { .. }
+                | PendingResponseMessage::WebSocketAccept { .. } => break,
+            }
+        }
+    })
 }
 
 /// Reports a WebSocket or WebTransport handshake that never opens a session.
@@ -1381,7 +1479,8 @@ enum TransportEventKind {
     WebTransportStreamChunkReady = 10,
     WebTransportStreamFinished = 11,
     WebTransportOperationReady = 12,
-    BinaryStreamChunkCompleted = 13,
+    /// Half of a Dart stream's window drained (event id: request id).
+    BinaryStreamCredit = 13,
     BinaryStreamClosed = 14,
     /// A WebSocket or WebTransport handshake (event id: request id) ended
     /// without opening a session.
@@ -1850,27 +1949,54 @@ pub extern "C" fn dart_http_server_runtime_accept_web_transport(
     )
 }
 
+/// Opens a credit-windowed Dart stream for a pending request: `start` builds
+/// the response-start message around the new window. Returns an owned handle
+/// that Dart passes to `dart_stream_write` and releases with exactly one of
+/// `dart_stream_finish` or `dart_stream_abort`; null when the request is gone.
+fn start_dart_stream(
+    request_id: i64,
+    window_chunks: i64,
+    window_bytes: i64,
+    start: impl FnOnce(Arc<DartStreamWindow>) -> PendingResponseMessage,
+) -> *mut std::ffi::c_void {
+    let Some((response_tx, events)) = PENDING_REQUESTS.with(request_id, |request| {
+        (
+            request.response_tx.clone(),
+            Arc::clone(&request.runtime_state.events),
+        )
+    }) else {
+        return std::ptr::null_mut();
+    };
+    let window = Arc::new(DartStreamWindow::new(
+        request_id,
+        response_tx,
+        events,
+        window_chunks,
+        window_bytes,
+    ));
+    if !send_pending_response_message(request_id, start(Arc::clone(&window)), false) {
+        return std::ptr::null_mut();
+    }
+    Arc::into_raw(window).cast_mut().cast()
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn dart_http_server_runtime_start_sse_response(
     request_id: i64,
     status: i32,
     header_count: isize,
     headers: *const NativePair,
-) -> bool {
+    window_chunks: i64,
+    window_bytes: i64,
+) -> *mut std::ffi::c_void {
     let headers = unsafe { read_pairs_vec(headers, header_count) };
-    send_pending_response_message(
-        request_id,
+    start_dart_stream(request_id, window_chunks, window_bytes, |window| {
         PendingResponseMessage::SseStart {
             status: status as u16,
             headers,
-        },
-        false,
-    )
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn dart_http_server_runtime_finish_sse_response(request_id: i64) -> bool {
-    send_pending_response_message(request_id, PendingResponseMessage::Close, true)
+            window,
+        }
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -1881,82 +2007,89 @@ pub extern "C" fn dart_http_server_runtime_start_binary_stream_response(
     content_length: i64,
     header_count: isize,
     headers: *const NativePair,
-) -> bool {
+    window_chunks: i64,
+    window_bytes: i64,
+) -> *mut std::ffi::c_void {
     let Some(content_type) = (unsafe { read_c_string(content_type) }) else {
-        return false;
+        return std::ptr::null_mut();
     };
     let headers = unsafe { read_pairs_vec(headers, header_count) };
-    send_pending_response_message(
-        request_id,
+    start_dart_stream(request_id, window_chunks, window_bytes, |window| {
         PendingResponseMessage::BinaryStart {
             status: status as u16,
             content_type,
             content_length: u64::try_from(content_length).ok(),
             headers,
-        },
-        false,
-    )
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn dart_http_server_runtime_start_binary_stream_chunk(
-    request_id: i64,
-    chunk: NativeBytes,
-) -> i64 {
-    let Some(chunk) = (unsafe { read_native_bytes(chunk) }) else {
-        return 0;
-    };
-    if chunk.len() > MAX_BINARY_STREAM_CHUNK_BYTES {
-        return 0;
-    }
-    let Some((response_tx, completion)) = PENDING_REQUESTS
-        .with(request_id, |request| {
-            if request.binary_chunk.is_some() {
-                return None;
-            }
-            let completion = Arc::new(BinaryChunkCompletion {
-                operation_id: NEXT_BINARY_CHUNK_ID.fetch_add(1, Ordering::Relaxed),
-                request_id,
-                runtime_state: request.runtime_state.clone(),
-                completed: AtomicBool::new(false),
-            });
-            request.binary_chunk = Some(completion.clone());
-            Some((request.response_tx.clone(), completion))
-        })
-        .flatten()
-    else {
-        return 0;
-    };
-    let operation_id = completion.operation_id;
-    let message = PendingResponseMessage::BinaryChunk {
-        bytes: chunk.to_vec(),
-        completion: BinaryChunkAcknowledgement(completion),
-    };
-    if response_tx.send(message).is_ok() {
-        operation_id
-    } else {
-        0
-    }
-}
-
-fn cancel_binary_response(request_id: i64) {
-    let request = PENDING_REQUESTS.remove(request_id);
-    if let Some(request) = request {
-        if let Some(chunk) = request.binary_chunk {
-            chunk.complete(false);
+            window,
         }
-        let _ = request.response_tx.send(PendingResponseMessage::Close);
+    })
+}
+
+/// Borrows the window behind a live Dart stream handle.
+///
+/// # Safety
+///
+/// `stream` must be null or a handle from `start_dart_stream` that has not
+/// been finished or aborted.
+unsafe fn dart_stream_window<'a>(stream: *mut std::ffi::c_void) -> Option<&'a DartStreamWindow> {
+    unsafe { stream.cast::<DartStreamWindow>().cast_const().as_ref() }
+}
+
+#[unsafe(no_mangle)]
+/// Copies one chunk (at most 256 KiB) into the stream exactly once. A leaf
+/// call: it never blocks and never calls into Dart. Returns 1 when accepted,
+/// 2 when accepted but the window is full (wait for a `BinaryStreamCredit`
+/// event before writing again), and 0 when the stream no longer accepts data.
+pub extern "C" fn dart_http_server_runtime_dart_stream_write(
+    stream: *mut std::ffi::c_void,
+    chunk: *const u8,
+    chunk_length: isize,
+) -> i32 {
+    let Some(window) = (unsafe { dart_stream_window(stream) }) else {
+        return DART_STREAM_WRITE_REJECTED;
+    };
+    if usize::try_from(chunk_length).is_ok_and(|length| length > MAX_BINARY_STREAM_CHUNK_BYTES) {
+        return DART_STREAM_WRITE_REJECTED;
     }
+    let Some(bytes) = (unsafe { copy_dart_body(chunk, chunk_length) }) else {
+        return DART_STREAM_WRITE_REJECTED;
+    };
+    window.write(bytes)
+}
+
+/// Ends a Dart stream and releases its handle. A finished stream still sends
+/// every chunk written before; an aborted one drops chunks not yet sent.
+fn end_dart_stream(stream: *mut std::ffi::c_void, abort: bool) -> bool {
+    if stream.is_null() {
+        return false;
+    }
+    let window = unsafe { Arc::from_raw(stream.cast::<DartStreamWindow>().cast_const()) };
+    if abort {
+        window.abort();
+    } else {
+        window.close();
+    }
+    // Close is ordered after every chunk already queued on this channel.
+    let sent = window
+        .response_tx
+        .send(PendingResponseMessage::Close)
+        .is_ok();
+    let _ = PENDING_REQUESTS.remove(window.request_id);
+    sent
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn dart_http_server_runtime_abort_binary_stream_response(request_id: i64) {
-    cancel_binary_response(request_id);
+/// Finishes a Dart stream after its queued chunks and releases the handle.
+pub extern "C" fn dart_http_server_runtime_dart_stream_finish(
+    stream: *mut std::ffi::c_void,
+) -> bool {
+    end_dart_stream(stream, false)
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn dart_http_server_runtime_finish_binary_stream_response(request_id: i64) -> bool {
-    send_pending_response_message(request_id, PendingResponseMessage::Close, true)
+/// Aborts a Dart stream, dropping unsent chunks, and releases the handle.
+pub extern "C" fn dart_http_server_runtime_dart_stream_abort(stream: *mut std::ffi::c_void) {
+    end_dart_stream(stream, true);
 }
 
 #[unsafe(no_mangle)]
@@ -3051,38 +3184,25 @@ async fn handle_http_request(
             &transport_response.headers,
             Body::from(transport_response.body),
         ),
-        Some(PendingResponseMessage::SseStart { status, headers }) => {
+        Some(PendingResponseMessage::SseStart {
+            status,
+            headers,
+            window,
+        }) => {
             // SSE shares the binary stream lifetime: dropping the body (client
             // disconnect or completion) removes the pending request and tells
-            // Dart to cancel its event subscription. Event bytes arrive as
-            // acknowledged binary chunks, so at most one chunk is in flight.
+            // Dart to cancel its event subscription. Encoded events arrive as
+            // chunks under the same credit window as binary streams.
             let lifetime = BinaryResponseLifetime {
                 request_id,
                 runtime_state: runtime_state.clone(),
+                window,
             };
-            let stream = async_stream::stream! {
-                let _lifetime = lifetime;
-                while let Some(message) = response_rx.recv().await {
-                    match message {
-                        PendingResponseMessage::BinaryChunk { bytes, completion } => {
-                            completion.0.complete(true);
-                            yield Ok::<Bytes, std::convert::Infallible>(Bytes::from(bytes));
-                        }
-                        PendingResponseMessage::Close => break,
-                        PendingResponseMessage::Http(_)
-                        | PendingResponseMessage::SseStart { .. }
-                        | PendingResponseMessage::BinaryStart { .. }
-                        | PendingResponseMessage::NativeBinaryStart { .. }
-                        | PendingResponseMessage::WebSocketAccept { .. } => break,
-                    }
-                }
-            };
-
             response_body_with_headers(
                 StatusCode::from_u16(status).unwrap_or(StatusCode::OK),
                 "text/event-stream; charset=utf-8",
                 &headers,
-                Body::from_stream(stream),
+                dart_stream_body(response_rx, lifetime),
             )
         }
         Some(PendingResponseMessage::BinaryStart {
@@ -3090,6 +3210,7 @@ async fn handle_http_request(
             content_type,
             content_length,
             mut headers,
+            window,
         }) => {
             if let Some(content_length) = content_length {
                 headers.push((
@@ -3100,30 +3221,13 @@ async fn handle_http_request(
             let lifetime = BinaryResponseLifetime {
                 request_id,
                 runtime_state: runtime_state.clone(),
+                window,
             };
-            let stream = async_stream::stream! {
-                let _lifetime = lifetime;
-                while let Some(message) = response_rx.recv().await {
-                    match message {
-                        PendingResponseMessage::BinaryChunk { bytes, completion } => {
-                            completion.0.complete(true);
-                            yield Ok::<Bytes, std::convert::Infallible>(Bytes::from(bytes));
-                        }
-                        PendingResponseMessage::Close => break,
-                        PendingResponseMessage::Http(_)
-                        | PendingResponseMessage::SseStart { .. }
-                        | PendingResponseMessage::BinaryStart { .. }
-                        | PendingResponseMessage::NativeBinaryStart { .. }
-                        | PendingResponseMessage::WebSocketAccept { .. } => break,
-                    }
-                }
-            };
-
             response_body_with_headers(
                 StatusCode::from_u16(status).unwrap_or(StatusCode::OK),
                 &content_type,
                 &headers,
-                Body::from_stream(stream),
+                dart_stream_body(response_rx, lifetime),
             )
         }
         Some(PendingResponseMessage::NativeBinaryStart {
@@ -3207,7 +3311,7 @@ async fn handle_http_request(
             "text/plain; charset=utf-8",
             "Request handling failed".to_string(),
         ),
-        Some(PendingResponseMessage::BinaryChunk { .. }) => response(
+        Some(PendingResponseMessage::BinaryChunk(_)) => response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "text/plain; charset=utf-8",
             "Unexpected binary chunk before binary stream start".to_string(),
@@ -3795,7 +3899,6 @@ fn dispatch_request_to_dart(
             request: Some(transport_request),
             response_tx,
             runtime_state: runtime_state.clone(),
-            binary_chunk: None,
         },
     );
 
@@ -5908,11 +6011,8 @@ mod tests {
     #[test]
     fn transport_events_pack_kind_and_signed_id_into_one_integer() {
         for id in [1_i64, 42, -42, (1 << 57) - 1, -(1 << 57)] {
-            let packed = encode_transport_event(TransportEventKind::BinaryStreamChunkCompleted, id);
-            assert_eq!(
-                packed & 0x1f,
-                TransportEventKind::BinaryStreamChunkCompleted as i64
-            );
+            let packed = encode_transport_event(TransportEventKind::BinaryStreamCredit, id);
+            assert_eq!(packed & 0x1f, TransportEventKind::BinaryStreamCredit as i64);
             assert_eq!(packed >> TRANSPORT_EVENT_KIND_BITS, id);
         }
     }
@@ -5940,7 +6040,6 @@ mod tests {
                     request: None,
                     response_tx,
                     runtime_state: test_runtime_state(),
-                    binary_chunk: None,
                 },
             );
         }
@@ -6271,65 +6370,147 @@ mod tests {
         WEB_SOCKET_SESSIONS.lock().unwrap().remove(&session_id);
     }
 
+    fn test_window(
+        max_chunks: i64,
+        max_bytes: i64,
+    ) -> (
+        Arc<DartStreamWindow>,
+        mpsc::UnboundedReceiver<PendingResponseMessage>,
+    ) {
+        let (response_tx, response_rx) = mpsc::unbounded_channel();
+        let window = Arc::new(DartStreamWindow::new(
+            NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed),
+            response_tx,
+            Arc::new(ServerEvents::new(0)),
+            max_chunks,
+            max_bytes,
+        ));
+        (window, response_rx)
+    }
+
+    fn take_chunk(receiver: &mut mpsc::UnboundedReceiver<PendingResponseMessage>) -> Bytes {
+        match receiver.try_recv() {
+            Ok(PendingResponseMessage::BinaryChunk(bytes)) => bytes,
+            _ => panic!("expected a chunk"),
+        }
+    }
+
     #[test]
-    fn binary_chunks_return_before_consumption_and_bound_in_flight_bytes() {
-        let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
-        let (response_tx, mut response_rx) = mpsc::unbounded_channel();
-        PENDING_REQUESTS.insert(
-            request_id,
-            PendingRequest {
-                server_id: 0,
-                request: None,
-                response_tx,
+    fn dart_stream_writes_ahead_until_the_window_fills() {
+        let (window, mut receiver) = test_window(4, 1024);
+        for _ in 0..3 {
+            assert_eq!(
+                window.write(Bytes::from_static(b"abc")),
+                DART_STREAM_WRITE_ACCEPTED
+            );
+        }
+        assert_eq!(
+            window.write(Bytes::from_static(b"abc")),
+            DART_STREAM_WRITE_WINDOW_FULL
+        );
+        assert!(window.writer_waiting.load(Ordering::SeqCst));
+        // One pulled chunk leaves three queued: above the low watermark, so the
+        // writer keeps waiting. The second pull reaches it and grants credit.
+        window.consumed(take_chunk(&mut receiver).len());
+        assert!(window.writer_waiting.load(Ordering::SeqCst));
+        window.consumed(take_chunk(&mut receiver).len());
+        assert!(!window.writer_waiting.load(Ordering::SeqCst));
+        assert_eq!(window.queued_chunks.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            window.write(Bytes::from_static(b"abc")),
+            DART_STREAM_WRITE_ACCEPTED
+        );
+    }
+
+    #[test]
+    fn dart_stream_bounds_queued_bytes() {
+        let (window, mut receiver) = test_window(64, 8);
+        assert_eq!(
+            window.write(Bytes::from_static(b"1234")),
+            DART_STREAM_WRITE_ACCEPTED
+        );
+        assert_eq!(
+            window.write(Bytes::from_static(b"5678")),
+            DART_STREAM_WRITE_WINDOW_FULL
+        );
+        // Draining to half the byte budget grants the credit exactly once.
+        window.consumed(take_chunk(&mut receiver).len());
+        assert!(!window.writer_waiting.load(Ordering::SeqCst));
+        assert_eq!(window.queued_bytes.load(Ordering::SeqCst), 4);
+        window.consumed(take_chunk(&mut receiver).len());
+        assert_eq!(window.queued_bytes.load(Ordering::SeqCst), 0);
+        assert_eq!(window.queued_chunks.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn dart_stream_handles_reject_oversized_and_closed_writes() {
+        let (window, mut receiver) = test_window(16, 1 << 20);
+        let handle = Arc::into_raw(Arc::clone(&window)).cast_mut().cast();
+        let bytes = vec![42; MAX_BINARY_STREAM_CHUNK_BYTES + 1];
+        assert_eq!(
+            dart_http_server_runtime_dart_stream_write(
+                handle,
+                bytes.as_ptr(),
+                bytes.len() as isize
+            ),
+            DART_STREAM_WRITE_REJECTED
+        );
+        assert_eq!(
+            dart_http_server_runtime_dart_stream_write(
+                handle,
+                bytes.as_ptr(),
+                MAX_BINARY_STREAM_CHUNK_BYTES as isize
+            ),
+            DART_STREAM_WRITE_ACCEPTED
+        );
+        assert_eq!(
+            take_chunk(&mut receiver),
+            bytes[..MAX_BINARY_STREAM_CHUNK_BYTES]
+        );
+        assert!(dart_http_server_runtime_dart_stream_finish(handle));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(PendingResponseMessage::Close)
+        ));
+        assert_eq!(
+            window.write(Bytes::from_static(b"late")),
+            DART_STREAM_WRITE_REJECTED
+        );
+        assert!(!window.aborted.load(Ordering::Acquire));
+        assert_eq!(Arc::strong_count(&window), 1);
+    }
+
+    #[tokio::test]
+    async fn aborted_dart_streams_drop_unsent_chunks() {
+        let (window, response_rx) = test_window(16, 1 << 20);
+        let request_id = window.request_id;
+        let handle = Arc::into_raw(Arc::clone(&window)).cast_mut().cast();
+        assert_eq!(
+            window.write(Bytes::from_static(b"sent")),
+            DART_STREAM_WRITE_ACCEPTED
+        );
+        let body = dart_stream_body(
+            response_rx,
+            BinaryResponseLifetime {
+                request_id,
                 runtime_state: test_runtime_state(),
-                binary_chunk: None,
+                window: Arc::clone(&window),
             },
         );
-        let bytes = vec![42; MAX_BINARY_STREAM_CHUNK_BYTES + 1];
-        let chunk = NativeBytes {
-            ptr: bytes.as_ptr(),
-            len: MAX_BINARY_STREAM_CHUNK_BYTES as isize,
-        };
-        let oversized = NativeBytes {
-            ptr: bytes.as_ptr(),
-            len: bytes.len() as isize,
-        };
+        let mut frames = body.into_data_stream();
         assert_eq!(
-            dart_http_server_runtime_start_binary_stream_chunk(request_id, oversized),
-            0
+            frames.next().await.unwrap().unwrap(),
+            Bytes::from_static(b"sent")
         );
-        let operation = dart_http_server_runtime_start_binary_stream_chunk(request_id, chunk);
-        assert!(operation > 0);
+        assert_eq!(window.queued_chunks.load(Ordering::SeqCst), 0);
         assert_eq!(
-            dart_http_server_runtime_start_binary_stream_chunk(request_id, chunk),
-            0
+            window.write(Bytes::from_static(b"dropped")),
+            DART_STREAM_WRITE_ACCEPTED
         );
-        let PendingResponseMessage::BinaryChunk {
-            bytes: received,
-            completion,
-        } = response_rx.try_recv().unwrap()
-        else {
-            panic!("expected chunk")
-        };
-        assert_eq!(received, bytes[..MAX_BINARY_STREAM_CHUNK_BYTES]);
-        assert!(!completion.0.completed.load(Ordering::Acquire));
-        completion.0.complete(true);
-        drop(completion);
-        // Consumption permits exactly one more chunk. Cancellation also finishes
-        // its acknowledgement, even while the HTTP body has not polled it.
-        assert!(dart_http_server_runtime_start_binary_stream_chunk(request_id, chunk) > 0);
-        let PendingResponseMessage::BinaryChunk { completion, .. } =
-            response_rx.try_recv().unwrap()
-        else {
-            panic!("expected chunk")
-        };
-        cancel_binary_response(request_id);
-        assert!(completion.0.completed.load(Ordering::Acquire));
-        drop(completion);
-        assert_eq!(
-            dart_http_server_runtime_start_binary_stream_chunk(request_id, chunk),
-            0
-        );
+        dart_http_server_runtime_dart_stream_abort(handle);
+        assert!(frames.next().await.is_none());
+        drop(frames);
+        assert!(window.closed.load(Ordering::Acquire));
     }
 
     struct TestStreamContext {

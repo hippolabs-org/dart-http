@@ -9,9 +9,6 @@ library;
 
 import 'dart:ffi' as ffi;
 
-@ffi.Native<ffi.Void Function(ffi.Int64)>()
-external void dart_http_server_runtime_abort_binary_stream_response(int request_id);
-
 @ffi.Native<ffi.Bool Function(ffi.Int64, ffi.IntPtr, ffi.Pointer<NativePair>)>()
 external bool dart_http_server_runtime_accept_web_socket(
   int request_id,
@@ -32,11 +29,20 @@ external bool dart_http_server_runtime_copy_native_bytes(
   ffi.Pointer<ffi.Void> out_buffer,
 );
 
-@ffi.Native<ffi.Bool Function(ffi.Int64)>()
-external bool dart_http_server_runtime_finish_binary_stream_response(int request_id);
+@ffi.Native<ffi.Void Function(ffi.Pointer<ffi.Void>)>()
+external void dart_http_server_runtime_dart_stream_abort(ffi.Pointer<ffi.Void> stream);
 
-@ffi.Native<ffi.Bool Function(ffi.Int64)>()
-external bool dart_http_server_runtime_finish_sse_response(int request_id);
+@ffi.Native<ffi.Bool Function(ffi.Pointer<ffi.Void>)>()
+external bool dart_http_server_runtime_dart_stream_finish(ffi.Pointer<ffi.Void> stream);
+
+@ffi.Native<ffi.Int32 Function(ffi.Pointer<ffi.Void>, ffi.Pointer<ffi.Uint8>, ffi.IntPtr)>(
+  isLeaf: true,
+)
+external int dart_http_server_runtime_dart_stream_write(
+  ffi.Pointer<ffi.Void> stream,
+  ffi.Pointer<ffi.Uint8> chunk,
+  int chunk_length,
+);
 
 @ffi.Native<ffi.Void Function(ffi.Pointer<NativeMultipartForm>)>(isLeaf: true)
 external void dart_http_server_runtime_free_multipart_form(ffi.Pointer<NativeMultipartForm> value);
@@ -133,26 +139,27 @@ external bool dart_http_server_runtime_send_response(
   ffi.Pointer<NativePair> headers,
 );
 
-@ffi.Native<ffi.Int64 Function(ffi.Int64, NativeBytes)>()
-external int dart_http_server_runtime_start_binary_stream_chunk(int request_id, NativeBytes chunk);
-
 @ffi.Native<
-  ffi.Bool Function(
+  ffi.Pointer<ffi.Void> Function(
     ffi.Int64,
     ffi.Int32,
     ffi.Pointer<ffi.Char>,
     ffi.Int64,
     ffi.IntPtr,
     ffi.Pointer<NativePair>,
+    ffi.Int64,
+    ffi.Int64,
   )
 >()
-external bool dart_http_server_runtime_start_binary_stream_response(
+external ffi.Pointer<ffi.Void> dart_http_server_runtime_start_binary_stream_response(
   int request_id,
   int status,
   ffi.Pointer<ffi.Char> content_type,
   int content_length,
   int header_count,
   ffi.Pointer<NativePair> headers,
+  int window_chunks,
+  int window_bytes,
 );
 
 @ffi.Native<
@@ -205,12 +212,23 @@ external int dart_http_server_runtime_start_server(
   int event_port,
 );
 
-@ffi.Native<ffi.Bool Function(ffi.Int64, ffi.Int32, ffi.IntPtr, ffi.Pointer<NativePair>)>()
-external bool dart_http_server_runtime_start_sse_response(
+@ffi.Native<
+  ffi.Pointer<ffi.Void> Function(
+    ffi.Int64,
+    ffi.Int32,
+    ffi.IntPtr,
+    ffi.Pointer<NativePair>,
+    ffi.Int64,
+    ffi.Int64,
+  )
+>()
+external ffi.Pointer<ffi.Void> dart_http_server_runtime_start_sse_response(
   int request_id,
   int status,
   int header_count,
   ffi.Pointer<NativePair> headers,
+  int window_chunks,
+  int window_bytes,
 );
 
 @ffi.Native<ffi.Void Function()>()

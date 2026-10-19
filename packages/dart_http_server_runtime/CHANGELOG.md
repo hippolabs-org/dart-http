@@ -1,5 +1,19 @@
 ## Unreleased
 
+- Dart-produced binary stream and SSE bodies are credit windowed instead of
+  stop-and-wait with one 64 KiB chunk in flight: up to
+  `listen(streamWindowChunks: 16, streamWindowBytes: 1 MiB)` (configurable)
+  may be queued natively ahead of the client, chunks are up to 256 KiB, and
+  Dart is woken by one credit event per half window instead of one
+  acknowledgement per chunk. Backpressure, the stall timeout (now applied
+  while waiting for credit) and disconnect cancellation are unchanged; an
+  aborted stream drops queued chunks. Each chunk is copied into Rust once via
+  a leaf call. **Breaking (FFI facade):** `DartHttpNative.startSseResponse`
+  and `startBinaryStreamResponse` return a `NativeResponseStream` (`write`,
+  `finish`, `abort`) instead of `bool`; `startBinaryStreamChunk`,
+  `finishSseResponse`, `finishBinaryStreamResponse` and
+  `abortBinaryStreamResponse` (and their native exports) are removed, and
+  transport event 13 now means "stream credit" with the request id.
 - Buffered response bodies are copied from Dart into Rust exactly once:
   `DartHttpNative.tryRespond` passes the `Uint8List`'s address to a leaf
   `dart_http_server_runtime_send_response(…, body, body_length, …)` that

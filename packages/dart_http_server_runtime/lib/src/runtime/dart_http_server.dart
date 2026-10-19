@@ -38,11 +38,10 @@ const _transportEventWebTransportPersistentStreamOpened = 9;
 const _transportEventWebTransportStreamChunkReady = 10;
 const _transportEventWebTransportStreamFinished = 11;
 const _transportEventWebTransportOperationReady = 12;
-const _transportEventBinaryStreamChunkCompleted = 13;
+const _transportEventBinaryStreamCredit = 13;
 const _transportEventBinaryStreamClosed = 14;
 const _transportEventWebSocketWriteCompleted = 15;
 const _transportEventHandshakeAbandoned = 16;
-const _binaryStreamChunkSize = 64 * 1024;
 
 /// Main application object for a Dart HTTP server.
 ///
@@ -76,7 +75,8 @@ class DartHttp<TServices> extends Router<TServices> {
   DartHttpCodecRegistry _codecRegistry;
   _RustTransportSession? _session;
   Duration _streamStallTimeout = const Duration(minutes: 1);
-  final Map<int, Completer<bool>> _pendingBinaryChunks = {};
+  int _streamWindowChunks = NativeResponseStream.defaultWindowChunks;
+  int _streamWindowBytes = NativeResponseStream.defaultWindowBytes;
   final Map<int, Completer<bool>> _pendingWebSocketWrites = {};
   Duration _webSocketWriteStallTimeout = const Duration(seconds: 30);
   final Map<int, _BinaryResponseProgress> _activeBinaryResponses = {};
@@ -138,6 +138,11 @@ class DartHttp<TServices> extends Router<TServices> {
   /// responses receive HTTP 503. Dart handlers still share their isolate.
   /// Binary transfers are canceled after [streamStallTimeout] without progress
   /// from either their source or the HTTP transport.
+  ///
+  /// Dart-produced [BinaryStreamResponse] and SSE bodies keep up to
+  /// [streamWindowChunks] chunks (of at most 256 KiB) and [streamWindowBytes]
+  /// bytes queued natively ahead of the client, so the producer is not paced
+  /// by a round trip per chunk; a full window applies backpressure.
   Future<DartHttpServer> listen({
     String host = '127.0.0.1',
     required int port,
@@ -147,7 +152,10 @@ class DartHttp<TServices> extends Router<TServices> {
     int webSocketMaxPendingMessages = 32,
     int webSocketMaxPendingBytes = 8 * 1024 * 1024,
     Duration webSocketWriteStallTimeout = const Duration(seconds: 30),
+    int streamWindowChunks = NativeResponseStream.defaultWindowChunks,
+    int streamWindowBytes = NativeResponseStream.defaultWindowBytes,
   }) async {
+    NativeResponseStream.checkWindow(streamWindowChunks, streamWindowBytes);
     final normalizedHost = host.trim();
     if (normalizedHost.isEmpty) {
       throw ArgumentError.value(host, 'host', 'Must not be empty.');
@@ -193,6 +201,8 @@ class DartHttp<TServices> extends Router<TServices> {
 
     final compiledRoutes = _compileRoutes();
     _streamStallTimeout = streamStallTimeout;
+    _streamWindowChunks = streamWindowChunks;
+    _streamWindowBytes = streamWindowBytes;
 
     final session = await _RustTransportSession.start(
       host: normalizedHost,
@@ -223,10 +233,6 @@ class DartHttp<TServices> extends Router<TServices> {
         for (final response in _activeBinaryResponses.values) {
           response.close();
         }
-        for (final chunk in _pendingBinaryChunks.values) {
-          if (!chunk.isCompleted) chunk.complete(false);
-        }
-        _pendingBinaryChunks.clear();
         for (final write in _pendingWebSocketWrites.values) {
           if (!write.isCompleted) write.complete(false);
         }
@@ -262,8 +268,8 @@ class DartHttp<TServices> extends Router<TServices> {
       case _transportEventWebSocketWriteCompleted:
         _pendingWebSocketWrites.remove(eventId.abs())?.complete(eventId > 0);
         return;
-      case _transportEventBinaryStreamChunkCompleted:
-        _pendingBinaryChunks.remove(eventId.abs())?.complete(eventId > 0);
+      case _transportEventBinaryStreamCredit:
+        _activeBinaryResponses[eventId]?.grantCredit();
         return;
       case _transportEventBinaryStreamClosed:
         _activeBinaryResponses[eventId]?.close();
@@ -1065,55 +1071,37 @@ class DartHttp<TServices> extends Router<TServices> {
   }
 
   Future<void> _streamBinaryResponse(int requestId, BinaryStreamResponse response) async {
-    var started = false;
     var finished = false;
     final progress = _BinaryResponseProgress();
     _activeBinaryResponses[requestId] = progress;
     final iterator = StreamIterator(response.body);
+    NativeResponseStream? stream;
     try {
-      started = DartHttpNative.startBinaryStreamResponse(
+      stream = DartHttpNative.startBinaryStreamResponse(
         requestId,
         status: response.status,
         contentType: response.contentType,
         contentLength: response.contentLength,
         headers: response.headers,
+        windowChunks: _streamWindowChunks,
+        windowBytes: _streamWindowBytes,
       );
-      if (!started) {
+      if (stream == null) {
         return;
       }
 
       while (await progress.waitFor(iterator.moveNext(), _streamStallTimeout)) {
         if (progress.closed) break;
-        final chunk = iterator.current;
-        for (var offset = 0; offset < chunk.length; offset += _binaryStreamChunkSize) {
-          final end = (offset + _binaryStreamChunkSize).clamp(0, chunk.length);
-          final part = offset == 0 && end == chunk.length
-              ? chunk
-              : chunk is Uint8List
-              ? Uint8List.sublistView(chunk, offset, end)
-              : chunk.sublist(offset, end);
-          final operationId = DartHttpNative.startBinaryStreamChunk(requestId, part);
-          if (operationId <= 0) return;
-          final completion = Completer<bool>();
-          _pendingBinaryChunks[operationId] = completion;
-          try {
-            final consumed = await progress.waitFor(completion.future, _streamStallTimeout);
-            if (!consumed) return;
-          } finally {
-            _pendingBinaryChunks.remove(operationId);
-          }
-        }
+        if (!await _writeStreamChunk(stream, progress, iterator.current)) return;
       }
       finished = !progress.closed;
     } finally {
       _activeBinaryResponses.remove(requestId);
       try {
-        if (started) {
-          if (finished) {
-            DartHttpNative.finishBinaryStreamResponse(requestId);
-          } else {
-            DartHttpNative.abortBinaryStreamResponse(requestId);
-          }
+        if (finished) {
+          stream?.finish();
+        } else {
+          stream?.abort();
         }
       } finally {
         try {
@@ -1125,55 +1113,70 @@ class DartHttp<TServices> extends Router<TServices> {
     }
   }
 
+  /// Writes one producer chunk, split at [NativeResponseStream.maxChunkBytes].
+  ///
+  /// Each piece is copied into native memory once and the producer continues
+  /// immediately while the credit window has room; a full window waits (up to
+  /// the stall timeout) for the client to drain half of it. Returns `false`
+  /// once the stream no longer accepts data.
+  Future<bool> _writeStreamChunk(
+    NativeResponseStream stream,
+    _BinaryResponseProgress progress,
+    List<int> chunk,
+  ) async {
+    final bytes = chunk is Uint8List ? chunk : Uint8List.fromList(chunk);
+    const pieceSize = NativeResponseStream.maxChunkBytes;
+    for (var offset = 0; offset < bytes.length; offset += pieceSize) {
+      final end = offset + pieceSize < bytes.length ? offset + pieceSize : bytes.length;
+      final piece = offset == 0 && end == bytes.length
+          ? bytes
+          : Uint8List.sublistView(bytes, offset, end);
+      switch (stream.write(piece)) {
+        case NativeResponseStreamWrite.rejected:
+          return false;
+        case NativeResponseStreamWrite.accepted:
+          break;
+        case NativeResponseStreamWrite.windowFull:
+          if (!await progress.waitFor(progress.nextCredit(), _streamStallTimeout)) return false;
+      }
+    }
+    return true;
+  }
+
   Future<void> _streamSseResponse(int requestId, SseResponse response) async {
-    // SSE reuses the binary stream mechanism: each encoded event is sent as an
-    // acknowledged chunk (backpressure), and the native closed event cancels
-    // the event subscription when the client disconnects.
+    // SSE reuses the credit-windowed stream: encoded events are queued ahead
+    // of the client up to the window (backpressure beyond it), and the native
+    // closed event cancels the event subscription when the client disconnects.
     final progress = _BinaryResponseProgress();
     _activeBinaryResponses[requestId] = progress;
     final iterator = StreamIterator(response.events);
     var finished = false;
-    var started = false;
+    NativeResponseStream? stream;
     try {
-      started = DartHttpNative.startSseResponse(
+      stream = DartHttpNative.startSseResponse(
         requestId,
         status: response.status,
         headers: _defaultSseHeaders(response.headers),
+        windowChunks: _streamWindowChunks,
+        windowBytes: _streamWindowBytes,
       );
-      if (!started) return;
+      if (stream == null) return;
 
       // Idle SSE streams are normal, so waiting for the next event has no
-      // stall timeout; only an unread chunk does.
+      // stall timeout; only a full window the client does not drain does.
       while (await progress.waitFor(iterator.moveNext(), null)) {
         if (progress.closed) break;
         final bytes = utf8.encode(iterator.current.encode());
-        for (var offset = 0; offset < bytes.length; offset += _binaryStreamChunkSize) {
-          final end = (offset + _binaryStreamChunkSize).clamp(0, bytes.length);
-          final part = offset == 0 && end == bytes.length
-              ? bytes
-              : Uint8List.sublistView(bytes, offset, end);
-          final operationId = DartHttpNative.startBinaryStreamChunk(requestId, part);
-          if (operationId <= 0) return;
-          final completion = Completer<bool>();
-          _pendingBinaryChunks[operationId] = completion;
-          try {
-            final consumed = await progress.waitFor(completion.future, _streamStallTimeout);
-            if (!consumed) return;
-          } finally {
-            _pendingBinaryChunks.remove(operationId);
-          }
-        }
+        if (!await _writeStreamChunk(stream, progress, bytes)) return;
       }
       finished = !progress.closed;
     } finally {
       _activeBinaryResponses.remove(requestId);
       try {
-        if (started) {
-          if (finished) {
-            DartHttpNative.finishSseResponse(requestId);
-          } else {
-            DartHttpNative.abortBinaryStreamResponse(requestId);
-          }
+        if (finished) {
+          stream?.finish();
+        } else {
+          stream?.abort();
         }
       } finally {
         await iterator.cancel();
@@ -1365,6 +1368,16 @@ WebSocketMessage _decodeWebSocketMessage(NativeWebSocketMessage message) {
 final class _BinaryResponseProgress {
   bool closed = false;
   Completer<bool>? _waiting;
+  Completer<bool>? _credit;
+
+  /// Completes with `true` at the stream's next credit event.
+  Future<bool> nextCredit() => (_credit = Completer<bool>()).future;
+
+  void grantCredit() {
+    final credit = _credit;
+    _credit = null;
+    if (credit != null && !credit.isCompleted) credit.complete(true);
+  }
 
   void close() {
     closed = true;

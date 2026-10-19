@@ -156,31 +156,41 @@ bool dart_http_server_runtime_accept_web_transport(
     intptr_t header_count,
     const NativePair* headers);
 
-bool dart_http_server_runtime_start_sse_response(
+/* Dart-produced streaming bodies (SSE and binary) are credit windowed: the
+ * start functions return an owned stream handle (null when the request is
+ * gone) that admits up to window_chunks chunks / window_bytes bytes not yet
+ * pulled by the HTTP body. Release it with exactly one of finish or abort. */
+void* dart_http_server_runtime_start_sse_response(
     int64_t request_id,
     int32_t status,
     intptr_t header_count,
-    const NativePair* headers);
+    const NativePair* headers,
+    int64_t window_chunks,
+    int64_t window_bytes);
 
-bool dart_http_server_runtime_finish_sse_response(int64_t request_id);
-
-bool dart_http_server_runtime_start_binary_stream_response(
+void* dart_http_server_runtime_start_binary_stream_response(
     int64_t request_id,
     int32_t status,
     const char* content_type,
     int64_t content_length,
     intptr_t header_count,
-    const NativePair* headers);
+    const NativePair* headers,
+    int64_t window_chunks,
+    int64_t window_bytes);
 
-/** Starts one bounded chunk; signed completion IDs arrive as transport event 13. */
-int64_t dart_http_server_runtime_start_binary_stream_chunk(
-    int64_t request_id,
-    NativeBytes chunk);
+/* Leaf call: copies one chunk of at most 256 KiB once. Returns 1 when
+ * accepted, 2 when accepted but the window is full (wait for transport event
+ * 13 with the request id), 0 when the stream no longer accepts data. */
+int32_t dart_http_server_runtime_dart_stream_write(
+    void* stream,
+    const uint8_t* chunk,
+    intptr_t chunk_length);
 
-void dart_http_server_runtime_abort_binary_stream_response(int64_t request_id);
+/* Sends every written chunk, ends the body and releases the handle. */
+bool dart_http_server_runtime_dart_stream_finish(void* stream);
 
-bool dart_http_server_runtime_finish_binary_stream_response(
-    int64_t request_id);
+/* Drops unsent chunks, ends the body and releases the handle. */
+void dart_http_server_runtime_dart_stream_abort(void* stream);
 
 bool dart_http_server_runtime_start_native_binary_stream_response(
     int64_t request_id,

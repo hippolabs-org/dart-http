@@ -9,6 +9,7 @@ functions:
     - dart_http_server_runtime_.*
   leaf:
     include:
+      - dart_http_server_runtime_dart_stream_write
       - dart_http_server_runtime_free_multipart_form
       - dart_http_server_runtime_free_request
       - dart_http_server_runtime_free_string
