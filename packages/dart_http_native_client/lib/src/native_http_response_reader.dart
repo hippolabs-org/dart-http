@@ -9,7 +9,11 @@ const _directReadCanceled = 3;
 /// Demand-driven bridge from a Tokio response body to Native Exchange leases.
 final class _NativeHttpResponseReader {
   _NativeHttpResponseReader._(this._transport, this._readerId, this._reader) {
-    _resources = _NativeHttpResponseReaderResources(_reader);
+    _resources = _NativeHttpResponseReaderResources(
+      _reader,
+      _readerId,
+      _transport._responseReaders,
+    );
     _nativeHttpResponseReaderFinalizer.attach(this, _resources, detach: this);
   }
 
@@ -43,6 +47,7 @@ final class _NativeHttpResponseReader {
   Stream<NativeBufferLease> leases() async* {
     if (_consumed) throw StateError('Native HTTP response stream has already been consumed.');
     _consumed = true;
+    _transport._responseReaders[_readerId]?.active = this;
     try {
       while (!_closing) {
         final lease = await _readLease();
@@ -137,21 +142,26 @@ final class _NativeHttpResponseReader {
     _closing = true;
     native.dart_http_native_client_response_reader_cancel(_reader);
     await _pendingCompletion?.future;
-    _transport._responseReaders.remove(_readerId);
     _nativeHttpResponseReaderFinalizer.detach(this);
     _resources.release();
   }
 }
 
 final class _NativeHttpResponseReaderResources {
-  _NativeHttpResponseReaderResources(this.reader);
+  _NativeHttpResponseReaderResources(this.reader, this.readerId, this.registry);
 
   final Pointer<Void> reader;
+  final int readerId;
+
+  /// The owning transport's reader table; holding the map rather than the
+  /// transport keeps a finalizable reader from pinning its transport.
+  final Map<int, _NativeHttpResponseReaderEntry> registry;
   var _released = false;
 
   void release() {
     if (_released) return;
     _released = true;
+    if (registry[readerId]?.resources == this) registry.remove(readerId);
     native.dart_http_native_client_response_reader_release(reader);
   }
 }

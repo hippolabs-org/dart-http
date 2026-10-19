@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:convert';
 import 'dart:ffi';
 import 'dart:isolate';
@@ -125,8 +126,21 @@ final class NativeHttpClientTransport
   late final StreamSubscription<Object?> _subscription;
   final Map<int, Completer<_NativeResponseData>> _pending = {};
   final Map<int, NativeHttpWebSocket> _webSockets = {};
-  final Map<int, _NativeHttpResponseReader> _responseReaders = {};
+  final Map<int, _NativeHttpResponseReaderEntry> _responseReaders = {};
   var _closed = false;
+
+  /// Number of streamed response bodies whose native reader is still open.
+  ///
+  /// Exposed for leak tests only.
+  int get debugOpenResponseReaderCount => _responseReaders.length;
+
+  /// Number of streamed response bodies the transport keeps reachable. Only
+  /// bodies that are being read are held strongly; an unlistened body can be
+  /// garbage collected and its native reader finalized.
+  ///
+  /// Exposed for leak tests only.
+  int get debugStronglyHeldResponseReaderCount =>
+      _responseReaders.values.where((entry) => entry.active != null).length;
 
   /// Sends a request while preserving the response body as Native Exchange.
   Future<NativeHttpResponse> sendNative(DartHttpClientRequest request) async {
@@ -164,7 +178,6 @@ final class NativeHttpClientTransport
   }) async {
     _ensureOpen();
     final prepared = _prepareRequest(request);
-    final progressPort = request.onUploadProgress == null ? null : ReceivePort();
     final progressDone = Completer<void>();
     var lastProgress = -1;
     final totalBytes =
@@ -172,42 +185,57 @@ final class NativeHttpClientTransport
         prepared.nativeBody?.contentLength ??
         prepared.nativeBuffer?.length ??
         prepared.bytes?.length;
-    final progressSubscription = progressPort?.listen((message) {
-      if (message is! int) return;
-      if (message == -1) {
-        if (!progressDone.isCompleted) progressDone.complete();
-      } else if (message > lastProgress) {
-        lastProgress = message;
-        request.onUploadProgress!(
-          DartHttpClientUploadProgress(
-            bytes: message,
-            totalBytes: totalBytes,
-            measurement: DartHttpClientUploadMeasurement.transportConsumed,
-          ),
-        );
-      }
-    });
-    final method = request.method.wireName.toNativeUtf8();
-    final url = request.uri.toString().toNativeUtf8();
-    final headers = calloc<native.NativeHttpHeader>(request.headers.length);
-    final headerStrings = <Pointer<Utf8>>[];
     final bytes = prepared.bytes;
-    final bodyPointer = bytes == null ? nullptr : calloc<Uint8>(bytes.length);
     final nativePrefix = prepared.nativeBody?.prefix;
     final nativeSuffix = prepared.nativeBody?.suffix;
-    final prefixPointer = nativePrefix == null || nativePrefix.isEmpty
-        ? nullptr
-        : calloc<Uint8>(nativePrefix.length);
-    final suffixPointer = nativeSuffix == null || nativeSuffix.isEmpty
-        ? nullptr
-        : calloc<Uint8>(nativeSuffix.length);
+    // Everything below is released in the finally block, so a failure while
+    // setting the request up cannot leak a port or native memory.
+    ReceivePort? progressPort;
+    StreamSubscription<Object?>? progressSubscription;
+    Pointer<Utf8> method = nullptr;
+    Pointer<Utf8> url = nullptr;
+    Pointer<native.NativeHttpHeader> headers = nullptr;
+    final headerStrings = <Pointer<Utf8>>[];
+    Pointer<Uint8> bodyPointer = nullptr;
+    Pointer<Uint8> prefixPointer = nullptr;
+    Pointer<Uint8> suffixPointer = nullptr;
     NativeByteStreamTransfer? nativeTransfer;
     NativeBufferTransfer? nativeBufferTransfer;
-    final upload = prepared.bodyStream == null ? null : _NativeRequestBodyUpload.open(_clientId);
-    final uploadIterator = prepared.bodyStream == null
-        ? null
-        : StreamIterator<List<int>>(prepared.bodyStream!);
+    _NativeRequestBodyUpload? upload;
+    StreamIterator<List<int>>? uploadIterator;
     try {
+      if (request.onUploadProgress case final onUploadProgress?) {
+        progressPort = ReceivePort();
+        progressSubscription = progressPort.listen((message) {
+          if (message is! int) return;
+          if (message == -1) {
+            if (!progressDone.isCompleted) progressDone.complete();
+          } else if (message > lastProgress) {
+            lastProgress = message;
+            onUploadProgress(
+              DartHttpClientUploadProgress(
+                bytes: message,
+                totalBytes: totalBytes,
+                measurement: DartHttpClientUploadMeasurement.transportConsumed,
+              ),
+            );
+          }
+        });
+      }
+      method = request.method.wireName.toNativeUtf8();
+      url = request.uri.toString().toNativeUtf8();
+      headers = calloc<native.NativeHttpHeader>(request.headers.length);
+      if (bytes != null) bodyPointer = calloc<Uint8>(bytes.length);
+      if (nativePrefix != null && nativePrefix.isNotEmpty) {
+        prefixPointer = calloc<Uint8>(nativePrefix.length);
+      }
+      if (nativeSuffix != null && nativeSuffix.isNotEmpty) {
+        suffixPointer = calloc<Uint8>(nativeSuffix.length);
+      }
+      if (prepared.bodyStream case final bodyStream?) {
+        upload = _NativeRequestBodyUpload.open(_clientId);
+        uploadIterator = StreamIterator<List<int>>(bodyStream);
+      }
       var index = 0;
       for (final entry in request.headers.entries) {
         final name = entry.key.toNativeUtf8();
@@ -272,9 +300,10 @@ final class NativeHttpClientTransport
           : _pumpRequestBody(uploadIterator!, upload, expectedLength: prepared.bodyStreamLength);
       final abortTrigger = request.abortTrigger;
       if (abortTrigger != null) {
+        final abortedUpload = upload;
         unawaited(
           abortTrigger.then<void>((_) {
-            unawaited(upload?.close());
+            unawaited(abortedUpload?.close());
             if (_pending.containsKey(requestId)) {
               native.dart_http_native_client_cancel(_clientId, requestId);
             }
@@ -283,11 +312,7 @@ final class NativeHttpClientTransport
       }
       late final _NativeResponseData response;
       try {
-        final completed = await Future.wait<Object?>(<Future<Object?>>[
-          responseFuture,
-          uploadFuture,
-        ], eagerError: true);
-        response = completed.first! as _NativeResponseData;
+        response = await _awaitResponseAndUpload(responseFuture, uploadFuture);
         if (progressPort != null) await progressDone.future;
       } on Object {
         native.dart_http_native_client_cancel(_clientId, requestId);
@@ -296,8 +321,13 @@ final class NativeHttpClientTransport
         rethrow;
       }
       if (abortTrigger != null) {
+        // Weak, so an abort trigger that never fires does not keep an
+        // unlistened response body (and its native reader) alive.
+        final abortedResponse = WeakReference(response);
         unawaited(
           abortTrigger.then<void>((_) {
+            final response = abortedResponse.target;
+            if (response == null) return;
             response.body?.close();
             unawaited(
               response.bodyReader?.abort(
@@ -316,10 +346,9 @@ final class NativeHttpClientTransport
       progressPort?.close();
       await uploadIterator?.cancel();
       await upload?.close();
-      calloc
-        ..free(method)
-        ..free(url)
-        ..free(headers);
+      if (method != nullptr) calloc.free(method);
+      if (url != nullptr) calloc.free(url);
+      if (headers != nullptr) calloc.free(headers);
       for (final value in headerStrings) {
         calloc.free(value);
       }
@@ -385,8 +414,13 @@ final class NativeHttpClientTransport
       socket._transportClosed();
     }
     _webSockets.clear();
-    for (final reader in _responseReaders.values.toList()) {
-      reader._transportClosed();
+    for (final entry in _responseReaders.values.toList()) {
+      final reader = entry.active ?? entry.reader.target;
+      if (reader != null) {
+        reader._transportClosed();
+      } else {
+        entry.resources.release();
+      }
     }
     _responseReaders.clear();
     native.dart_http_native_client_close(_clientId);
@@ -434,15 +468,19 @@ final class NativeHttpClientTransport
       final kind = notification & 7;
       final resourceId = notification >> 3;
       if (kind == _responseReaderEventReady) {
-        _responseReaders[resourceId]?._handleNotification();
+        _responseReaders[resourceId]?.active?._handleNotification();
       } else {
         _webSockets[resourceId]?._handleNotification(kind);
       }
       return;
     }
     final completer = _pending.remove(message);
-    if (completer == null) return;
     final result = native.dart_http_native_client_take_result(_clientId, message);
+    if (completer == null) {
+      // Nobody waits for this request any more; release what it produced.
+      _discardOrphanedResult(result);
+      return;
+    }
     if (result == nullptr) {
       completer.completeError(
         const NativeHttpClientException('Native HTTP result was unavailable.'),
@@ -466,7 +504,7 @@ final class NativeHttpClientTransport
         final name = _readCString(header.name);
         final headerValue = _readCString(header.value);
         if (name != null && headerValue != null) {
-          headers[name.toLowerCase()] = headerValue;
+          _addResponseHeader(headers, name.toLowerCase(), headerValue);
         }
       }
       final body = value.body_stream == nullptr
@@ -496,7 +534,7 @@ final class NativeHttpClientTransport
             );
       if (bodyReader != null) {
         value.body_reader = nullptr;
-        _responseReaders[value.body_reader_id] = bodyReader;
+        _responseReaders[value.body_reader_id] = _NativeHttpResponseReaderEntry(bodyReader);
       }
       completer.complete(
         _NativeResponseData(
@@ -515,9 +553,42 @@ final class NativeHttpClientTransport
     }
   }
 
+  void _discardOrphanedResult(Pointer<native.NativeHttpResult> result) {
+    if (result == nullptr) return;
+    try {
+      final value = result.ref;
+      if (value.success && value.body_stream != nullptr) {
+        // The descriptor box is freed with the result; the stream it describes
+        // is owned by whoever adopts the descriptor.
+        NativeByteStreamHandle.fromDescriptor(value.body_stream.cast<NexByteStream>().ref).close();
+      }
+    } finally {
+      native.dart_http_native_client_free_result(result);
+    }
+  }
+
   void _ensureOpen() {
     if (_closed) throw StateError('NativeHttpClientTransport is closed.');
   }
+}
+
+/// Transport bookkeeping for one streamed response body.
+///
+/// The reader is held weakly until its body is listened to, so an unlistened
+/// response can be garbage collected and its native reader released by the
+/// finalizer. [resources] lets [NativeHttpClientTransport.close] release the
+/// native reader even after the Dart reader is gone.
+final class _NativeHttpResponseReaderEntry {
+  _NativeHttpResponseReaderEntry(_NativeHttpResponseReader reader)
+    : reader = WeakReference(reader),
+      resources = reader._resources;
+
+  final WeakReference<_NativeHttpResponseReader> reader;
+  final _NativeHttpResponseReaderResources resources;
+
+  /// Strong reference while the body is being read; native readiness
+  /// notifications must reach the reader even when nothing else holds it.
+  _NativeHttpResponseReader? active;
 }
 
 final class _PreparedRequest {
@@ -582,7 +653,11 @@ final class _NativeRequestBodyUpload {
       chunk.length,
     );
     if (status < 0) {
-      throw const NativeHttpClientException('Native streaming upload rejected a chunk.');
+      // The native side rejects chunks once the request stopped reading its
+      // body (receiver dropped or upload already removed).
+      throw const _NativeUploadReceiverClosedException(
+        'Native streaming upload rejected a chunk because its receiver closed.',
+      );
     }
     if (status > 0) return null;
     final completion = Completer<void>();
@@ -614,10 +689,76 @@ final class _NativeRequestBodyUpload {
       completion.complete();
     } else {
       completion.completeError(
-        const NativeHttpClientException('Native streaming upload receiver closed.'),
+        const _NativeUploadReceiverClosedException('Native streaming upload receiver closed.'),
       );
     }
   }
+}
+
+/// Waits for both the response and the streamed request body.
+///
+/// A server may answer (for example 401 or 413) and close before it reads the
+/// whole body. The upload then fails because its receiver closed; that is not
+/// a request failure, so the response still wins. Any other upload failure
+/// fails the request, and a response that arrives after the request already
+/// failed is released instead of leaking its body.
+Future<_NativeResponseData> _awaitResponseAndUpload(
+  Future<_NativeResponseData> responseFuture,
+  Future<void> uploadFuture,
+) {
+  final result = Completer<_NativeResponseData>();
+  _NativeResponseData? response;
+  var uploadDone = false;
+  void settle() {
+    if (result.isCompleted) return;
+    if (response != null && uploadDone) result.complete(response);
+  }
+
+  responseFuture.then<void>(
+    (value) {
+      if (result.isCompleted) {
+        _disposeResponseData(value);
+        return;
+      }
+      response = value;
+      settle();
+    },
+    onError: (Object error, StackTrace stackTrace) {
+      if (!result.isCompleted) result.completeError(error, stackTrace);
+    },
+  );
+  uploadFuture.then<void>(
+    (_) {
+      uploadDone = true;
+      settle();
+    },
+    onError: (Object error, StackTrace stackTrace) {
+      if (error is _NativeUploadReceiverClosedException) {
+        // The request body consumer is gone; the response (or the request
+        // error) decides the outcome.
+        uploadDone = true;
+        settle();
+        return;
+      }
+      if (result.isCompleted) return;
+      result.completeError(error, stackTrace);
+      final settled = response;
+      if (settled != null) _disposeResponseData(settled);
+    },
+  );
+  return result.future;
+}
+
+void _disposeResponseData(_NativeResponseData response) {
+  response.body?.close();
+  unawaited(response.bodyReader?.close());
+  response.bodyBuffer?.close();
+}
+
+/// The native request stopped consuming a streamed request body, usually
+/// because the server already answered.
+final class _NativeUploadReceiverClosedException extends NativeHttpClientException {
+  const _NativeUploadReceiverClosedException(super.message);
 }
 
 Future<void> _pumpRequestBody(
@@ -697,6 +838,20 @@ void _initializeNativeEngine() {
   _ensureNativeRuntime();
   if (native.dart_http_native_client_engine_initialize() != 0) {
     throw const NativeHttpClientException('Could not initialize the native HTTP engine.');
+  }
+}
+
+/// Adds one response header line, combining repeated fields.
+///
+/// Repeated fields are joined with `, ` as RFC 9110 allows. `set-cookie` is
+/// the exception: its values may contain commas (`Expires`), so they are
+/// joined with `\n`, which cannot appear inside a header value.
+void _addResponseHeader(Map<String, String> headers, String name, String value) {
+  final existing = headers[name];
+  if (existing == null) {
+    headers[name] = value;
+  } else {
+    headers[name] = '$existing${name == 'set-cookie' ? '\n' : ', '}$value';
   }
 }
 

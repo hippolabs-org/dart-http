@@ -1503,6 +1503,218 @@ void main() {
     await Future<void>.delayed(const Duration(milliseconds: 100));
     await socket.close().timeout(const Duration(seconds: 5));
   });
+
+  test('keeps repeated response headers instead of the last value', () async {
+    final raw = await _RawHttpServer.start((socket) async {
+      socket.write(
+        'HTTP/1.1 200 OK\r\n'
+        'vary: accept\r\n'
+        'vary: origin\r\n'
+        'set-cookie: a=1; Expires=Wed, 21 Oct 2026 07:28:00 GMT\r\n'
+        'set-cookie: b=2\r\n'
+        'content-length: 2\r\n'
+        'connection: close\r\n'
+        '\r\n'
+        'ok',
+      );
+      await socket.flush();
+      await socket.close();
+    });
+    addTearDown(raw.close);
+
+    final response = await transport.send(
+      DartHttpClientRequest(method: HttpMethod.get, uri: raw.uri('/headers')),
+    );
+
+    expect(response.headers['vary'], 'accept, origin');
+    expect(response.headers['set-cookie']!.split('\n'), [
+      'a=1; Expires=Wed, 21 Oct 2026 07:28:00 GMT',
+      'b=2',
+    ]);
+  });
+
+  test('returns an early server error sent before the streamed body is read', () async {
+    final raw = await _RawHttpServer.start((socket) async {
+      socket.write(
+        'HTTP/1.1 413 Payload Too Large\r\n'
+        'content-length: 0\r\n'
+        'connection: close\r\n'
+        '\r\n',
+      );
+      await socket.flush();
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      socket.destroy();
+    });
+    addTearDown(raw.close);
+    const chunkSize = 1024 * 1024;
+    const chunkCount = 256;
+
+    final response = await transport
+        .send(
+          DartHttpClientRequest(
+            method: HttpMethod.post,
+            uri: raw.uri('/too-large'),
+            bodyStream: () async* {
+              for (var index = 0; index < chunkCount; index++) {
+                yield List<int>.filled(chunkSize, index & 0xff);
+                await Future<void>.delayed(Duration.zero);
+              }
+            }(),
+            bodyStreamLength: chunkSize * chunkCount,
+          ),
+        )
+        .timeout(const Duration(seconds: 20));
+
+    expect(response.status, 413);
+  });
+
+  test('lets an unlistened streamed response body be finalized', () async {
+    server.listen((request) async {
+      request.response.write('x' * 1024);
+      await request.response.close();
+    });
+    final uri = Uri.parse('http://${server.address.host}:${server.port}/unlistened');
+
+    Future<void> sendAndDrop() async {
+      final response = await transport.sendStream(
+        DartHttpClientRequest(method: HttpMethod.get, uri: uri),
+      );
+      expect(response.status, 200);
+    }
+
+    await sendAndDrop();
+    expect(transport.debugOpenResponseReaderCount, 1);
+    expect(transport.debugStronglyHeldResponseReaderCount, 0);
+
+    final deadline = DateTime.now().add(const Duration(seconds: 20));
+    var garbage = <List<int>>[];
+    while (transport.debugOpenResponseReaderCount != 0 && DateTime.now().isBefore(deadline)) {
+      // Allocate until the VM collects the dropped response and runs its
+      // finalizer.
+      for (var index = 0; index < 64; index++) {
+        garbage.add(List<int>.filled(16 * 1024, index));
+      }
+      if (garbage.length > 4096) garbage = <List<int>>[];
+      await Future<void>.delayed(const Duration(milliseconds: 1));
+    }
+    expect(transport.debugOpenResponseReaderCount, 0);
+  });
+
+  test('holds a streamed body strongly only while it is read', () async {
+    server.listen((request) async {
+      request.response.write('hello');
+      await request.response.close();
+    });
+    final uri = Uri.parse('http://${server.address.host}:${server.port}/listened');
+
+    final unlistened = await transport.sendStream(
+      DartHttpClientRequest(method: HttpMethod.get, uri: uri),
+    );
+    final listened = await transport.sendStream(
+      DartHttpClientRequest(method: HttpMethod.get, uri: uri),
+    );
+    expect(transport.debugOpenResponseReaderCount, 2);
+    expect(utf8.decode(await listened.bodyStream.expand((chunk) => chunk).toList()), 'hello');
+    expect(transport.debugOpenResponseReaderCount, 1);
+    expect(transport.debugStronglyHeldResponseReaderCount, 0);
+
+    transport.close();
+    expect(transport.debugOpenResponseReaderCount, 0);
+    expect(unlistened.status, 200);
+  });
+
+  test('learns of a peer close on a socket that is only sent on', () async {
+    server.listen((request) async {
+      final socket = await WebSocketTransformer.upgrade(request);
+      socket.add('before close');
+      socket.listen((_) {});
+      await socket.close(4001, 'bye');
+    });
+    final socket = await transport.connect(
+      DartHttpClientWebSocketRequest(
+        uri: Uri.parse('ws://${server.address.host}:${server.port}/send-only'),
+      ),
+    ) as NativeHttpWebSocket;
+
+    final deadline = DateTime.now().add(const Duration(seconds: 5));
+    while (socket.closeDetails == null && DateTime.now().isBefore(deadline)) {
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+    }
+    expect(socket.closeDetails?.code, 4001);
+    expect(socket.closeDetails?.reason, 'bye');
+    await expectLater(socket.sendText('after close'), throwsA(isA<NativeHttpClientException>()));
+
+    // Frames received before the close still reach a late listener.
+    final messages = await socket.messages.toList().timeout(const Duration(seconds: 5));
+    expect(messages.map((message) => message.text), ['before close']);
+  });
+
+  test('a close rejected by a full send queue leaves the socket usable', () async {
+    transport.close();
+    transport = await NativeHttpClientTransport.open(webSocketOutgoingCapacity: 1);
+    final received = <String>[];
+    final peerClosed = Completer<int?>();
+    server.listen((request) async {
+      final socket = await WebSocketTransformer.upgrade(request);
+      socket.listen(
+        (message) => received.add(message as String),
+        onDone: () => peerClosed.complete(socket.closeCode),
+      );
+    });
+    final socket = await transport.connect(
+      DartHttpClientWebSocketRequest(
+        uri: Uri.parse('ws://${server.address.host}:${server.port}/close-full-queue'),
+      ),
+    );
+    final ended = socket.messages.drain<void>();
+
+    final first = socket.sendText('first');
+    await expectLater(
+      socket.close(),
+      throwsA(
+        isA<NativeHttpClientException>().having(
+          (error) => error.message,
+          'message',
+          contains('queue is full'),
+        ),
+      ),
+    );
+    await first;
+    await socket.sendText('second');
+    await socket.close(1000, 'done');
+    await ended.timeout(const Duration(seconds: 5));
+
+    expect(await peerClosed.future.timeout(const Duration(seconds: 5)), 1000);
+    expect(received, ['first', 'second']);
+  });
+}
+
+/// Minimal HTTP/1.1 server that answers each connection with hand-written
+/// bytes once the request head arrived.
+final class _RawHttpServer {
+  _RawHttpServer._(this._server, Future<void> Function(Socket socket) respond) {
+    _server.listen((socket) {
+      final head = <int>[];
+      var answered = false;
+      socket.listen((data) {
+        if (answered) return;
+        head.addAll(data);
+        if (latin1.decode(head, allowInvalid: true).contains('\r\n\r\n')) {
+          answered = true;
+          unawaited(respond(socket).catchError((Object _) {}));
+        }
+      }, onError: (Object _) {});
+    });
+  }
+
+  static Future<_RawHttpServer> start(Future<void> Function(Socket socket) respond) async =>
+      _RawHttpServer._(await ServerSocket.bind(InternetAddress.loopbackIPv4, 0), respond);
+
+  final ServerSocket _server;
+
+  Uri uri(String path) => Uri.parse('http://127.0.0.1:${_server.port}$path');
+
+  Future<void> close() => _server.close();
 }
 
 /// Forwards TCP traffic to a WebSocket server until [silence] is called, then
