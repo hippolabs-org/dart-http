@@ -78,10 +78,14 @@ final class _SingleConnectionWebSocket implements DartHttpClientCloseAwareWebSoc
   @override
   Future<void> sendJson(Object? value) => sendText(jsonEncode(value));
 
+  /// Sends one binary frame.
+  ///
+  /// A [Uint8List] is handed to the channel without a copy and must not be
+  /// modified afterwards; any other list is copied once.
   @override
   Future<void> sendBinary(List<int> value) async {
     _ensureOpen();
-    _channel.sink.add(Uint8List.fromList(value));
+    _channel.sink.add(value is Uint8List ? value : Uint8List.fromList(value));
   }
 
   @override

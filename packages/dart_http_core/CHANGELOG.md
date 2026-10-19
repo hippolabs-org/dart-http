@@ -1,5 +1,10 @@
 ## Unreleased
 
+- Generated clients encode JSON request bodies with `JsonUtf8Encoder` straight
+  to bytes. Behaviour change: such requests now carry `bodyBytes` instead of a
+  `body` string, so transports and tests that read `request.body` must read
+  `request.bodyBytes` (UTF-8 JSON); `package:http` transports no longer append
+  `charset=utf-8` to a JSON `Content-Type` that lacks it.
 - Add `DartHttpClientZeroCopyByteLease`. `DartHttpClientResponse.bodyBytes`
   of a leased body whose lease implements it is the transport's own buffer
   instead of a Dart-heap copy; it owns that storage and stays valid after

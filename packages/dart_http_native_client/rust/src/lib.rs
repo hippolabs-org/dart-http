@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::io;
-use std::mem::size_of;
+use std::mem::{MaybeUninit, size_of};
 use std::pin::Pin;
 use std::ptr;
 use std::str;
@@ -42,7 +42,7 @@ use tokio_tungstenite::tungstenite::protocol::{
 use tokio_tungstenite::{Connector, connect_async_tls_with_config};
 use tokio_util::sync::CancellationToken;
 
-const ABI_VERSION: i32 = 18;
+const ABI_VERSION: i32 = 19;
 const RESPONSE_MODE_NATIVE_STREAM: i32 = 0;
 const RESPONSE_MODE_BUFFERED: i32 = 1;
 const RESPONSE_MODE_DIRECT_STREAM: i32 = 2;
@@ -822,16 +822,18 @@ pub extern "C" fn dart_http_native_client_close(client_id: i64) {
 /// # Safety
 ///
 /// Every pointer must either be null where permitted or point to readable data
-/// of its corresponding length for the duration of this call. `native_body`,
-/// when non-null, must own a valid `NexByteStream` descriptor that this function
-/// may adopt.
+/// of its corresponding length for the duration of this call. `body`, when
+/// non-null, must be a filled allocation of `body_length` bytes from
+/// `dart_http_native_client_bytes_allocate`; it is adopted without a copy on
+/// every return path. `native_body`, when non-null, must own a valid
+/// `NexByteStream` descriptor that this function may adopt.
 pub unsafe extern "C" fn dart_http_native_client_start(
     client_id: i64,
     method: *const c_char,
     url: *const c_char,
     headers: *const NativeHttpHeader,
     header_count: isize,
-    body: *const u8,
+    body: *mut u8,
     body_length: isize,
     dart_upload_id: i64,
     dart_upload_length: i64,
@@ -846,6 +848,10 @@ pub unsafe extern "C" fn dart_http_native_client_start(
     response_mode: i32,
     upload_progress_port: i64,
 ) -> i64 {
+    // The buffered body is owned from here on, whatever happens next.
+    let Some(body) = (unsafe { adopt_owned_bytes(body, body_length) }) else {
+        return 0;
+    };
     let Some(state) = client_state(client_id) else {
         return 0;
     };
@@ -875,7 +881,6 @@ pub unsafe extern "C" fn dart_http_native_client_start(
             headers,
             header_count,
             body,
-            body_length,
             dart_upload_id,
             dart_upload_length,
             native_buffer,
@@ -972,13 +977,59 @@ pub extern "C" fn dart_http_native_client_upload_create(
 #[unsafe(no_mangle)]
 /// Allocates one writable upload chunk using the Rust allocator.
 pub extern "C" fn dart_http_native_client_upload_chunk_allocate(length: isize) -> *mut u8 {
+    dart_http_native_client_bytes_allocate(length)
+}
+
+#[unsafe(no_mangle)]
+/// Allocates `length` uninitialized bytes that Dart fills and then hands to a
+/// function that adopts them, so a Dart payload is copied into Rust exactly
+/// once and never zero-filled first. Returns null for a non-positive length.
+pub extern "C" fn dart_http_native_client_bytes_allocate(length: isize) -> *mut u8 {
     let Ok(length) = usize::try_from(length) else {
         return ptr::null_mut();
     };
     if length == 0 {
         return ptr::null_mut();
     }
-    Box::into_raw(vec![0_u8; length].into_boxed_slice()).cast::<u8>()
+    Box::into_raw(Box::<[u8]>::new_uninit_slice(length)).cast::<u8>()
+}
+
+#[unsafe(no_mangle)]
+/// Frees an allocation from `dart_http_native_client_bytes_allocate` that was
+/// never handed to an adopting function.
+///
+/// # Safety
+///
+/// `bytes` must be null or a live allocation of exactly `length` bytes.
+pub unsafe extern "C" fn dart_http_native_client_bytes_free(bytes: *mut u8, length: isize) {
+    let Ok(length) = usize::try_from(length) else {
+        return;
+    };
+    if bytes.is_null() || length == 0 {
+        return;
+    }
+    drop(unsafe {
+        Box::from_raw(ptr::slice_from_raw_parts_mut(
+            bytes.cast::<MaybeUninit<u8>>(),
+            length,
+        ))
+    });
+}
+
+/// Takes ownership of a buffer filled by Dart after
+/// `dart_http_native_client_bytes_allocate`, without copying it.
+///
+/// # Safety
+///
+/// `bytes` must be null (with `length <= 0`) or an allocation of exactly
+/// `length` bytes from `dart_http_native_client_bytes_allocate`, fully written.
+unsafe fn adopt_owned_bytes(bytes: *mut u8, length: isize) -> Option<Bytes> {
+    let length = usize::try_from(length).ok()?;
+    if length == 0 || bytes.is_null() {
+        return (length == 0).then(Bytes::new);
+    }
+    let owned = unsafe { Box::from_raw(ptr::slice_from_raw_parts_mut(bytes, length)) };
+    Some(Bytes::from(owned))
 }
 
 #[unsafe(no_mangle)]
@@ -1451,23 +1502,23 @@ pub unsafe extern "C" fn dart_http_native_client_websocket_enqueue_text_base64_n
 }
 
 #[unsafe(no_mangle)]
-/// Enqueues one WebSocket binary frame after copying its bytes.
+/// Enqueues one WebSocket binary frame, adopting its Dart-filled bytes.
 ///
 /// # Safety
 ///
-/// `value` must be null only when `length` is zero and otherwise point to
-/// `length` readable bytes for this call.
+/// `value` must be null when `length` is zero and otherwise an allocation of
+/// `length` bytes from `dart_http_native_client_bytes_allocate`, which this
+/// call adopts on every return path.
 pub unsafe extern "C" fn dart_http_native_client_websocket_send_binary(
     client_id: i64,
     socket_id: i64,
-    value: *const u8,
+    value: *mut u8,
     length: isize,
 ) -> i64 {
-    let bytes = match unsafe { copy_optional_bytes(value, length) } {
-        Ok(value) => value,
-        Err(_) => return 0,
+    let Some(bytes) = (unsafe { adopt_owned_bytes(value, length) }) else {
+        return 0;
     };
-    enqueue_web_socket_message(client_id, socket_id, Message::Binary(bytes.into()))
+    enqueue_web_socket_message(client_id, socket_id, Message::Binary(bytes))
 }
 
 #[unsafe(no_mangle)]
@@ -2787,8 +2838,7 @@ unsafe fn prepare_request(
     url: *const c_char,
     headers: *const NativeHttpHeader,
     header_count: isize,
-    body: *const u8,
-    body_length: isize,
+    body: Bytes,
     dart_upload_id: i64,
     dart_upload_length: i64,
     native_buffer: *mut c_void,
@@ -2799,7 +2849,7 @@ unsafe fn prepare_request(
     native_suffix: *const u8,
     native_suffix_length: isize,
 ) -> Result<(reqwest::Request, Option<RequestStreamCancel>), String> {
-    let body_source_count = usize::from(body_length > 0)
+    let body_source_count = usize::from(!body.is_empty())
         + usize::from(dart_upload_id > 0)
         + usize::from(!native_buffer.is_null())
         + usize::from(!native_body.is_null());
@@ -2884,12 +2934,8 @@ unsafe fn prepare_request(
                     .expect("a non-negative integer is a valid header value"),
             );
         }
-    } else if body_length > 0 {
-        if body.is_null() {
-            return Err("Missing HTTP request body bytes.".to_owned());
-        }
-        let bytes = unsafe { std::slice::from_raw_parts(body, body_length as usize) }.to_vec();
-        *request.body_mut() = Some(Body::from(bytes));
+    } else if !body.is_empty() {
+        *request.body_mut() = Some(Body::from(body));
     }
     Ok((request, body_cancel))
 }
@@ -3842,5 +3888,38 @@ mod buffered_body_tests {
             .await
             .unwrap();
         assert!(body.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod owned_bytes_tests {
+    use super::*;
+
+    #[test]
+    fn adopts_a_dart_filled_allocation_without_copying() {
+        let pointer = dart_http_native_client_bytes_allocate(4);
+        assert!(!pointer.is_null());
+        unsafe { ptr::copy_nonoverlapping(b"json".as_ptr(), pointer, 4) };
+        let bytes = unsafe { adopt_owned_bytes(pointer, 4) }.unwrap();
+        assert_eq!(bytes.as_ptr(), pointer.cast_const());
+        assert_eq!(bytes, Bytes::from_static(b"json"));
+    }
+
+    #[test]
+    fn treats_an_empty_body_as_absent_and_rejects_a_missing_pointer() {
+        assert!(dart_http_native_client_bytes_allocate(0).is_null());
+        assert!(dart_http_native_client_bytes_allocate(-1).is_null());
+        assert_eq!(
+            unsafe { adopt_owned_bytes(ptr::null_mut(), 0) },
+            Some(Bytes::new())
+        );
+        assert_eq!(unsafe { adopt_owned_bytes(ptr::null_mut(), 3) }, None);
+    }
+
+    #[test]
+    fn frees_an_allocation_that_was_never_adopted() {
+        let pointer = dart_http_native_client_bytes_allocate(1024);
+        unsafe { dart_http_native_client_bytes_free(pointer, 1024) };
+        unsafe { dart_http_native_client_bytes_free(ptr::null_mut(), 0) };
     }
 }

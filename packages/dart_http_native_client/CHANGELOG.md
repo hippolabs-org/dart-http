@@ -1,5 +1,13 @@
 ## Unreleased
 
+- Copy Dart request bodies (bytes, any `List<int>`, JSON from generated
+  clients, non-transferable leases) and WebSocket binary sends exactly once,
+  into an uninitialized Rust allocation that Rust adopts without another copy
+  (previously: an extra `Uint8List.fromList`/`takeDartBytes`, a zero-filled
+  `calloc` buffer and a Rust `to_vec`). A Dart-leased `sendBinaryLease`
+  writes prefix and payload into one native frame. Native ABI 19
+  (`dart_http_native_client_start` and `_websocket_send_binary` now adopt
+  their body, new `_bytes_allocate`/`_bytes_free`).
 - Buffered responses (`send`) are collected into one native allocation sized
   from `Content-Length` (growing only when it is absent) and `bodyBytes` is a
   zero-copy view of it. The view owns the allocation through a native

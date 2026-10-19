@@ -46,7 +46,7 @@ int64_t dart_http_native_client_start(
     const char* url,
     const NativeHttpHeader* headers,
     intptr_t header_count,
-    const uint8_t* body,
+    uint8_t* body,
     intptr_t body_length,
     int64_t dart_upload_id,
     int64_t dart_upload_length,
@@ -65,6 +65,8 @@ int64_t dart_http_native_client_upload_create(
     int64_t completion_port,
     intptr_t capacity);
 uint8_t* dart_http_native_client_upload_chunk_allocate(intptr_t length);
+uint8_t* dart_http_native_client_bytes_allocate(intptr_t length);
+void dart_http_native_client_bytes_free(uint8_t* bytes, intptr_t length);
 int32_t dart_http_native_client_upload_write(
     int64_t client_id,
     int64_t upload_id,
@@ -130,7 +132,7 @@ int32_t dart_http_native_client_websocket_enqueue_text_base64_native(
 int64_t dart_http_native_client_websocket_send_binary(
     int64_t client_id,
     int64_t socket_id,
-    const uint8_t* value,
+    uint8_t* value,
     intptr_t length);
 int64_t dart_http_native_client_websocket_send_binary_native_prefixed(
     int64_t client_id,

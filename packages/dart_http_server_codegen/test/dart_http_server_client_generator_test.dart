@@ -1080,7 +1080,8 @@ void main() {
             'x-request-id': 'req_1',
             'content-type': 'application/json; charset=utf-8',
           });
-          expect(jsonDecode(request.body!), {'name': 'Ada'});
+          expect(request.body, isNull);
+          expect(jsonDecode(utf8.decode(request.bodyBytes!)), {'name': 'Ada'});
           expect(request.abortTrigger, same(abortTrigger));
 
           return DartHttpClientResponse(

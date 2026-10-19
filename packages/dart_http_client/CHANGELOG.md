@@ -1,5 +1,8 @@
 ## Unreleased
 
+- `sendBinary` on the single-connection WebSocket transport hands a
+  `Uint8List` to the channel without copying it; do not modify it after
+  sending. Other `List<int>` values are still copied.
 - **Breaking:** Remove the opt-in reconnecting WebSocket mode:
   `DartHttpWebSocketClientTransport`'s `reconnect`, `backoff` and
   `socketFactory` parameters, `DartHttpWebSocketClient`,

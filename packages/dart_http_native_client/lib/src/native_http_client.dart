@@ -16,7 +16,7 @@ import 'native_http_response.dart';
 part 'native_http_web_socket.dart';
 part 'native_http_response_reader.dart';
 
-const _nativeAbiVersion = 18;
+const _nativeAbiVersion = 19;
 const _responseModeNativeStream = 0;
 const _responseModeBuffered = 1;
 const _responseModeDirectStream = 2;
@@ -225,7 +225,6 @@ final class NativeHttpClientTransport
       method = request.method.wireName.toNativeUtf8();
       url = request.uri.toString().toNativeUtf8();
       headers = calloc<native.NativeHttpHeader>(request.headers.length);
-      if (bytes != null) bodyPointer = calloc<Uint8>(bytes.length);
       if (nativePrefix != null && nativePrefix.isNotEmpty) {
         prefixPointer = calloc<Uint8>(nativePrefix.length);
       }
@@ -248,9 +247,12 @@ final class NativeHttpClientTransport
           ..value = value.cast();
         index++;
       }
+      final bodyLength = bytes?.length ?? 0;
       if (bytes != null && bytes.isNotEmpty) {
-        bodyPointer.asTypedList(bytes.length).setAll(0, bytes);
+        bodyPointer = _copyToNativeBytes(bytes);
       }
+      // The only Dart copy of a leased body has been made; release it now.
+      prepared.copiedLease?.close();
       if (nativePrefix != null && nativePrefix.isNotEmpty) {
         prefixPointer.asTypedList(nativePrefix.length).setAll(0, nativePrefix);
       }
@@ -270,7 +272,7 @@ final class NativeHttpClientTransport
         headers,
         request.headers.length,
         bodyPointer,
-        bytes?.length ?? 0,
+        bodyLength,
         upload?.id ?? 0,
         prepared.bodyStreamLength ?? -1,
         nativeBufferTransfer?.descriptor.cast() ?? nullptr,
@@ -284,6 +286,8 @@ final class NativeHttpClientTransport
         responseMode,
         progressPort?.sendPort.nativePort ?? 0,
       );
+      // The native call adopted the body allocation on every return path.
+      bodyPointer = nullptr;
       if (requestId <= 0) {
         await upload?.close();
         nativeBufferTransfer?.close();
@@ -352,7 +356,10 @@ final class NativeHttpClientTransport
       for (final value in headerStrings) {
         calloc.free(value);
       }
-      if (bodyPointer != nullptr) calloc.free(bodyPointer);
+      prepared.copiedLease?.close();
+      if (bodyPointer != nullptr) {
+        native.dart_http_native_client_bytes_free(bodyPointer, prepared.bytes?.length ?? 0);
+      }
       if (prefixPointer != nullptr) calloc.free(prefixPointer);
       if (suffixPointer != nullptr) calloc.free(suffixPointer);
     }
@@ -448,12 +455,12 @@ final class NativeHttpClientTransport
       if (bodyLease is TransferableNativeByteLease) {
         return _PreparedRequest(nativeBuffer: bodyLease);
       }
-      return _PreparedRequest(bytes: bodyLease.takeDartBytes());
+      // Copied straight from the lease view into native memory, then closed.
+      return _PreparedRequest(bytes: bodyLease.bytesView, copiedLease: bodyLease);
     }
     if (request.bodyBytes case final bodyBytes?) {
-      return _PreparedRequest(
-        bytes: bodyBytes is Uint8List ? bodyBytes : Uint8List.fromList(bodyBytes),
-      );
+      // Any List<int> is written straight into native memory: one copy.
+      return _PreparedRequest(bytes: bodyBytes);
     }
     if (request.body case final body?) {
       return _PreparedRequest(bytes: utf8.encode(body));
@@ -594,17 +601,33 @@ final class _NativeHttpResponseReaderEntry {
 final class _PreparedRequest {
   const _PreparedRequest({
     this.bytes,
+    this.copiedLease,
     this.nativeBuffer,
     this.nativeBody,
     this.bodyStream,
     this.bodyStreamLength,
   });
 
-  final Uint8List? bytes;
+  final List<int>? bytes;
+
+  /// A non-transferable lease whose view is [bytes]; closed once copied.
+  final ByteLease? copiedLease;
   final TransferableNativeByteLease? nativeBuffer;
   final NativeHttpRequestBody? nativeBody;
   final Stream<List<int>>? bodyStream;
   final int? bodyStreamLength;
+}
+
+/// Copies [bytes] into an uninitialized Rust allocation that a native call
+/// then adopts without another copy. Callers must hand the pointer to such a
+/// call or free it with `dart_http_native_client_bytes_free`.
+Pointer<Uint8> _copyToNativeBytes(List<int> bytes) {
+  final pointer = native.dart_http_native_client_bytes_allocate(bytes.length);
+  if (pointer == nullptr) {
+    throw const NativeHttpClientException('Could not allocate native request bytes.');
+  }
+  pointer.asTypedList(bytes.length).setRange(0, bytes.length, bytes);
+  return pointer;
 }
 
 final class _NativeRequestBodyUpload {
@@ -639,11 +662,7 @@ final class _NativeRequestBodyUpload {
       throw const NativeHttpClientException('Native streaming upload is closed.');
     }
     if (chunk.isEmpty) return null;
-    final pointer = native.dart_http_native_client_upload_chunk_allocate(chunk.length);
-    if (pointer == nullptr) {
-      throw const NativeHttpClientException('Could not allocate a native streaming upload chunk.');
-    }
-    pointer.asTypedList(chunk.length).setAll(0, chunk);
+    final pointer = _copyToNativeBytes(chunk);
     final writeId = _nextWriteId++;
     final status = native.dart_http_native_client_upload_write(
       clientId,

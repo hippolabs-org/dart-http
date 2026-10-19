@@ -841,6 +841,60 @@ void main() {
     });
   });
 
+  test('uploads JSON, List<int> and Dart-leased bodies byte for byte', () async {
+    final received = <String, List<int>>{};
+    server.listen((request) async {
+      final bytes = await request.fold<List<int>>(<int>[], (all, chunk) => all..addAll(chunk));
+      expect(request.contentLength, bytes.length);
+      received[request.uri.path] = bytes;
+      request.response.headers.contentType = ContentType.json;
+      request.response.write('{}');
+      await request.response.close();
+    });
+    final base = Uri.parse('http://${server.address.host}:${server.port}');
+    final document = {
+      'name': 'Grüße',
+      'values': [for (var i = 0; i < 5000; i++) i],
+    };
+    await _JsonClient(base, transport).invoke(
+      DartHttpClientInvocation<Object?, Object?, Object?, Object?, Map<String, Object?>>(
+        method: HttpMethod.post,
+        pathTemplate: '/json',
+        body: DartHttpClientRequestBody<Map<String, Object?>>(
+          value: document,
+          contentType: 'application/json',
+        ),
+        success: const DartHttpClientResponseSpec<Object?>(
+          status: 200,
+          contentType: 'application/json',
+          responseMode: DartHttpClientResponseMode.buffered,
+        ),
+      ),
+    );
+    expect(received['/json'], utf8.encode(jsonEncode(document)));
+
+    final listBody = List<int>.generate(70000, (i) => i % 251);
+    await transport.send(
+      DartHttpClientRequest(
+        method: HttpMethod.post,
+        uri: base.replace(path: '/list'),
+        bodyBytes: listBody,
+      ),
+    );
+    expect(received['/list'], listBody);
+
+    final lease = DartByteLease(Uint8List.fromList(const [3, 1, 4, 1, 5]));
+    await transport.send(
+      DartHttpClientRequest(
+        method: HttpMethod.post,
+        uri: base.replace(path: '/lease'),
+        bodyLease: lease,
+      ),
+    );
+    expect(lease.isClosed, isTrue);
+    expect(received['/lease'], const [3, 1, 4, 1, 5]);
+  });
+
   test('cancels an in-flight Tokio request', () async {
     final requestStarted = Completer<void>();
     server.listen((request) async {
@@ -924,6 +978,38 @@ void main() {
     final prefixedLease = prefixedMessage.takeBinaryLease();
     expect(prefixedLease.bytesView, <int>[9, 8, 1, 2, 3, 4]);
     prefixedLease.close();
+  });
+
+  test('sends Dart-owned WebSocket payloads with one native copy', () async {
+    server.listen((request) async {
+      final socket = await WebSocketTransformer.upgrade(request);
+      socket.listen(socket.add);
+    });
+    final socket = await transport.connect(
+      DartHttpClientWebSocketRequest(
+        uri: Uri.parse('ws://${server.address.host}:${server.port}/echo'),
+      ),
+    );
+    addTearDown(socket.close);
+    final echoes = StreamIterator(socket.messages);
+    addTearDown(echoes.cancel);
+
+    final reused = Uint8List.fromList(const [1, 2, 3]);
+    await socket.sendBinary(reused);
+    reused[0] = 99;
+    expect(await echoes.moveNext(), isTrue);
+    expect(echoes.current.bytes, const [1, 2, 3]);
+
+    final lease = BinaryPayloadLease.fromByteLease(DartByteLease(Uint8List.fromList(const [7, 7])));
+    await socket.sendBinaryLease(lease, prefix: const [0]);
+    expect(lease.isClosed, isTrue);
+    expect(await echoes.moveNext(), isTrue);
+    expect(echoes.current.bytes, const [0, 7, 7]);
+
+    final empty = BinaryPayloadLease.fromByteLease(DartByteLease(Uint8List(0)));
+    await socket.sendBinaryLease(empty);
+    expect(await echoes.moveNext(), isTrue);
+    expect(echoes.current.bytes, isEmpty);
   });
 
   test('extracts selected JSON audio into native leases and preserves control metadata', () async {

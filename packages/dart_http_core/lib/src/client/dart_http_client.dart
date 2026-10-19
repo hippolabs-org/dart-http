@@ -56,6 +56,7 @@ abstract base class DartHttpClientBase {
         encodedBody: encodedBody,
       ),
       body: encodedBody?.body,
+      bodyBytes: encodedBody?.bodyBytes,
       bodyStream: encodedBody?.bodyStream,
       bodyStreamLength: encodedBody?.bodyStreamLength,
       abortTrigger: abortTrigger,
@@ -233,6 +234,7 @@ abstract base class DartHttpClientBase {
         encodedBody: encodedBody,
       ),
       body: encodedBody?.body,
+      bodyBytes: encodedBody?.bodyBytes,
       bodyStream: encodedBody?.bodyStream,
       bodyStreamLength: encodedBody?.bodyStreamLength,
       abortTrigger: abortTrigger,
@@ -296,9 +298,11 @@ abstract base class DartHttpClientBase {
     final contentType = body.contentType.toLowerCase();
 
     if (_isJsonContentType(contentType)) {
+      // Encode straight to UTF-8 bytes: no intermediate JSON String, and a
+      // native transport copies the bytes into its own memory exactly once.
       return _EncodedClientRequestBody(
         contentType: body.contentType,
-        body: jsonEncode(encodedBody),
+        bodyBytes: _jsonUtf8Encoder.convert(encodedBody),
       );
     }
 
@@ -540,12 +544,14 @@ final class _EncodedClientRequestBody {
   const _EncodedClientRequestBody({
     required this.contentType,
     this.body,
+    this.bodyBytes,
     this.bodyStream,
     this.bodyStreamLength,
   });
 
   final String contentType;
   final String? body;
+  final List<int>? bodyBytes;
   final Stream<List<int>>? bodyStream;
   final int? bodyStreamLength;
 }
@@ -1146,6 +1152,10 @@ Object? _decodeJsonBytes(Uint8List bytes) {
   if (bytes.isEmpty) return null;
   return _jsonUtf8Decoder.convert(bytes);
 }
+
+/// Output buffers large enough that big documents join few chunks, small
+/// enough that tiny bodies do not pin a large backing buffer.
+final _jsonUtf8Encoder = JsonUtf8Encoder(null, null, 16 * 1024);
 
 final Converter<List<int>, Object?> _jsonUtf8Decoder = const Utf8Decoder(allowMalformed: true)
     .fuse(const JsonDecoder());

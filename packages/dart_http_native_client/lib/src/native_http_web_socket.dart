@@ -215,21 +215,19 @@ final class NativeHttpWebSocket
   }
 
   @override
-  Future<void> sendBinary(List<int> value) => _scheduleOperation(() {
-    final bytes = value is Uint8List ? value : Uint8List.fromList(value);
-    final pointer = bytes.isEmpty ? nullptr.cast<Uint8>() : calloc<Uint8>(bytes.length);
-    try {
-      if (bytes.isNotEmpty) pointer.asTypedList(bytes.length).setAll(0, bytes);
-      return native.dart_http_native_client_websocket_send_binary(
+  Future<void> sendBinary(List<int> value) => _scheduleOperation(
+    () => _sendOwnedBinary(value.isEmpty ? nullptr : _copyToNativeBytes(value), value.length),
+  );
+
+  /// Sends [length] bytes at [pointer], an allocation from
+  /// `dart_http_native_client_bytes_allocate` that the native call adopts.
+  int _sendOwnedBinary(Pointer<Uint8> pointer, int length) =>
+      native.dart_http_native_client_websocket_send_binary(
         _transport._clientId,
         _socketId,
         pointer,
-        bytes.length,
+        length,
       );
-    } finally {
-      if (pointer != nullptr) calloc.free(pointer);
-    }
-  });
 
   @override
   Future<void> sendBinaryLease(BinaryPayloadLease lease, {List<int> prefix = const <int>[]}) {
@@ -238,17 +236,31 @@ final class NativeHttpWebSocket
       _ => null,
     };
     if (exchangeLease is! TransferableNativeByteLease) {
-      if (prefix.isEmpty) {
-        return sendBinary(lease.takeBytes());
-      }
-      try {
-        final combined = Uint8List(prefix.length + lease.length)
-          ..setRange(0, prefix.length, prefix)
-          ..setRange(prefix.length, prefix.length + lease.length, lease.bytesView);
-        return sendBinary(combined);
-      } finally {
-        lease.close();
-      }
+      // One copy: prefix and payload are written straight into the native
+      // frame buffer, then the lease is released.
+      return _scheduleOperation(() {
+        final length = prefix.length + lease.length;
+        Pointer<Uint8> pointer = nullptr;
+        try {
+          if (length > 0) {
+            pointer = native.dart_http_native_client_bytes_allocate(length);
+            if (pointer == nullptr) {
+              throw const NativeHttpClientException('Could not allocate a native WebSocket frame.');
+            }
+            pointer.asTypedList(length)
+              ..setRange(0, prefix.length, prefix)
+              ..setRange(prefix.length, length, lease.bytesView);
+          }
+        } catch (_) {
+          if (pointer != nullptr) native.dart_http_native_client_bytes_free(pointer, length);
+          rethrow;
+        } finally {
+          lease.close();
+        }
+        return _sendOwnedBinary(pointer, length);
+      }).whenComplete(() {
+        if (!lease.isClosed) lease.close();
+      });
     }
     return _scheduleOperation(() {
       final prefixPointer = prefix.isEmpty ? nullptr.cast<Uint8>() : calloc<Uint8>(prefix.length);

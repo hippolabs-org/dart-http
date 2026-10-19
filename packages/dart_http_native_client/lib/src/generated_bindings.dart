@@ -12,6 +12,12 @@ import 'dart:ffi' as ffi;
 @ffi.Native<ffi.Int32 Function()>()
 external int dart_http_native_client_abi_version();
 
+@ffi.Native<ffi.Pointer<ffi.Uint8> Function(ffi.IntPtr)>()
+external ffi.Pointer<ffi.Uint8> dart_http_native_client_bytes_allocate(int length);
+
+@ffi.Native<ffi.Void Function(ffi.Pointer<ffi.Uint8>, ffi.IntPtr)>()
+external void dart_http_native_client_bytes_free(ffi.Pointer<ffi.Uint8> bytes, int length);
+
 @ffi.Native<ffi.Bool Function(ffi.Int64, ffi.Int64)>()
 external bool dart_http_native_client_cancel(int client_id, int request_id);
 
