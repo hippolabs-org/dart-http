@@ -892,10 +892,10 @@ pub unsafe extern "C" fn dart_http_native_client_start(
     };
     let upload_progress =
         (upload_progress_port > 0).then(|| Arc::new(UploadProgress::new(upload_progress_port)));
-    if let Some(progress) = &upload_progress {
-        if let Some(body) = request.body_mut().take() {
-            *request.body_mut() = Some(measured_request_body(body, Arc::clone(progress)));
-        }
+    if let Some(progress) = &upload_progress
+        && let Some(body) = request.body_mut().take()
+    {
+        *request.body_mut() = Some(measured_request_body(body, Arc::clone(progress)));
     }
     let request_id = state.next_request_id.fetch_add(1, Ordering::Relaxed);
     let cancellation = CancellationToken::new();
@@ -2942,13 +2942,13 @@ impl UploadProgress {
     }
     fn consumed(&self, length: usize) {
         let bytes = self.bytes.fetch_add(length as u64, Ordering::Relaxed) + length as u64;
-        if let Ok(mut last) = self.last_report.lock() {
-            if last.0 == 0 || last.1.elapsed() >= Duration::from_millis(50) {
-                if self.port.0 > 0 {
-                    self.port.post(bytes as i64);
-                }
-                *last = (bytes, Instant::now());
+        if let Ok(mut last) = self.last_report.lock()
+            && (last.0 == 0 || last.1.elapsed() >= Duration::from_millis(50))
+        {
+            if self.port.0 > 0 {
+                self.port.post(bytes as i64);
             }
+            *last = (bytes, Instant::now());
         }
     }
     fn finish(&self) {
@@ -3042,8 +3042,7 @@ async fn send_request(
         })
         .collect::<Vec<_>>();
     if response_mode == RESPONSE_MODE_BUFFERED {
-        let body_bytes = response
-            .bytes()
+        let body_bytes = collect_buffered_body(response)
             .await
             .map_err(|error| format!("Native HTTP response failed: {error}"))?;
         return Ok(ResponseData {
@@ -3083,6 +3082,43 @@ async fn send_request(
         body_reader_id: 0,
         body_buffer: None,
     })
+}
+
+/// Buffers a whole response body into one contiguous allocation.
+///
+/// A declared `Content-Length` sizes the allocation up front, so the body is
+/// written exactly once and handed to Dart without a second buffer. Without a
+/// length, a single-frame body is kept as received and multi-frame bodies grow
+/// one buffer. A length the allocator refuses falls back to growth, so a
+/// hostile header cannot abort the process.
+async fn collect_buffered_body(mut response: reqwest::Response) -> Result<Bytes, reqwest::Error> {
+    let mut body = Vec::new();
+    if let Some(declared) = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+    {
+        let _ = body.try_reserve_exact(declared);
+    }
+    let mut first = None::<Bytes>;
+    while let Some(chunk) = response.chunk().await? {
+        if body.capacity() == 0 {
+            match first.take() {
+                None => {
+                    first = Some(chunk);
+                    continue;
+                }
+                Some(previous) => {
+                    body.reserve((previous.len() + chunk.len()) * 2);
+                    body.extend_from_slice(&previous);
+                }
+            }
+        }
+        body.extend_from_slice(&chunk);
+    }
+    if let Some(only) = first {
+        return Ok(only);
+    }
+    Ok(Bytes::from(body))
 }
 
 fn response_stream(response: reqwest::Response, cancellation: CancellationToken) -> NexByteStream {
@@ -3754,5 +3790,57 @@ mod upload_progress_tests {
         let body = measured_request_body(Body::wrap_stream(chunks), Arc::clone(&progress));
         assert!(body.collect().await.is_err());
         assert_eq!(progress.bytes.load(Ordering::Relaxed), 2);
+    }
+}
+
+#[cfg(test)]
+mod buffered_body_tests {
+    use super::*;
+
+    fn streamed_response(chunks: Vec<&'static [u8]>) -> reqwest::Response {
+        let frames = futures_util::stream::iter(
+            chunks
+                .into_iter()
+                .map(|chunk| Ok::<_, io::Error>(Bytes::from_static(chunk))),
+        );
+        reqwest::Response::from(tokio_tungstenite::tungstenite::http::Response::new(
+            Body::wrap_stream(frames),
+        ))
+    }
+
+    #[tokio::test]
+    async fn joins_unsized_multi_frame_bodies_in_order() {
+        let body = collect_buffered_body(streamed_response(vec![b"ab", b"cde", b"f"]))
+            .await
+            .unwrap();
+        assert_eq!(body, Bytes::from_static(b"abcdef"));
+    }
+
+    #[tokio::test]
+    async fn keeps_an_unsized_single_frame_body_without_copying() {
+        static PAYLOAD: &[u8] = b"single frame";
+        let body = collect_buffered_body(streamed_response(vec![PAYLOAD]))
+            .await
+            .unwrap();
+        assert_eq!(body.as_ptr(), PAYLOAD.as_ptr());
+    }
+
+    #[tokio::test]
+    async fn sized_bodies_fill_one_allocation() {
+        let payload = vec![7_u8; 3 * 1024 * 1024];
+        let response = reqwest::Response::from(
+            tokio_tungstenite::tungstenite::http::Response::new(Body::from(payload.clone())),
+        );
+        assert_eq!(response.content_length(), Some(payload.len() as u64));
+        let body = collect_buffered_body(response).await.unwrap();
+        assert_eq!(body.as_ref(), payload.as_slice());
+    }
+
+    #[tokio::test]
+    async fn empty_bodies_stay_empty() {
+        let body = collect_buffered_body(streamed_response(vec![]))
+            .await
+            .unwrap();
+        assert!(body.is_empty());
     }
 }

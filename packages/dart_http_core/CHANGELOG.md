@@ -1,5 +1,10 @@
 ## Unreleased
 
+- Add `DartHttpClientZeroCopyByteLease`. `DartHttpClientResponse.bodyBytes`
+  of a leased body whose lease implements it is the transport's own buffer
+  instead of a Dart-heap copy; it owns that storage and stays valid after
+  `close()`. Add `DartHttpClientResponse.copyBodyBytes()` for an explicit
+  Dart-heap copy.
 - **Breaking:** Remove the unused `DartHttpIsolateWorker`,
   `DartHttpIsolateWorkerPool`, and `DartHttpIsolateWorkerPoolStrategy` APIs,
   and drop the `meta` dependency they required.

@@ -365,7 +365,7 @@ final class NativeHttpClientTransport
       status: response.status,
       contentType: response.contentType,
       headers: response.headers,
-      body: response.body,
+      body: _NativeResponseBodyLease(response.body),
     );
   }
 
@@ -808,6 +808,78 @@ final class _NativeResponseData {
   final _NativeHttpResponseReader? bodyReader;
   final NativeBufferLease? bodyBuffer;
 }
+
+/// A buffered response body whose bytes become a self-owning native view.
+///
+/// [takeView] moves the producer context into a [NativeFinalizer] attached to
+/// the returned list, so the native allocation lives exactly as long as the
+/// list (and any view of it) and is reported to the GC as external memory.
+final class _NativeResponseBodyLease
+    implements DartHttpClientZeroCopyByteLease, TransferableNativeByteLease {
+  _NativeResponseBodyLease(this._lease);
+
+  final NativeBufferLease _lease;
+
+  @override
+  int get length => _lease.length;
+
+  @override
+  bool get isClosed => _lease.isClosed;
+
+  @override
+  Pointer<Uint8> get bytesPointer => _lease.bytesPointer;
+
+  @override
+  Uint8List get bytesView => _lease.bytesView;
+
+  @override
+  Uint8List copyBytes() => _lease.copyBytes();
+
+  @override
+  Uint8List takeDartBytes() => takeView();
+
+  @override
+  Uint8List takeView() => _lease.takeOwnedView();
+
+  @override
+  NativeBufferTransfer takeNative() => _lease.takeNative();
+
+  @override
+  void close() => _lease.close();
+}
+
+/// Turns a native byte lease into an ordinary, self-owning [Uint8List].
+extension NativeHttpOwnedBufferView on TransferableNativeByteLease {
+  /// Moves this lease into a [Uint8List] that owns the native allocation,
+  /// without copying it.
+  ///
+  /// The list keeps the producer context alive through a [NativeFinalizer]
+  /// and reports it to the GC as external memory, so it remains valid after
+  /// the lease, the response, and the transport are closed. A producer that
+  /// does not allow release from another thread is copied instead.
+  Uint8List takeOwnedView() {
+    final transfer = takeNative();
+    final descriptor = transfer.descriptor.ref;
+    final length = descriptor.len;
+    if (length == 0 || descriptor.capabilities & _nexCapabilityThreadSafe == 0) {
+      try {
+        return length == 0 ? Uint8List(0) : Uint8List.fromList(descriptor.ptr.asTypedList(length));
+      } finally {
+        transfer.close();
+      }
+    }
+    final view = descriptor.ptr.asTypedList(
+      length,
+      finalizer: descriptor.release.cast(),
+      token: descriptor.context,
+    );
+    transfer.markAdopted();
+    return view;
+  }
+}
+
+/// `NEX_CAPABILITY_THREAD_SAFE`: the release callback may run on any thread.
+const _nexCapabilityThreadSafe = 1;
 
 Stream<Uint8List> _copyResponseLeases(Stream<NativeBufferLease> leases) async* {
   await for (final lease in leases) {

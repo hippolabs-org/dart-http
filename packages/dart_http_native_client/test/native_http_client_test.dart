@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:ffi';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:dart_http_core/dart_http_core.dart';
 import 'package:dart_http_native_client/dart_http_native_client.dart';
@@ -332,6 +334,88 @@ void main() {
 
     expect(first, const [4, 3, 2, 1]);
     expect(identical(first, second), isTrue);
+  });
+
+  test('exposes a sized buffered body as a view that outlives its response', () async {
+    final payload = Uint8List.fromList(List<int>.generate(3 * 1024 * 1024 + 7, (i) => i * 31));
+    server.listen((request) async {
+      request.response
+        ..contentLength = payload.length
+        ..add(payload);
+      await request.response.close();
+    });
+
+    final response = await transport.send(
+      DartHttpClientRequest(
+        method: HttpMethod.get,
+        uri: Uri.parse('http://${server.address.host}:${server.port}/large'),
+      ),
+    );
+    final bytes = response.bodyBytes;
+    response.close();
+    transport.close();
+
+    expect(bytes.length, payload.length);
+    expect(bytes, payload);
+    final copy = response.copyBodyBytes();
+    expect(identical(copy, bytes), isFalse);
+    expect(copy, payload);
+  });
+
+  test('turns a leased body into a self-owning view without copying', () async {
+    server.listen((request) async {
+      request.response.add(const [5, 6, 7]);
+      await request.response.close();
+    });
+
+    final response = await transport.sendLeased(
+      DartHttpClientRequest(
+        method: HttpMethod.get,
+        uri: Uri.parse('http://${server.address.host}:${server.port}/view'),
+      ),
+    );
+    final pointer = response.body.bytesPointer;
+    final view = response.body.takeOwnedView();
+
+    expect(response.body.isClosed, isTrue);
+    response.close();
+    expect(view, const [5, 6, 7]);
+    // The view aliases the native allocation instead of copying it.
+    view[0] = 42;
+    expect(pointer.value, 42);
+  });
+
+  test('decodes a buffered JSON response straight from native bytes', () async {
+    final document = {
+      'items': [
+        for (var i = 0; i < 2000; i++) {'id': i, 'name': 'Grüße $i'},
+      ],
+    };
+    server.listen((request) async {
+      request.response
+        ..headers.contentType = ContentType.json
+        ..add(utf8.encode(jsonEncode(document)));
+      await request.response.close();
+    });
+    final client = _JsonClient(
+      Uri.parse('http://${server.address.host}:${server.port}'),
+      transport,
+    );
+
+    final result = await client.invoke(
+      const DartHttpClientInvocation<Object?, Object?, Object?, Object?, Object?>(
+        method: HttpMethod.get,
+        pathTemplate: '/json',
+        success: DartHttpClientResponseSpec<Object?>(
+          status: 200,
+          contentType: 'application/json',
+          responseMode: DartHttpClientResponseMode.buffered,
+        ),
+      ),
+    );
+
+    expect(result.data, document);
+    expect(result.rawBody, jsonEncode(document));
   });
 
   test('transfers a native response lease into a request without Dart bytes', () async {
@@ -1764,5 +1848,10 @@ final class _SilencingProxy {
 
 final class _StreamingClient extends DartHttpClientBase {
   _StreamingClient(Uri baseUri, NativeHttpClientTransport transport)
+    : super(baseUri: baseUri, transport: transport);
+}
+
+final class _JsonClient extends DartHttpClientBase {
+  _JsonClient(Uri baseUri, HttpClientTransport transport)
     : super(baseUri: baseUri, transport: transport);
 }

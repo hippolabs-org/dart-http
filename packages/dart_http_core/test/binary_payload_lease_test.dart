@@ -40,6 +40,27 @@ void main() {
     expect(lease.closeCount, 1);
   });
 
+  test('zero-copy leased HTTP response hands its storage to bodyBytes', () {
+    final storage = Uint8List.fromList([7, 8, 9]);
+    final lease = _ZeroCopyByteLease(storage);
+    final response = DartHttpClientResponse.leased(
+      status: 200,
+      contentType: 'application/octet-stream',
+      body: lease,
+    );
+
+    final bytes = response.bodyBytes;
+    expect(identical(bytes, storage), isTrue);
+    expect(lease.takeViewCount, 1);
+    expect(lease.isClosed, isTrue);
+    response.close();
+    expect(bytes, [7, 8, 9]);
+
+    final copy = response.copyBodyBytes();
+    expect(copy, [7, 8, 9]);
+    expect(identical(copy, bytes), isFalse);
+  });
+
   test('leased HTTP response releases unmaterialized native ownership', () {
     final lease = _TrackingByteLease([4, 5, 6]);
     final response = DartHttpClientResponse.leased(
@@ -348,4 +369,37 @@ final class _TrackingBinaryPayloadLease implements BinaryPayloadLease {
       close();
     }
   }
+}
+
+final class _ZeroCopyByteLease implements DartHttpClientZeroCopyByteLease {
+  _ZeroCopyByteLease(this._bytes);
+
+  Uint8List? _bytes;
+  int takeViewCount = 0;
+
+  @override
+  int get length => _bytes!.length;
+
+  @override
+  bool get isClosed => _bytes == null;
+
+  @override
+  Uint8List get bytesView => _bytes!;
+
+  @override
+  Uint8List copyBytes() => Uint8List.fromList(_bytes!);
+
+  @override
+  Uint8List takeDartBytes() => throw StateError('A zero-copy lease must not be copied.');
+
+  @override
+  Uint8List takeView() {
+    takeViewCount++;
+    final bytes = _bytes!;
+    _bytes = null;
+    return bytes;
+  }
+
+  @override
+  void close() => _bytes = null;
 }

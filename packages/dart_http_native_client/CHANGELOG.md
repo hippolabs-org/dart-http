@@ -1,3 +1,16 @@
+## Unreleased
+
+- Buffered responses (`send`) are collected into one native allocation sized
+  from `Content-Length` (growing only when it is absent) and `bodyBytes` is a
+  zero-copy view of it. The view owns the allocation through a native
+  finalizer that reports it as external memory, so it stays valid after the
+  response or transport is closed. Behaviour change: `bodyBytes` is no longer
+  a Dart-heap list; writes to it modify the response buffer. Use
+  `copyBodyBytes()` for an independent copy.
+- Add `NativeHttpOwnedBufferView.takeOwnedView()` to turn a `sendLeased` body
+  (or any transferable Native Exchange lease) into a self-owning `Uint8List`
+  without copying.
+
 ## 0.2.27
 
 - Report native request-body consumption with bounded progress events. Require native ABI 18 and native artifacts 0.2.26.

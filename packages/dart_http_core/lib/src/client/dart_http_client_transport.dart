@@ -21,6 +21,18 @@ abstract interface class DartHttpClientNativeBody {
   int? get contentLength;
 }
 
+/// A [ByteLease] whose payload can become an ordinary [Uint8List] without a
+/// copy.
+///
+/// Native transports implement this for buffered response bodies: the
+/// returned list is a view of the native allocation and keeps it alive until
+/// the list and every view of it are garbage collected, so it stays valid after
+/// the response is closed.
+abstract interface class DartHttpClientZeroCopyByteLease implements ByteLease {
+  /// Moves the payload into a self-owning [Uint8List] and closes this lease.
+  Uint8List takeView();
+}
+
 /// Describes how a generated client consumes the response body.
 ///
 /// Transports use [serverSentEvents] to apply the HTTP semantics required for
@@ -182,6 +194,10 @@ final class DartHttpClientResponse {
   }
 
   /// Raw response body bytes.
+  ///
+  /// For a leased body this takes ownership of the payload. A transport that
+  /// implements [DartHttpClientZeroCopyByteLease] returns a view of its native
+  /// buffer without copying; use [copyBodyBytes] for a Dart-heap copy.
   Uint8List get bodyBytes {
     final storage = _storage;
     if (storage != null) {
@@ -196,7 +212,12 @@ final class DartHttpClientResponse {
     return _legacyResponseByteCache[this] = Uint8List.fromList(utf8.encode(_body ?? ''));
   }
 
+  /// Copies the response body into a new Dart-heap list.
+  Uint8List copyBodyBytes() => Uint8List.fromList(bodyBytes);
+
   /// Releases a native body that has not been materialized.
+  ///
+  /// Bytes already returned by [bodyBytes] own their storage and stay valid.
   void close() => _storage?.close();
 }
 
@@ -233,7 +254,9 @@ final class _DartHttpClientResponseBodyStorage {
     final lease = _lease;
     if (lease != null) {
       _lease = null;
-      return _bytes = lease.takeDartBytes();
+      return _bytes = lease is DartHttpClientZeroCopyByteLease
+          ? lease.takeView()
+          : lease.takeDartBytes();
     }
     return _bytes = Uint8List.fromList(utf8.encode(_text ?? ''));
   }
