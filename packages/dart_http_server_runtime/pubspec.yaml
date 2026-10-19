@@ -21,6 +21,7 @@ dependencies:
   json_schema:
     hosted: https://pub.hippolabs.org
     version: ^0.1.2
+  meta: ^1.17.0
   native_exchange:
     hosted: "https://pub.hippolabs.org"
     version: ^0.3.3

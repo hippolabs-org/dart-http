@@ -117,6 +117,32 @@ void main() {
       expect(response.status, HttpStatus.notFound);
     });
   });
+
+  test('releases the handshake context when a WebSocket upgrade fails after accept', () async {
+    final app = DartHttp<void>(services: () {});
+    app.websocket('/socket', onConnect: (_) async {});
+    final server = await app.listen(port: 0);
+    addTearDown(server.close);
+
+    // The route guards pass, so Dart stores the context and accepts. The
+    // upgrade itself then fails in Rust because Sec-WebSocket-Key is missing.
+    final response = await _rawRequest(
+      server.port,
+      'GET /socket HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\n'
+      'Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\r\n',
+    );
+    expect(response.status, isNot(HttpStatus.switchingProtocols));
+
+    await _waitFor(() => app.pendingHandshakeContextCount == 0);
+    expect(app.pendingHandshakeContextCount, 0);
+  });
+}
+
+Future<void> _waitFor(bool Function() condition) async {
+  final deadline = DateTime.now().add(const Duration(seconds: 5));
+  while (!condition() && DateTime.now().isBefore(deadline)) {
+    await Future<void>.delayed(const Duration(milliseconds: 20));
+  }
 }
 
 List<String> _csv(String? value) =>

@@ -7,6 +7,7 @@ import 'dart:typed_data';
 import 'package:dart_http_core/dart_http_core.dart';
 import 'package:native_exchange/native_exchange_ffi.dart' show NativeByteLease;
 import 'package:json_schema/json_schema.dart';
+import 'package:meta/meta.dart' show visibleForTesting;
 
 import '../native/dart_http_native.dart';
 import '../native/native_incoming_controller.dart';
@@ -40,6 +41,7 @@ const _transportEventWebTransportOperationReady = 12;
 const _transportEventBinaryStreamChunkCompleted = 13;
 const _transportEventBinaryStreamClosed = 14;
 const _transportEventWebSocketWriteCompleted = 15;
+const _transportEventHandshakeAbandoned = 16;
 const _binaryStreamChunkSize = 64 * 1024;
 
 /// Main application object for a Dart HTTP server.
@@ -90,6 +92,12 @@ class DartHttp<TServices> extends Router<TServices> {
       <int, Completer<NativeWebTransportOperation>>{};
   final Map<int, NativeWebTransportOperation> _earlyWebTransportOperations =
       <int, NativeWebTransportOperation>{};
+
+  /// Number of accepted WebSocket and WebTransport handshakes whose session
+  /// has not opened yet.
+  @visibleForTesting
+  int get pendingHandshakeContextCount =>
+      _pendingWebSocketContexts.length + _pendingWebTransportContexts.length;
 
   /// Installed JSON Schema registry used for validation and manifests.
   JsonSchemaRegistry? get schemaRegistry => _schemaRegistry;
@@ -262,6 +270,11 @@ class DartHttp<TServices> extends Router<TServices> {
         return;
       case _transportEventBinaryStreamClosed:
         _activeBinaryResponses[eventId]?.close();
+        return;
+      case _transportEventHandshakeAbandoned:
+        // The upgrade failed or the client left before the session opened.
+        _pendingWebSocketContexts.remove(eventId);
+        _pendingWebTransportContexts.remove(eventId);
         return;
       case _transportEventRequestReady:
         await _handleTransportRequest(eventId, compiledRoutes);

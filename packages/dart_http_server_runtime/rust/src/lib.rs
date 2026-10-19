@@ -48,7 +48,7 @@ use wtransport::{
     ServerConfig as WebTransportServerConfig, VarInt,
 };
 
-const DART_HTTP_SERVER_RUNTIME_NATIVE_ABI_VERSION: i32 = 24;
+const DART_HTTP_SERVER_RUNTIME_NATIVE_ABI_VERSION: i32 = 25;
 const MAX_BINARY_STREAM_CHUNK_BYTES: usize = 64 * 1024;
 const RESERVED_BLOCKING_WORKERS: usize = 16;
 const SCHEMA_REGISTRY_URI: &str = "urn:dart-http:schema-registry";
@@ -433,6 +433,43 @@ impl Drop for BinaryResponseLifetime {
             TransportEventKind::BinaryStreamClosed,
             self.request_id,
         );
+    }
+}
+
+/// Reports a WebSocket or WebTransport handshake that never opens a session.
+///
+/// Dart keeps the request context of an accepted handshake until the session
+/// opens. Every other outcome, including a rejected upgrade, a failed accept,
+/// or a client gone before the upgrade completes, drops this guard and tells
+/// Dart to release that context.
+struct HandshakeAbandonGuard {
+    request_id: i64,
+    runtime_state: Option<ServerRuntimeState>,
+}
+
+impl HandshakeAbandonGuard {
+    fn new(request_id: i64, runtime_state: &ServerRuntimeState) -> Self {
+        Self {
+            request_id,
+            runtime_state: Some(runtime_state.clone()),
+        }
+    }
+
+    /// Marks the handshake as opened; the session events take over.
+    fn disarm(mut self) {
+        self.runtime_state = None;
+    }
+}
+
+impl Drop for HandshakeAbandonGuard {
+    fn drop(&mut self) {
+        if let Some(runtime_state) = self.runtime_state.take() {
+            notify_transport_event(
+                &runtime_state,
+                TransportEventKind::HandshakeAbandoned,
+                self.request_id,
+            );
+        }
     }
 }
 
@@ -1238,6 +1275,9 @@ enum TransportEventKind {
     WebTransportOperationReady = 12,
     BinaryStreamChunkCompleted = 13,
     BinaryStreamClosed = 14,
+    /// A WebSocket or WebTransport handshake (event id: request id) ended
+    /// without opening a session.
+    HandshakeAbandoned = 16,
 }
 
 #[unsafe(no_mangle)]
@@ -3165,6 +3205,7 @@ async fn handle_web_socket_request(
             Ok(value) => value,
             Err(error_response) => return error_response,
         };
+    let handshake = HandshakeAbandonGuard::new(request_id, &runtime_state);
 
     match response_rx.recv().await {
         Some(PendingResponseMessage::Http(transport_response)) => response_body_with_headers(
@@ -3188,6 +3229,7 @@ async fn handle_web_socket_request(
                 .on_upgrade(move |socket| {
                     handle_web_socket_session(
                         socket,
+                        handshake,
                         request_id,
                         route_id,
                         path_params,
@@ -3213,6 +3255,7 @@ async fn handle_web_socket_request(
 
 async fn handle_web_socket_session(
     socket: WebSocket,
+    handshake: HandshakeAbandonGuard,
     request_id: i64,
     route_id: String,
     path_params: HashMap<String, String>,
@@ -3253,6 +3296,7 @@ async fn handle_web_socket_session(
             accepting_messages: true,
         },
     );
+    handshake.disarm();
     notify_transport_event(
         &runtime_state,
         TransportEventKind::WebSocketOpened,
@@ -3471,6 +3515,7 @@ async fn handle_web_transport_incoming_session(
                 return Ok(());
             }
         };
+    let handshake = HandshakeAbandonGuard::new(request_id, &runtime_state);
 
     match response_rx.recv().await {
         Some(PendingResponseMessage::Http(_)) => {
@@ -3485,6 +3530,7 @@ async fn handle_web_transport_incoming_session(
                 .map_err(|error| format!("Failed to accept WebTransport session: {error}"))?;
             handle_web_transport_session(
                 connection,
+                handshake,
                 request_id,
                 route_id,
                 path_params,
@@ -3506,6 +3552,7 @@ async fn handle_web_transport_incoming_session(
 
 async fn handle_web_transport_session(
     connection: WebTransportConnection,
+    handshake: HandshakeAbandonGuard,
     request_id: i64,
     route_id: String,
     path_params: HashMap<String, String>,
@@ -3542,6 +3589,7 @@ async fn handle_web_transport_session(
             },
         );
     }
+    handshake.disarm();
     notify_transport_event(
         &runtime_state,
         TransportEventKind::WebTransportOpened,

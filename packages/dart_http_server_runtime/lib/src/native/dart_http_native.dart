@@ -71,8 +71,8 @@ abstract final class DartHttpNative {
     required String middlewaresJson,
     required Pointer<NativeFunction<NativeTransportEvent>> callback,
   }) {
-    if (abiVersion != 24) {
-      throw StateError('Dart HTTP runtime requires native ABI 24; loaded $abiVersion.');
+    if (abiVersion != 25) {
+      throw StateError('Dart HTTP runtime requires native ABI 25; loaded $abiVersion.');
     }
     final hostPtr = host.toNativeUtf8();
     final routesJsonPtr = routesJson.toNativeUtf8();
