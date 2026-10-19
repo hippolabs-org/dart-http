@@ -47,15 +47,13 @@ use wtransport::{
     ServerConfig as WebTransportServerConfig, VarInt,
 };
 
-const DART_HTTP_SERVER_RUNTIME_NATIVE_ABI_VERSION: i32 = 26;
+const DART_HTTP_SERVER_RUNTIME_NATIVE_ABI_VERSION: i32 = 27;
 const MAX_BINARY_STREAM_CHUNK_BYTES: usize = 64 * 1024;
 const RESERVED_BLOCKING_WORKERS: usize = 16;
 const SCHEMA_REGISTRY_URI: &str = "urn:dart-http:schema-registry";
 const DEFAULT_REALTIME_MAX_PENDING_MESSAGES: usize = 256;
 const DEFAULT_REALTIME_MAX_PENDING_BYTES: usize = 8 * 1024 * 1024;
 const REALTIME_OVERLOAD_CODE: u32 = 0x100;
-
-type TransportEventCallback = extern "C" fn(i32, i64);
 
 static NEXT_REQUEST_ID: AtomicI64 = AtomicI64::new(1);
 static NEXT_BINARY_CHUNK_ID: AtomicI64 = AtomicI64::new(1);
@@ -65,8 +63,7 @@ static NEXT_WEB_TRANSPORT_SESSION_ID: AtomicI64 = AtomicI64::new(1);
 static NEXT_WEB_TRANSPORT_STREAM_HANDLE_ID: AtomicI64 = AtomicI64::new(1);
 static NEXT_WEB_TRANSPORT_OPERATION_ID: AtomicI64 = AtomicI64::new(1);
 static LAST_ERROR: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None));
-static PENDING_REQUESTS: Lazy<Mutex<HashMap<i64, PendingRequest>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+static PENDING_REQUESTS: Lazy<PendingRequests> = Lazy::new(PendingRequests::new);
 static WEB_SOCKET_SESSIONS: Lazy<Mutex<HashMap<i64, WebSocketSessionState>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 static WEB_TRANSPORT_SESSIONS: Lazy<Mutex<HashMap<i64, WebTransportSessionState>>> =
@@ -83,6 +80,102 @@ const SERVER_SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 static SERVER_STATES: Lazy<Mutex<HashMap<i64, ServerState>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
+/// Number of independently locked partitions of the pending-request table.
+/// Request ids are sequential, so consecutive requests land on different
+/// shards and concurrent workers rarely contend.
+const PENDING_REQUEST_SHARDS: usize = 64;
+
+/// Requests waiting for (or streaming) a Dart response, partitioned by id so
+/// the per-request hot path never serializes on one global lock.
+struct PendingRequests {
+    shards: [Mutex<HashMap<i64, PendingRequest>>; PENDING_REQUEST_SHARDS],
+}
+
+impl PendingRequests {
+    fn new() -> Self {
+        Self {
+            shards: std::array::from_fn(|_| Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn shard(&self, request_id: i64) -> std::sync::MutexGuard<'_, HashMap<i64, PendingRequest>> {
+        let index = (request_id as u64 % PENDING_REQUEST_SHARDS as u64) as usize;
+        self.shards[index]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn insert(&self, request_id: i64, request: PendingRequest) {
+        self.shard(request_id).insert(request_id, request);
+    }
+
+    fn remove(&self, request_id: i64) -> Option<PendingRequest> {
+        self.shard(request_id).remove(&request_id)
+    }
+
+    /// Runs `update` on one pending request while only its shard is locked.
+    fn with<R>(&self, request_id: i64, update: impl FnOnce(&mut PendingRequest) -> R) -> Option<R> {
+        self.shard(request_id).get_mut(&request_id).map(update)
+    }
+
+    /// Removes every pending request that belongs to `server_id`.
+    fn drain_server(&self, server_id: i64) -> Vec<PendingRequest> {
+        let mut drained = Vec::new();
+        for shard in &self.shards {
+            let mut shard = shard
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let request_ids = shard
+                .iter()
+                .filter_map(|(request_id, request)| {
+                    (request.server_id == server_id).then_some(*request_id)
+                })
+                .collect::<Vec<_>>();
+            drained.extend(request_ids.into_iter().filter_map(|id| shard.remove(&id)));
+        }
+        drained
+    }
+}
+
+/// Where one server posts transport events for its Dart isolate.
+///
+/// Events go to a Dart native port with `Dart_PostInteger`, which is safe to
+/// call concurrently and after the port closed, so posting needs no lock:
+/// the hot path reads two immutable fields and one atomic flag.
+struct ServerEvents {
+    port: i64,
+    stopped: AtomicBool,
+}
+
+impl ServerEvents {
+    fn new(port: i64) -> Self {
+        Self {
+            port,
+            stopped: AtomicBool::new(false),
+        }
+    }
+
+    fn stop(&self) {
+        self.stopped.store(true, Ordering::Release);
+    }
+
+    fn post(&self, event_kind: TransportEventKind, event_id: i64) -> bool {
+        if self.stopped.load(Ordering::Acquire) {
+            return false;
+        }
+        post_dart_integer(self.port, encode_transport_event(event_kind, event_id))
+    }
+}
+
+/// Packs an event into one Dart integer: the id (which may be negative) in
+/// the high bits and the kind in the low five bits. Dart decodes it with an
+/// arithmetic shift and a mask.
+const fn encode_transport_event(event_kind: TransportEventKind, event_id: i64) -> i64 {
+    (event_id << TRANSPORT_EVENT_KIND_BITS) | event_kind as i64
+}
+
+const TRANSPORT_EVENT_KIND_BITS: u32 = 5;
+
 struct PendingRequest {
     server_id: i64,
     request: Option<TransportRequest>,
@@ -94,6 +187,7 @@ struct PendingRequest {
 struct ServerState {
     shutdown_tx: Option<watch::Sender<bool>>,
     join_handle: Option<thread::JoinHandle<()>>,
+    events: Arc<ServerEvents>,
 }
 
 #[derive(Clone)]
@@ -101,7 +195,7 @@ struct ServerRuntimeState {
     server_id: i64,
     routes: Arc<Vec<CompiledRoute>>,
     schemas: Arc<HashMap<String, jsonschema::Validator>>,
-    callback: TransportEventCallback,
+    events: Arc<ServerEvents>,
     native_stream_slots: Arc<Semaphore>,
     stream_stall_timeout: Duration,
     body_limit: usize,
@@ -390,14 +484,15 @@ impl BinaryChunkCompletion {
         if self.completed.swap(true, Ordering::AcqRel) {
             return;
         }
-        if let Some(request) = PENDING_REQUESTS.lock().unwrap().get_mut(&self.request_id)
-            && request
+        PENDING_REQUESTS.with(self.request_id, |request| {
+            if request
                 .binary_chunk
                 .as_ref()
                 .is_some_and(|chunk| chunk.operation_id == self.operation_id)
-        {
-            request.binary_chunk = None;
-        }
+            {
+                request.binary_chunk = None;
+            }
+        });
         notify_transport_event(
             &self.runtime_state,
             TransportEventKind::BinaryStreamChunkCompleted,
@@ -1294,6 +1389,89 @@ pub extern "C" fn dart_http_server_runtime_native_abi_version() -> i32 {
 }
 
 #[unsafe(no_mangle)]
+/// Initializes the part of the Dart native API used to post transport events.
+/// Idempotent; returns 0 on success.
+///
+/// # Safety
+///
+/// `data` must be `NativeApi.initializeApiDLData` from the running Dart VM.
+pub unsafe extern "C" fn dart_http_server_runtime_initialize_api_dl(
+    data: *mut std::ffi::c_void,
+) -> i32 {
+    match unsafe { initialize_dart_api_dl(data) } {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("dart_http_server_runtime could not initialize the Dart API: {error}");
+            -1
+        }
+    }
+}
+
+struct DartApi {
+    post_integer: unsafe extern "C" fn(i64, i64) -> bool,
+}
+
+static DART_API: std::sync::OnceLock<DartApi> = std::sync::OnceLock::new();
+
+fn post_dart_integer(port: i64, value: i64) -> bool {
+    match DART_API.get() {
+        Some(api) if port != 0 => unsafe { (api.post_integer)(port, value) },
+        _ => false,
+    }
+}
+
+#[repr(C)]
+struct DartApiEntry {
+    name: *const c_char,
+    function: *const std::ffi::c_void,
+}
+
+#[repr(C)]
+struct DartApiTable {
+    major: std::ffi::c_int,
+    minor: std::ffi::c_int,
+    functions: *const DartApiEntry,
+}
+
+unsafe fn initialize_dart_api_dl(data: *mut std::ffi::c_void) -> Result<(), String> {
+    if DART_API.get().is_some() {
+        return Ok(());
+    }
+    if data.is_null() {
+        return Err("missing Dart API DL data".to_owned());
+    }
+    let api = unsafe { &*data.cast::<DartApiTable>() };
+    if api.major != 2 {
+        return Err(format!(
+            "unsupported Dart API DL version {}.{}",
+            api.major, api.minor
+        ));
+    }
+    let mut post_integer = None;
+    let mut index = 0;
+    loop {
+        let entry = unsafe { &*api.functions.add(index) };
+        if entry.name.is_null() {
+            break;
+        }
+        if unsafe { CStr::from_ptr(entry.name) }.to_bytes() == b"Dart_PostInteger" {
+            post_integer = Some(entry.function);
+            break;
+        }
+        index += 1;
+    }
+    let function = post_integer.ok_or_else(|| "Dart_PostInteger is unavailable".to_owned())?;
+    let _ = DART_API.set(DartApi {
+        post_integer: unsafe {
+            std::mem::transmute::<*const std::ffi::c_void, unsafe extern "C" fn(i64, i64) -> bool>(
+                function,
+            )
+        },
+    });
+    Ok(())
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn dart_http_server_runtime_start_server(
     host: *const c_char,
     port: i64,
@@ -1305,8 +1483,12 @@ pub extern "C" fn dart_http_server_runtime_start_server(
     web_socket_write_stall_timeout_ms: i64,
     routes_json: *const c_char,
     middlewares_json: *const c_char,
-    callback: TransportEventCallback,
+    event_port: i64,
 ) -> i64 {
+    if event_port == 0 || DART_API.get().is_none() {
+        eprintln!("dart_http_server_runtime needs an event port and an initialized Dart API.");
+        return -1;
+    }
     let Some(host) = (unsafe { read_c_string(host) }) else {
         return -1;
     };
@@ -1340,6 +1522,7 @@ pub extern "C" fn dart_http_server_runtime_start_server(
     };
 
     let server_id = NEXT_SERVER_ID.fetch_add(1, Ordering::Relaxed);
+    let events = Arc::new(ServerEvents::new(event_port));
     let runtime_state = ServerRuntimeState {
         server_id,
         routes: Arc::new(compiled_manifest.routes),
@@ -1350,7 +1533,7 @@ pub extern "C" fn dart_http_server_runtime_start_server(
         web_socket_write_stall_timeout: Duration::from_millis(
             web_socket_write_stall_timeout_ms.max(1) as u64,
         ),
-        callback,
+        events: Arc::clone(&events),
         native_stream_slots: Arc::new(Semaphore::new(native_stream_worker_count.max(1) as usize)),
         stream_stall_timeout: Duration::from_millis(stream_stall_timeout_ms.max(1) as u64),
     };
@@ -1365,6 +1548,7 @@ pub extern "C" fn dart_http_server_runtime_start_server(
         ServerState {
             shutdown_tx: Some(shutdown_tx),
             join_handle: None,
+            events: Arc::clone(&events),
         },
     );
     let bind_host = host;
@@ -1488,12 +1672,14 @@ pub extern "C" fn dart_http_server_runtime_start_server(
         }
         Ok(Err(error)) => {
             SERVER_STATES.lock().unwrap().remove(&server_id);
+            events.stop();
             eprintln!("dart_http_server_runtime transport startup failed: {error}");
             let _ = join_handle.join();
             -1
         }
         Err(error) => {
             SERVER_STATES.lock().unwrap().remove(&server_id);
+            events.stop();
             eprintln!("dart_http_server_runtime transport startup failed: {error}");
             let _ = join_handle.join();
             -1
@@ -1517,17 +1703,7 @@ pub extern "C" fn dart_http_server_runtime_stop_server() {
 #[unsafe(no_mangle)]
 pub extern "C" fn dart_http_server_runtime_stop_server_by_id(server_id: i64) {
     {
-        let mut pending = PENDING_REQUESTS.lock().unwrap();
-        let request_ids = pending
-            .iter()
-            .filter_map(|(request_id, request)| {
-                (request.server_id == server_id).then_some(*request_id)
-            })
-            .collect::<Vec<_>>();
-        for request_id in request_ids {
-            let Some(request) = pending.remove(&request_id) else {
-                continue;
-            };
+        for request in PENDING_REQUESTS.drain_server(server_id) {
             let _ = request
                 .response_tx
                 .send(PendingResponseMessage::Http(TransportResponse {
@@ -1582,6 +1758,8 @@ pub extern "C" fn dart_http_server_runtime_stop_server_by_id(server_id: i64) {
 
     let server_state = SERVER_STATES.lock().unwrap().remove(&server_id);
     if let Some(mut state) = server_state {
+        // No event reaches Dart after this returns, so Dart may close its port.
+        state.events.stop();
         if let Some(shutdown_tx) = state.shutdown_tx.take() {
             let _ = shutdown_tx.send(true);
         }
@@ -1593,11 +1771,12 @@ pub extern "C" fn dart_http_server_runtime_stop_server_by_id(server_id: i64) {
 pub extern "C" fn dart_http_server_runtime_take_request(
     request_id: i64,
 ) -> *mut NativeTransportRequest {
-    let mut pending = PENDING_REQUESTS.lock().unwrap();
-    let Some(request) = pending.get_mut(&request_id) else {
-        return std::ptr::null_mut();
-    };
-    let Some(request) = request.request.take() else {
+    // Only the take happens under the shard lock; building the native view
+    // of the request does not.
+    let Some(request) = PENDING_REQUESTS
+        .with(request_id, |request| request.request.take())
+        .flatten()
+    else {
         return std::ptr::null_mut();
     };
 
@@ -1725,22 +1904,23 @@ pub extern "C" fn dart_http_server_runtime_start_binary_stream_chunk(
     if chunk.len() > MAX_BINARY_STREAM_CHUNK_BYTES {
         return 0;
     }
-    let (response_tx, completion) = {
-        let mut pending = PENDING_REQUESTS.lock().unwrap();
-        let Some(request) = pending.get_mut(&request_id) else {
-            return 0;
-        };
-        if request.binary_chunk.is_some() {
-            return 0;
-        }
-        let completion = Arc::new(BinaryChunkCompletion {
-            operation_id: NEXT_BINARY_CHUNK_ID.fetch_add(1, Ordering::Relaxed),
-            request_id,
-            runtime_state: request.runtime_state.clone(),
-            completed: AtomicBool::new(false),
-        });
-        request.binary_chunk = Some(completion.clone());
-        (request.response_tx.clone(), completion)
+    let Some((response_tx, completion)) = PENDING_REQUESTS
+        .with(request_id, |request| {
+            if request.binary_chunk.is_some() {
+                return None;
+            }
+            let completion = Arc::new(BinaryChunkCompletion {
+                operation_id: NEXT_BINARY_CHUNK_ID.fetch_add(1, Ordering::Relaxed),
+                request_id,
+                runtime_state: request.runtime_state.clone(),
+                completed: AtomicBool::new(false),
+            });
+            request.binary_chunk = Some(completion.clone());
+            Some((request.response_tx.clone(), completion))
+        })
+        .flatten()
+    else {
+        return 0;
     };
     let operation_id = completion.operation_id;
     let message = PendingResponseMessage::BinaryChunk {
@@ -1755,7 +1935,7 @@ pub extern "C" fn dart_http_server_runtime_start_binary_stream_chunk(
 }
 
 fn cancel_binary_response(request_id: i64) {
-    let request = { PENDING_REQUESTS.lock().unwrap().remove(&request_id) };
+    let request = PENDING_REQUESTS.remove(request_id);
     if let Some(request) = request {
         if let Some(chunk) = request.binary_chunk {
             chunk.complete(false);
@@ -3575,22 +3755,19 @@ fn dispatch_request_to_dart(
 ) -> Result<(i64, mpsc::UnboundedReceiver<PendingResponseMessage>), Response<Body>> {
     let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
     let (response_tx, response_rx) = mpsc::unbounded_channel::<PendingResponseMessage>();
-    {
-        let mut pending = PENDING_REQUESTS.lock().unwrap();
-        pending.insert(
-            request_id,
-            PendingRequest {
-                server_id: runtime_state.server_id,
-                request: Some(transport_request),
-                response_tx,
-                runtime_state: runtime_state.clone(),
-                binary_chunk: None,
-            },
-        );
-    }
+    PENDING_REQUESTS.insert(
+        request_id,
+        PendingRequest {
+            server_id: runtime_state.server_id,
+            request: Some(transport_request),
+            response_tx,
+            runtime_state: runtime_state.clone(),
+            binary_chunk: None,
+        },
+    );
 
     if !notify_transport_event(runtime_state, TransportEventKind::RequestReady, request_id) {
-        let _ = PENDING_REQUESTS.lock().unwrap().remove(&request_id);
+        let _ = PENDING_REQUESTS.remove(request_id);
         return Err(response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "text/plain; charset=utf-8",
@@ -3606,19 +3783,15 @@ fn send_pending_response_message(
     message: PendingResponseMessage,
     remove: bool,
 ) -> bool {
-    let response_tx = {
-        let mut pending = PENDING_REQUESTS.lock().unwrap();
-        if remove {
-            let Some(request) = pending.remove(&request_id) else {
-                return false;
-            };
-            request.response_tx
-        } else {
-            let Some(request) = pending.get(&request_id) else {
-                return false;
-            };
-            request.response_tx.clone()
-        }
+    let response_tx = if remove {
+        PENDING_REQUESTS
+            .remove(request_id)
+            .map(|request| request.response_tx)
+    } else {
+        PENDING_REQUESTS.with(request_id, |request| request.response_tx.clone())
+    };
+    let Some(response_tx) = response_tx else {
+        return false;
     };
 
     if response_tx.send(message).is_ok() {
@@ -3626,7 +3799,7 @@ fn send_pending_response_message(
     }
 
     if !remove {
-        let _ = PENDING_REQUESTS.lock().unwrap().remove(&request_id);
+        let _ = PENDING_REQUESTS.remove(request_id);
     }
     false
 }
@@ -3636,15 +3809,9 @@ fn notify_transport_event(
     event_kind: TransportEventKind,
     event_id: i64,
 ) -> bool {
-    // Keep callback invocation and server removal mutually exclusive. Native
-    // listener callbacks only enqueue into Dart and cannot re-enter this lock.
-    let servers = SERVER_STATES.lock().unwrap();
-    if !servers.contains_key(&runtime_state.server_id) {
-        return false;
-    }
-
-    (runtime_state.callback)(event_kind as i32, event_id);
-    true
+    // No lock: posting to a Dart port is thread safe and harmless after the
+    // port closed, and a stopped server refuses new events.
+    runtime_state.events.post(event_kind, event_id)
 }
 
 fn wants_web_socket_upgrade(headers: &HeaderMap) -> bool {
@@ -5690,14 +5857,12 @@ mod tests {
     use std::mem::size_of;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
 
-    extern "C" fn unused_test_callback(_kind: i32, _id: i64) {}
-
     fn test_runtime_state() -> ServerRuntimeState {
         ServerRuntimeState {
             server_id: 0,
             routes: Arc::new(Vec::new()),
             schemas: Arc::new(HashMap::new()),
-            callback: unused_test_callback,
+            events: Arc::new(ServerEvents::new(0)),
             native_stream_slots: Arc::new(Semaphore::new(1)),
             stream_stall_timeout: Duration::from_secs(1),
             body_limit: 1024,
@@ -5705,6 +5870,55 @@ mod tests {
             web_socket_max_pending_bytes: 1024,
             web_socket_write_stall_timeout: Duration::from_secs(1),
         }
+    }
+
+    #[test]
+    fn transport_events_pack_kind_and_signed_id_into_one_integer() {
+        for id in [1_i64, 42, -42, (1 << 57) - 1, -(1 << 57)] {
+            let packed = encode_transport_event(TransportEventKind::BinaryStreamChunkCompleted, id);
+            assert_eq!(
+                packed & 0x1f,
+                TransportEventKind::BinaryStreamChunkCompleted as i64
+            );
+            assert_eq!(packed >> TRANSPORT_EVENT_KIND_BITS, id);
+        }
+    }
+
+    #[test]
+    fn stopped_servers_refuse_events_without_a_lock() {
+        let events = ServerEvents::new(0);
+        assert!(!events.post(TransportEventKind::RequestReady, 1));
+        events.stop();
+        assert!(events.stopped.load(Ordering::Acquire));
+        assert!(!events.post(TransportEventKind::RequestReady, 1));
+    }
+
+    #[test]
+    fn pending_requests_shard_by_id_and_drain_per_server() {
+        let requests = PendingRequests::new();
+        let mut receivers = Vec::new();
+        for request_id in 1..=200_i64 {
+            let (response_tx, response_rx) = mpsc::unbounded_channel();
+            receivers.push(response_rx);
+            requests.insert(
+                request_id,
+                PendingRequest {
+                    server_id: request_id % 2,
+                    request: None,
+                    response_tx,
+                    runtime_state: test_runtime_state(),
+                    binary_chunk: None,
+                },
+            );
+        }
+        assert_eq!(requests.with(7, |request| request.server_id), Some(1));
+        assert!(requests.remove(7).is_some());
+        assert!(requests.remove(7).is_none());
+        let drained = requests.drain_server(1);
+        assert_eq!(drained.len(), 99);
+        assert!(drained.iter().all(|request| request.server_id == 1));
+        assert_eq!(requests.drain_server(0).len(), 100);
+        assert!(requests.with(8, |_| ()).is_none());
     }
 
     #[test]
@@ -6028,7 +6242,7 @@ mod tests {
     fn binary_chunks_return_before_consumption_and_bound_in_flight_bytes() {
         let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
         let (response_tx, mut response_rx) = mpsc::unbounded_channel();
-        PENDING_REQUESTS.lock().unwrap().insert(
+        PENDING_REQUESTS.insert(
             request_id,
             PendingRequest {
                 server_id: 0,

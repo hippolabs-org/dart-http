@@ -14,7 +14,12 @@ import 'native_transport_request.dart';
 import 'native_transport_web_socket.dart';
 import 'native_transport_web_transport.dart';
 
-typedef NativeTransportEvent = Void Function(Int32, Int64);
+/// Native ABI this package's bindings were generated for.
+const dartHttpServerRuntimeNativeAbiVersion = 27;
+
+/// Low bits of a transport event message that hold the event kind; the rest
+/// is the (signed) event id. See [DartHttpNative.decodeTransportEvent].
+const _transportEventKindBits = 5;
 
 final class NativeServerStartResult {
   const NativeServerStartResult({required this.serverId, required this.port});
@@ -57,7 +62,25 @@ abstract final class DartHttpNative {
   /// Whether the current process can load the bundled runtime asset.
   static bool get hasBundledRuntime => abiVersion >= 13;
 
+  /// Decodes one message posted to a server's event port into its kind and id.
+  static (int kind, int id) decodeTransportEvent(int message) =>
+      (message & ((1 << _transportEventKindBits) - 1), message >> _transportEventKindBits);
+
+  static var _dartApiInitialized = false;
+
+  static void _ensureDartApi() {
+    if (_dartApiInitialized) return;
+    if (gen.dart_http_server_runtime_initialize_api_dl(NativeApi.initializeApiDLData) != 0) {
+      throw StateError('Could not initialize the Dart native API for the HTTP runtime.');
+    }
+    _dartApiInitialized = true;
+  }
+
   /// Starts the native HTTP server.
+  ///
+  /// Transport events are posted to the native port [eventPort] (a
+  /// [SendPort.nativePort]) as integers; decode them with
+  /// [decodeTransportEvent]. Close that port only after [stopServerById].
   static NativeServerStartResult startServer(
     String host,
     int port, {
@@ -69,11 +92,15 @@ abstract final class DartHttpNative {
     required Duration webSocketWriteStallTimeout,
     required String routesJson,
     required String middlewaresJson,
-    required Pointer<NativeFunction<NativeTransportEvent>> callback,
+    required int eventPort,
   }) {
-    if (abiVersion != 26) {
-      throw StateError('Dart HTTP runtime requires native ABI 26; loaded $abiVersion.');
+    if (abiVersion != dartHttpServerRuntimeNativeAbiVersion) {
+      throw StateError(
+        'Dart HTTP runtime requires native ABI $dartHttpServerRuntimeNativeAbiVersion; '
+        'loaded $abiVersion.',
+      );
     }
+    _ensureDartApi();
     final hostPtr = host.toNativeUtf8();
     final routesJsonPtr = routesJson.toNativeUtf8();
     final middlewaresJsonPtr = middlewaresJson.toNativeUtf8();
@@ -90,7 +117,7 @@ abstract final class DartHttpNative {
         webSocketWriteStallTimeout.inMilliseconds,
         routesJsonPtr.cast<Char>(),
         middlewaresJsonPtr.cast<Char>(),
-        callback,
+        eventPort,
       );
       if (result <= 0) {
         return const NativeServerStartResult(serverId: -1, port: -1);

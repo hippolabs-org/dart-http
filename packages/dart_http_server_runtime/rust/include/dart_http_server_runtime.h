@@ -15,10 +15,6 @@ typedef struct NativePair {
   NativeBytes value;
 } NativePair;
 
-typedef void (*dart_http_server_runtime_transport_event_callback_t)(
-    int32_t event_kind,
-    int64_t event_id);
-
 typedef struct NativeTransportRequest {
   NativeBytes route_id;
   intptr_t path_param_count;
@@ -121,6 +117,10 @@ typedef struct NativeMultipartForm {
 
 int32_t dart_http_server_runtime_native_abi_version(void);
 
+/* Initializes Dart_PostInteger from NativeApi.initializeApiDLData. Transport
+ * events are posted to the server's event port as (event_id << 5) | kind. */
+int32_t dart_http_server_runtime_initialize_api_dl(void* data);
+
 int64_t dart_http_server_runtime_start_server(
     const char* host,
     int64_t port,
@@ -132,7 +132,7 @@ int64_t dart_http_server_runtime_start_server(
     int64_t web_socket_write_stall_timeout_ms,
     const char* routes_json,
     const char* middlewares_json,
-    dart_http_server_runtime_transport_event_callback_t callback);
+    int64_t event_port);
 
 void dart_http_server_runtime_stop_server(void);
 

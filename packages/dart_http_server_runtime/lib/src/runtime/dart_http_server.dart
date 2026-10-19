@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:ffi';
 import 'dart:io';
+import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:dart_http_core/dart_http_core.dart';
@@ -1359,8 +1360,6 @@ WebSocketMessage _decodeWebSocketMessage(NativeWebSocketMessage message) {
   };
 }
 
-typedef _NativeTransportEvent = Void Function(Int32, Int64);
-
 // Keep only the current wait cancellable. Racing every chunk against one
 // long-lived disconnect future would retain a listener for every sent chunk.
 final class _BinaryResponseProgress {
@@ -1410,13 +1409,13 @@ final class _RustTransportSession {
     required this.serverId,
     required this.host,
     required this.port,
-    required this.callback,
+    required this.events,
   });
 
   final int serverId;
   final String host;
   final int port;
-  final NativeCallable<_NativeTransportEvent> callback;
+  final ReceivePort events;
   var _closed = false;
 
   static Future<_RustTransportSession> start({
@@ -1432,28 +1431,33 @@ final class _RustTransportSession {
     required String middlewaresJson,
     required Future<void> Function(int eventKind, int eventId) onTransportEvent,
   }) async {
-    late final NativeCallable<_NativeTransportEvent> callback;
-
-    void handleTransportEvent(int eventKind, int eventId) {
+    final events = ReceivePort('dart_http_server_runtime transport events');
+    events.listen((message) {
+      if (message is! int) return;
+      final (eventKind, eventId) = DartHttpNative.decodeTransportEvent(message);
       unawaited(onTransportEvent(eventKind, eventId));
+    });
+    final NativeServerStartResult startResult;
+    try {
+      startResult = DartHttpNative.startServer(
+        host,
+        requestedPort,
+        workers: workers,
+        nativeStreamWorkers: nativeStreamWorkers,
+        streamStallTimeout: streamStallTimeout,
+        webSocketMaxPendingMessages: webSocketMaxPendingMessages,
+        webSocketMaxPendingBytes: webSocketMaxPendingBytes,
+        webSocketWriteStallTimeout: webSocketWriteStallTimeout,
+        routesJson: routesJson,
+        middlewaresJson: middlewaresJson,
+        eventPort: events.sendPort.nativePort,
+      );
+    } catch (_) {
+      events.close();
+      rethrow;
     }
-
-    callback = NativeCallable<_NativeTransportEvent>.listener(handleTransportEvent);
-    final startResult = DartHttpNative.startServer(
-      host,
-      requestedPort,
-      workers: workers,
-      nativeStreamWorkers: nativeStreamWorkers,
-      streamStallTimeout: streamStallTimeout,
-      webSocketMaxPendingMessages: webSocketMaxPendingMessages,
-      webSocketMaxPendingBytes: webSocketMaxPendingBytes,
-      webSocketWriteStallTimeout: webSocketWriteStallTimeout,
-      routesJson: routesJson,
-      middlewaresJson: middlewaresJson,
-      callback: callback.nativeFunction,
-    );
     if (startResult.port <= 0 || startResult.serverId <= 0) {
-      callback.close();
+      events.close();
       throw StateError('Failed to start Rust-backed transport runtime.');
     }
 
@@ -1461,7 +1465,7 @@ final class _RustTransportSession {
       serverId: startResult.serverId,
       host: host,
       port: startResult.port,
-      callback: callback,
+      events: events,
     );
   }
 
@@ -1471,7 +1475,7 @@ final class _RustTransportSession {
     }
     _closed = true;
     DartHttpNative.stopServerById(serverId);
-    callback.close();
+    events.close();
   }
 }
 

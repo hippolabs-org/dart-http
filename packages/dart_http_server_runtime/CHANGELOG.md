@@ -1,5 +1,16 @@
 ## Unreleased
 
+- **Breaking (FFI facade):** transport events reach Dart through a native port
+  instead of a `NativeCallable.listener`. `DartHttpNative.startServer` takes
+  `eventPort` (a `SendPort.nativePort`) instead of `callback`, the
+  `NativeTransportEvent` typedef is gone, and messages are decoded with
+  `DartHttpNative.decodeTransportEvent`. Native ABI 27
+  (`dartHttpServerRuntimeNativeAbiVersion`; new
+  `dart_http_server_runtime_initialize_api_dl`).
+- Posting an event no longer takes the global server-state mutex: each server
+  owns an `Arc` with its port and a stopped flag, and `Dart_PostInteger` is
+  called without any lock held. Pending requests live in a 64-way sharded
+  table, and `take_request` builds the native request view outside the lock.
 - **Breaking:** Remove the unused `DartHttpNative.sendSseChunk` and its
   `dart_http_server_runtime_send_sse_chunk` export; SSE responses stream
   through the backpressured binary chunk path.

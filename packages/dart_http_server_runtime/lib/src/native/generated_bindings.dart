@@ -92,6 +92,9 @@ external void dart_http_server_runtime_free_web_transport_stream_terminal(
   ffi.Pointer<NativeWebTransportStreamTerminal> value,
 );
 
+@ffi.Native<ffi.Int32 Function(ffi.Pointer<ffi.Void>)>()
+external int dart_http_server_runtime_initialize_api_dl(ffi.Pointer<ffi.Void> data);
+
 @ffi.Native<ffi.Int32 Function()>(isLeaf: true)
 external int dart_http_server_runtime_native_abi_version();
 
@@ -183,7 +186,7 @@ external bool dart_http_server_runtime_start_native_binary_stream_response(
     ffi.Int64,
     ffi.Pointer<ffi.Char>,
     ffi.Pointer<ffi.Char>,
-    dart_http_server_runtime_transport_event_callback_t,
+    ffi.Int64,
   )
 >()
 external int dart_http_server_runtime_start_server(
@@ -197,7 +200,7 @@ external int dart_http_server_runtime_start_server(
   int web_socket_write_stall_timeout_ms,
   ffi.Pointer<ffi.Char> routes_json,
   ffi.Pointer<ffi.Char> middlewares_json,
-  dart_http_server_runtime_transport_event_callback_t callback,
+  int event_port,
 );
 
 @ffi.Native<ffi.Bool Function(ffi.Int64, ffi.Int32, ffi.IntPtr, ffi.Pointer<NativePair>)>()
@@ -544,6 +547,3 @@ final class NativeWebTransportStreamTerminal extends ffi.Struct {
 
   external NativeBytes error;
 }
-
-typedef dart_http_server_runtime_transport_event_callback_t =
-    ffi.Pointer<ffi.NativeFunction<ffi.Void Function(ffi.Int32 event_kind, ffi.Int64 event_id)>>;
