@@ -1116,23 +1116,58 @@ class DartHttp<TServices> extends Router<TServices> {
   }
 
   Future<void> _streamSseResponse(int requestId, SseResponse response) async {
-    final started = DartHttpNative.startSseResponse(
-      requestId,
-      status: response.status,
-      headers: _defaultSseHeaders(response.headers),
-    );
-    if (!started) {
-      return;
-    }
-
+    // SSE reuses the binary stream mechanism: each encoded event is sent as an
+    // acknowledged chunk (backpressure), and the native closed event cancels
+    // the event subscription when the client disconnects.
+    final progress = _BinaryResponseProgress();
+    _activeBinaryResponses[requestId] = progress;
+    final iterator = StreamIterator(response.events);
+    var finished = false;
+    var started = false;
     try {
-      await for (final event in response.events) {
-        if (!DartHttpNative.sendSseChunk(requestId, event.encode())) {
-          break;
+      started = DartHttpNative.startSseResponse(
+        requestId,
+        status: response.status,
+        headers: _defaultSseHeaders(response.headers),
+      );
+      if (!started) return;
+
+      // Idle SSE streams are normal, so waiting for the next event has no
+      // stall timeout; only an unread chunk does.
+      while (await progress.waitFor(iterator.moveNext(), null)) {
+        if (progress.closed) break;
+        final bytes = utf8.encode(iterator.current.encode());
+        for (var offset = 0; offset < bytes.length; offset += _binaryStreamChunkSize) {
+          final end = (offset + _binaryStreamChunkSize).clamp(0, bytes.length);
+          final part = offset == 0 && end == bytes.length
+              ? bytes
+              : Uint8List.sublistView(bytes, offset, end);
+          final operationId = DartHttpNative.startBinaryStreamChunk(requestId, part);
+          if (operationId <= 0) return;
+          final completion = Completer<bool>();
+          _pendingBinaryChunks[operationId] = completion;
+          try {
+            final consumed = await progress.waitFor(completion.future, _streamStallTimeout);
+            if (!consumed) return;
+          } finally {
+            _pendingBinaryChunks.remove(operationId);
+          }
         }
       }
+      finished = !progress.closed;
     } finally {
-      DartHttpNative.finishSseResponse(requestId);
+      _activeBinaryResponses.remove(requestId);
+      try {
+        if (started) {
+          if (finished) {
+            DartHttpNative.finishSseResponse(requestId);
+          } else {
+            DartHttpNative.abortBinaryStreamResponse(requestId);
+          }
+        }
+      } finally {
+        await iterator.cancel();
+      }
     }
   }
 
@@ -1329,7 +1364,7 @@ final class _BinaryResponseProgress {
     if (waiting != null && !waiting.isCompleted) waiting.complete(false);
   }
 
-  Future<bool> waitFor(Future<bool> progress, Duration timeout) async {
+  Future<bool> waitFor(Future<bool> progress, Duration? timeout) async {
     if (closed) {
       progress.ignore();
       return false;
@@ -1347,6 +1382,7 @@ final class _BinaryResponseProgress {
       ),
     );
     try {
+      if (timeout == null) return await waiting.future;
       return await waiting.future.timeout(
         timeout,
         onTimeout: () {

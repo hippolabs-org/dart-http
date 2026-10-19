@@ -249,6 +249,66 @@ void main() {
     expect(server.port, isPositive);
   });
 
+  test('keeps serving HTTP when the WebTransport UDP port is unavailable', () async {
+    // Occupy the UDP port the WebTransport listener will try to bind.
+    RawDatagramSocket? udp;
+    DartHttpServer? server;
+    final app = DartHttp<void>(services: () {});
+    app.get('/health', handler: (_) => const {'status': 'ok'});
+    app.webtransport(
+      '/events',
+      options: const WebTransportOptions(operationId: 'connectEvents'),
+      onConnect: (transport) async {},
+    );
+    for (var attempt = 0; attempt < 10 && server == null; attempt++) {
+      final candidate = await RawDatagramSocket.bind(InternetAddress.loopbackIPv4, 0);
+      try {
+        server = await app.listen(host: '127.0.0.1', port: candidate.port);
+        udp = candidate;
+      } on Object {
+        candidate.close();
+      }
+    }
+    expect(server, isNotNull, reason: 'could not find a free TCP port matching a UDP port');
+    final client = HttpClient();
+    addTearDown(() async {
+      client.close(force: true);
+      udp?.close();
+      await server?.close();
+    });
+
+    // Give a failing WebTransport listener time to tear the runtime down.
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+    final response = await (await client.getUrl(Uri.http('127.0.0.1:${server!.port}', '/health')))
+        .close()
+        .timeout(const Duration(seconds: 5));
+    expect(response.statusCode, HttpStatus.ok);
+    expect(jsonDecode(await utf8.decoder.bind(response).join()), {'status': 'ok'});
+  });
+
+  test('returns 500 when a handler sets an invalid response header', () async {
+    final app = DartHttp<void>(services: () {});
+    app.get(
+      '/bad-header',
+      handler: (ctx) {
+        ctx.res.header('x-bad', 'line\r\nbreak');
+        return const {'ok': true};
+      },
+    );
+    final server = await app.listen(port: 0);
+    final client = HttpClient();
+    addTearDown(() async {
+      client.close(force: true);
+      await server.close();
+    });
+
+    final response = await (await client.getUrl(
+      Uri.http('127.0.0.1:${server.port}', '/bad-header'),
+    )).close();
+    expect(response.statusCode, HttpStatus.internalServerError);
+    await response.drain<void>();
+  });
+
   test('binds to an explicit deploy host and serves requests', () async {
     final app = DartHttp<void>(services: () {});
     app.get('/health', handler: (_) => const {'status': 'ok'});
@@ -770,6 +830,81 @@ void main() {
       'data: beta\n'
       '\n',
     );
+  });
+
+  test('streams large and many SSE events through acknowledged chunks', () async {
+    final app = DartHttp<void>(services: () {});
+    final large = 'x' * (200 * 1024);
+    app.get(
+      '/events',
+      options: RouteOptions(success: ResponseSpec.sse()),
+      handler: (ctx) => ctx.res.sse(
+        Stream<SseEvent>.fromIterable([
+          SseEvent(data: large),
+          for (var index = 0; index < 200; index++) SseEvent(id: '$index', data: 'n$index'),
+        ]),
+      ),
+    );
+
+    final server = await app.listen(port: 0);
+    final client = HttpClient();
+    addTearDown(() async {
+      client.close(force: true);
+      await server.close();
+    });
+
+    final response = await (await client.getUrl(Uri.http('127.0.0.1:${server.port}', '/events')))
+        .close();
+    final body = await utf8.decoder.bind(response).join();
+    expect(body, startsWith('data: $large\n\n'));
+    expect(body, endsWith('id: 199\ndata: n199\n\n'));
+    expect('data: n'.allMatches(body), hasLength(200));
+  });
+
+  test('cancels the SSE event subscription when the client disconnects', () async {
+    final app = DartHttp<void>(services: () {});
+    final listened = Completer<void>();
+    final cancelled = Completer<void>();
+    app.get(
+      '/idle-events',
+      options: RouteOptions(success: ResponseSpec.sse()),
+      handler: (ctx) {
+        late final StreamController<SseEvent> controller;
+        controller = StreamController<SseEvent>(
+          onListen: () {
+            controller.add(const SseEvent(event: 'ready', data: 'go'));
+            listened.complete();
+          },
+          onCancel: () {
+            if (!cancelled.isCompleted) cancelled.complete();
+          },
+        );
+        return ctx.res.sse(controller.stream);
+      },
+    );
+
+    final server = await app.listen(port: 0);
+    addTearDown(server.close);
+
+    final socket = await Socket.connect('127.0.0.1', server.port);
+    socket.write(
+      'GET /idle-events HTTP/1.1\r\nHost: localhost\r\nAccept: text/event-stream\r\n\r\n',
+    );
+    final received = StringBuffer();
+    final sawEvent = Completer<void>();
+    final subscription = socket.listen((data) {
+      received.write(utf8.decode(data, allowMalformed: true));
+      if (received.toString().contains('data: go') && !sawEvent.isCompleted) {
+        sawEvent.complete();
+      }
+    });
+    await listened.future.timeout(const Duration(seconds: 5));
+    await sawEvent.future.timeout(const Duration(seconds: 5));
+
+    await subscription.cancel();
+    socket.destroy();
+
+    await cancelled.future.timeout(const Duration(seconds: 5));
   });
 
   test('upgrades websocket routes and exchanges JSON messages', () async {

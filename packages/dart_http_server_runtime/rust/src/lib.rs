@@ -48,7 +48,7 @@ use wtransport::{
     ServerConfig as WebTransportServerConfig, VarInt,
 };
 
-const DART_HTTP_SERVER_RUNTIME_NATIVE_ABI_VERSION: i32 = 23;
+const DART_HTTP_SERVER_RUNTIME_NATIVE_ABI_VERSION: i32 = 24;
 const MAX_BINARY_STREAM_CHUNK_BYTES: usize = 64 * 1024;
 const RESERVED_BLOCKING_WORKERS: usize = 16;
 const SCHEMA_REGISTRY_URI: &str = "urn:dart-http:schema-registry";
@@ -78,6 +78,9 @@ static WEB_TRANSPORT_OPENED_STREAMS: Lazy<Mutex<HashMap<i64, WebTransportStreamI
     Lazy::new(|| Mutex::new(HashMap::new()));
 static WEB_TRANSPORT_OPERATIONS: Lazy<Mutex<HashMap<i64, WebTransportOperationResult>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+/// How long a stopped server waits for in-flight connections to finish.
+const SERVER_SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+
 static SERVER_STATES: Lazy<Mutex<HashMap<i64, ServerState>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
@@ -1303,6 +1306,16 @@ pub extern "C" fn dart_http_server_runtime_start_server(
 
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    // Register the server before it can accept connections: transport events
+    // for unknown servers are dropped, so requests racing the startup
+    // handshake would otherwise be lost.
+    SERVER_STATES.lock().unwrap().insert(
+        server_id,
+        ServerState {
+            shutdown_tx: Some(shutdown_tx),
+            join_handle: None,
+        },
+    );
     let bind_host = host;
     let requested_port = port as u16;
     let worker_count = worker_count.max(1) as usize;
@@ -1340,9 +1353,13 @@ pub extern "C" fn dart_http_server_runtime_start_server(
                     return;
                 }
             };
-            let _ = ready_tx.send(Ok(local_port));
             let mut axum_shutdown_rx = shutdown_rx.clone();
-            let web_transport_shutdown_rx = shutdown_rx.clone();
+            let lifetime_shutdown_rx = shutdown_rx.clone();
+            let has_web_transport_routes = runtime_state
+                .routes
+                .iter()
+                .any(|route| route.kind == RouteTransportKind::WebTransport);
+            let web_transport_state = runtime_state.clone();
 
             let mut app = Router::new()
                 .fallback(any(handle_validated_request))
@@ -1350,7 +1367,7 @@ pub extern "C" fn dart_http_server_runtime_start_server(
                     runtime_state.clone(),
                     validate_request_middleware,
                 ))
-                .with_state(runtime_state.clone());
+                .with_state(runtime_state);
             if let Some(cors_layer) = cors_layer {
                 app = app.layer(cors_layer);
             }
@@ -1358,20 +1375,54 @@ pub extern "C" fn dart_http_server_runtime_start_server(
                 let _ = axum_shutdown_rx.changed().await;
             });
 
+            // WebTransport runs beside HTTP and must never decide the server's
+            // lifetime: a UDP bind or identity failure is reported and HTTP
+            // keeps serving. Only servers with WebTransport routes bind UDP.
+            let web_transport_task = has_web_transport_routes.then(|| {
+                tokio::spawn(async move {
+                    if let Err(error) = run_web_transport_listener(
+                        SocketAddr::new(bind_address.ip(), local_port),
+                        shutdown_rx,
+                        web_transport_state,
+                    )
+                    .await
+                    {
+                        eprintln!(
+                            "dart_http_server_runtime WebTransport listener failed: {error}"
+                        );
+                    }
+                })
+            });
+
+            let _ = ready_tx.send(Ok(local_port));
+
+            // Axum's graceful shutdown alone drives the process lifetime so
+            // in-flight HTTP responses drain before the runtime is dropped. A
+            // bounded grace period keeps a stuck connection from pinning the
+            // runtime thread and its port forever after stop.
+            let mut grace_shutdown_rx = lifetime_shutdown_rx.clone();
             tokio::select! {
-                result = server => {
+                result = server.into_future() => {
                     if let Err(error) = result {
                         eprintln!("dart_http_server_runtime transport server failed: {error}");
                     }
                 }
-                result = run_web_transport_listener(
-                    SocketAddr::new(bind_address.ip(), local_port),
-                    web_transport_shutdown_rx,
-                    runtime_state,
-                ) => {
-                    if let Err(error) = result {
-                        eprintln!("dart_http_server_runtime WebTransport listener failed: {error}");
-                    }
+                _ = async move {
+                    let _ = grace_shutdown_rx.wait_for(|stopped| *stopped).await;
+                    tokio::time::sleep(SERVER_SHUTDOWN_GRACE).await;
+                } => {
+                    eprintln!(
+                        "dart_http_server_runtime graceful shutdown exceeded {SERVER_SHUTDOWN_GRACE:?}; closing remaining connections"
+                    );
+                }
+            }
+            if let Some(task) = web_transport_task {
+                if *lifetime_shutdown_rx.borrow() {
+                    // The listener observed the same shutdown signal and closes
+                    // its endpoint itself.
+                    let _ = task.await;
+                } else {
+                    task.abort();
                 }
             }
         });
@@ -1379,21 +1430,19 @@ pub extern "C" fn dart_http_server_runtime_start_server(
 
     match ready_rx.recv() {
         Ok(Ok(bound_port)) => {
-            SERVER_STATES.lock().unwrap().insert(
-                server_id,
-                ServerState {
-                    shutdown_tx: Some(shutdown_tx),
-                    join_handle: Some(join_handle),
-                },
-            );
+            if let Some(state) = SERVER_STATES.lock().unwrap().get_mut(&server_id) {
+                state.join_handle = Some(join_handle);
+            }
             (server_id << 16) | i64::from(bound_port)
         }
         Ok(Err(error)) => {
+            SERVER_STATES.lock().unwrap().remove(&server_id);
             eprintln!("dart_http_server_runtime transport startup failed: {error}");
             let _ = join_handle.join();
             -1
         }
         Err(error) => {
+            SERVER_STATES.lock().unwrap().remove(&server_id);
             eprintln!("dart_http_server_runtime transport startup failed: {error}");
             let _ = join_handle.join();
             -1
@@ -2735,9 +2784,22 @@ async fn handle_http_request(
             Body::from(transport_response.body),
         ),
         Some(PendingResponseMessage::SseStart { status, headers }) => {
+            // SSE shares the binary stream lifetime: dropping the body (client
+            // disconnect or completion) removes the pending request and tells
+            // Dart to cancel its event subscription. Event bytes arrive as
+            // acknowledged binary chunks, so at most one chunk is in flight.
+            let lifetime = BinaryResponseLifetime {
+                request_id,
+                runtime_state: runtime_state.clone(),
+            };
             let stream = async_stream::stream! {
+                let _lifetime = lifetime;
                 while let Some(message) = response_rx.recv().await {
                     match message {
+                        PendingResponseMessage::BinaryChunk { bytes, completion } => {
+                            completion.0.complete(true);
+                            yield Ok::<Bytes, std::convert::Infallible>(Bytes::from(bytes));
+                        }
                         PendingResponseMessage::SseChunk(chunk) => {
                             yield Ok::<Bytes, std::convert::Infallible>(Bytes::from(chunk));
                         }
@@ -2745,7 +2807,6 @@ async fn handle_http_request(
                         PendingResponseMessage::Http(_)
                         | PendingResponseMessage::SseStart { .. }
                         | PendingResponseMessage::BinaryStart { .. }
-                        | PendingResponseMessage::BinaryChunk { .. }
                         | PendingResponseMessage::NativeBinaryStart { .. }
                         | PendingResponseMessage::WebSocketAccept { .. } => break,
                     }
@@ -3695,14 +3756,48 @@ fn response_body_with_headers(
     headers: &[(String, String)],
     body: Body,
 ) -> Response<Body> {
-    let mut builder = Response::builder().status(status);
-    builder = builder.header(header::CONTENT_TYPE, content_type);
-    for (name, value) in headers {
-        builder = builder.header(name, value);
+    match response_header_map(content_type, headers) {
+        Ok(header_map) => {
+            let mut response = Response::new(body);
+            *response.status_mut() = status;
+            *response.headers_mut() = header_map;
+            response
+        }
+        Err(error) => {
+            eprintln!("dart_http_server_runtime rejected an invalid response header: {error}");
+            let mut response = Response::new(Body::from("Internal Server Error"));
+            *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; charset=utf-8"),
+            );
+            response
+        }
     }
-    builder
-        .body(body)
-        .unwrap_or_else(|_| Response::new(Body::from("Internal Server Error")))
+}
+
+/// Builds response headers, replacing (not duplicating) the runtime's
+/// Content-Type and any Content-Length when the handler supplies them.
+fn response_header_map(
+    content_type: &str,
+    headers: &[(String, String)],
+) -> Result<HeaderMap, String> {
+    let mut header_map = HeaderMap::with_capacity(headers.len() + 1);
+    let content_type = HeaderValue::from_str(content_type)
+        .map_err(|_| format!("invalid Content-Type value {content_type:?}"))?;
+    header_map.insert(header::CONTENT_TYPE, content_type);
+    for (name, value) in headers {
+        let header_name = HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| format!("invalid header name {name:?}"))?;
+        let header_value = HeaderValue::from_bytes(value.as_bytes())
+            .map_err(|_| format!("invalid value for header {name:?}"))?;
+        if header_name == header::CONTENT_TYPE || header_name == header::CONTENT_LENGTH {
+            header_map.insert(header_name, header_value);
+        } else {
+            header_map.append(header_name, header_value);
+        }
+    }
+    Ok(header_map)
 }
 
 async fn push_web_socket_message(session_id: i64, mut message: WebSocketIncomingMessage) -> bool {
@@ -5657,6 +5752,54 @@ mod tests {
             web_socket_max_pending_bytes: 1024,
             web_socket_write_stall_timeout: Duration::from_secs(1),
         }
+    }
+
+    #[test]
+    fn invalid_response_header_yields_internal_server_error() {
+        let response = response_with_headers(
+            StatusCode::OK,
+            "text/plain",
+            &[("x-bad".to_string(), "line\r\nbreak".to_string())],
+            "body".to_string(),
+        );
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let response = response_with_headers(
+            StatusCode::OK,
+            "text/plain",
+            &[("bad header".to_string(), "value".to_string())],
+            "body".to_string(),
+        );
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn user_content_headers_replace_runtime_defaults() {
+        let response = response_body_with_headers(
+            StatusCode::CREATED,
+            "application/json",
+            &[
+                (
+                    "Content-Type".to_string(),
+                    "application/problem+json".to_string(),
+                ),
+                ("content-length".to_string(), "4".to_string()),
+                ("x-multi".to_string(), "a".to_string()),
+                ("x-multi".to_string(), "b".to_string()),
+            ],
+            Body::from("body"),
+        );
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let headers = response.headers();
+        assert_eq!(
+            headers
+                .get_all(header::CONTENT_TYPE)
+                .iter()
+                .collect::<Vec<_>>(),
+            vec!["application/problem+json"]
+        );
+        assert_eq!(headers.get_all(header::CONTENT_LENGTH).iter().count(), 1);
+        assert_eq!(headers.get_all("x-multi").iter().count(), 2);
     }
 
     #[test]
