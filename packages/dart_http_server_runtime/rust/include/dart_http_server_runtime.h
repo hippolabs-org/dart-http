@@ -299,9 +299,11 @@ int64_t dart_http_server_runtime_web_socket_send_text(
     int64_t session_id,
     const char* text);
 
+/* Leaf call: copies the borrowed bytes once and never calls back into Dart. */
 int64_t dart_http_server_runtime_web_socket_send_binary(
     int64_t session_id,
-    NativeBytes body);
+    const uint8_t* body,
+    intptr_t body_length);
 
 bool dart_http_server_runtime_web_socket_close(
     int64_t session_id,
@@ -312,11 +314,13 @@ char* dart_http_server_runtime_take_last_error(void);
 
 void dart_http_server_runtime_free_string(char* value);
 
+/* Leaf call: copies the borrowed body once and never calls back into Dart. */
 bool dart_http_server_runtime_send_response(
     int64_t request_id,
     int32_t status,
     const char* content_type,
-    NativeBytes body,
+    const uint8_t* body,
+    intptr_t body_length,
     intptr_t header_count,
     const NativePair* headers);
 

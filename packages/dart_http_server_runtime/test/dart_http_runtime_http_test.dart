@@ -5,6 +5,7 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:dart_http_server_runtime/dart_http_server_runtime.dart';
+import 'package:json_schema/json_schema.dart' show JsonEncodable;
 import 'package:test/test.dart';
 
 void main() {
@@ -398,6 +399,81 @@ void main() {
     expect(response.headers.contentType?.mimeType, 'audio/wav');
     final body = await response.fold<List<int>>(<int>[], (buffer, chunk) => buffer..addAll(chunk));
     expect(body, bytes);
+  });
+
+  test('copies large, view and JSON response bodies into native memory once', () async {
+    final app = DartHttp<void>(services: () {});
+    final large = Uint8List.fromList(List<int>.generate(8 * 1024 * 1024 + 3, (i) => i * 7));
+    final backing = Uint8List.fromList(List<int>.generate(64, (i) => i));
+    app.get(
+      '/large',
+      options: const RouteOptions(success: ResponseSpec.binary()),
+      handler: (_) => RawResponse.binary(
+        status: HttpStatus.ok,
+        contentType: 'application/octet-stream',
+        body: large,
+      ),
+    );
+    app.get(
+      '/view',
+      options: const RouteOptions(success: ResponseSpec.binary()),
+      handler: (_) => RawResponse.binary(
+        status: HttpStatus.ok,
+        contentType: 'application/octet-stream',
+        body: Uint8List.sublistView(backing, 10, 20),
+      ),
+    );
+    app.get(
+      '/list',
+      options: const RouteOptions(success: ResponseSpec.binary()),
+      handler: (_) => RawResponse(
+        status: HttpStatus.ok,
+        contentType: 'application/octet-stream',
+        body: List<int>.generate(5, (i) => 250 + i),
+        isEncodedBody: true,
+      ),
+    );
+    app.get(
+      '/json',
+      handler: (_) => RawResponse.json(
+        status: HttpStatus.ok,
+        body: {
+          'model': const _Model('Grüße'),
+          'numbers': {1: 'one', 2: const _Model('two')},
+          'list': [const _Model('x'), null, true, 1.5],
+        },
+      ),
+    );
+
+    final server = await app.listen(port: 0);
+    final client = HttpClient();
+    addTearDown(() async {
+      client.close(force: true);
+      await server.close();
+    });
+    Future<List<int>> get(String path) async {
+      final response = await (await client.getUrl(Uri.http('127.0.0.1:${server.port}', path)))
+          .close();
+      expect(response.statusCode, HttpStatus.ok);
+      return response.fold<List<int>>(<int>[], (all, chunk) => all..addAll(chunk));
+    }
+
+    expect(await get('/large'), large);
+    expect(await get('/view'), List<int>.generate(10, (i) => 10 + i));
+    expect(await get('/list'), [250, 251, 252, 253, 254]);
+    expect(jsonDecode(utf8.decode(await get('/json'))), {
+      'model': {'name': 'Grüße'},
+      'numbers': {
+        '1': 'one',
+        '2': {'name': 'two'},
+      },
+      'list': [
+        {'name': 'x'},
+        null,
+        true,
+        1.5,
+      ],
+    });
   });
 
   test('streams binary responses in order with a content length', () async {
@@ -1227,4 +1303,13 @@ final class _GuardedContractRoute extends HttpRouteDefinition<void, String> {
 
   @override
   String handle(RequestContext<void> ctx) => 'ok';
+}
+
+final class _Model implements JsonEncodable {
+  const _Model(this.name);
+
+  final String name;
+
+  @override
+  Map<String, Object?> toJson() => {'name': name};
 }

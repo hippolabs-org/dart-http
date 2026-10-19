@@ -50,7 +50,7 @@ EncodedResponse encodeResponse({
     return EncodedResponse(
       status: effectiveStatus,
       contentType: effectiveContentType,
-      bodyBytes: _textBytes(jsonEncode(_normalizeJson(effectiveBody))),
+      bodyBytes: _jsonBytes(effectiveBody),
       headers: headers,
     );
   }
@@ -77,7 +77,7 @@ EncodedResponse _encodeRawResponse(RawResponse response) {
     return EncodedResponse(
       status: response.status,
       contentType: response.contentType,
-      bodyBytes: _textBytes(jsonEncode(_normalizeJson(response.body))),
+      bodyBytes: _jsonBytes(response.body),
       headers: response.headers,
     );
   }
@@ -106,34 +106,39 @@ EncodedResponse encodeBadRequest() {
   );
 }
 
+/// Response bytes for [body] without copying bytes the handler already owns.
+///
+/// A [Uint8List] is used as-is: the runtime copies it into native memory
+/// exactly once, synchronously, before the handler can observe the response.
 Uint8List _encodedBodyBytes(Object? body) {
   return switch (body) {
     null => Uint8List(0),
-    Uint8List() => Uint8List.fromList(body),
+    Uint8List() => body,
     List<int>() => Uint8List.fromList(body),
     String() => _textBytes(body),
     _ => _textBytes(body.toString()),
   };
 }
 
-Uint8List _textBytes(String body) => Uint8List.fromList(utf8.encode(body));
+Uint8List _textBytes(String body) => utf8.encode(body);
 
-Object? _normalizeJson(Object? value) {
-  switch (value) {
-    case null:
-    case bool():
-    case num():
-    case String():
-      return value;
-    case List():
-      return value.map(_normalizeJson).toList(growable: false);
-    case Map():
-      return {for (final entry in value.entries) entry.key.toString(): _normalizeJson(entry.value)};
-    case JsonEncodable():
-      return _normalizeJson(value.toJson());
-    default:
-      throw StateError('Response body of type ${value.runtimeType} is not JSON encodable.');
-  }
+/// Encodes JSON straight to UTF-8 bytes, without an intermediate String or a
+/// normalized copy of the value graph.
+Uint8List _jsonBytes(Object? body) => _jsonUtf8Encoder.convert(body) as Uint8List;
+
+final _jsonUtf8Encoder = JsonUtf8Encoder(null, _toEncodableJson, 16 * 1024);
+
+/// Called by the JSON encoder only for values it cannot write directly:
+/// [JsonEncodable] objects and maps whose keys are not all strings.
+Object? _toEncodableJson(Object? value) {
+  final json = value is JsonEncodable ? value.toJson() : value;
+  return switch (json) {
+    null || bool() || num() || String() || List() => json,
+    Map() when json.keys.every((key) => key is String) => json,
+    Map() => {for (final entry in json.entries) entry.key.toString(): entry.value},
+    JsonEncodable() => _toEncodableJson(json),
+    _ => throw StateError('Response body of type ${value.runtimeType} is not JSON encodable.'),
+  };
 }
 
 bool _isJsonContentType(String contentType) {

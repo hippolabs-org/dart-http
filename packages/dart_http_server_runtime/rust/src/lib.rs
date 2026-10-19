@@ -439,7 +439,7 @@ struct TransportRequest {
 struct TransportResponse {
     status: u16,
     content_type: String,
-    body: Vec<u8>,
+    body: Bytes,
     headers: Vec<(String, String)>,
 }
 
@@ -1107,6 +1107,11 @@ struct WebSocketWriteCompletion {
 
 impl Drop for WebSocketWriteCompletion {
     fn drop(&mut self) {
+        // A write rejected synchronously was never registered by Dart (it got
+        // operation id 0) and must not post from inside a leaf call.
+        if self.operation_id == 0 {
+            return;
+        }
         notify_transport_event(
             &self.runtime_state,
             TransportEventKind::WebSocketWriteCompleted,
@@ -1709,7 +1714,7 @@ pub extern "C" fn dart_http_server_runtime_stop_server_by_id(server_id: i64) {
                 .send(PendingResponseMessage::Http(TransportResponse {
                     status: 503,
                     content_type: "text/plain; charset=utf-8".to_string(),
-                    body: b"Server stopped".to_vec(),
+                    body: Bytes::from_static(b"Server stopped"),
                     headers: Vec::new(),
                 }));
             let _ = request.response_tx.send(PendingResponseMessage::Close);
@@ -2578,10 +2583,12 @@ fn submit_web_socket_write(
             _permit: permit,
         },
     };
-    if tx.send(command).is_ok() {
-        operation_id
-    } else {
-        0
+    match tx.send(command) {
+        Ok(()) => operation_id,
+        Err(mpsc::error::SendError(mut command)) => {
+            command.completion.operation_id = 0;
+            0
+        }
     }
 }
 
@@ -2603,15 +2610,23 @@ pub extern "C" fn dart_http_server_runtime_web_socket_send_text(
 }
 
 #[unsafe(no_mangle)]
+/// Queues one binary frame, copying the borrowed bytes once. Called as a leaf
+/// function; it never calls back into Dart.
 pub extern "C" fn dart_http_server_runtime_web_socket_send_binary(
     session_id: i64,
-    body: NativeBytes,
+    body: *const u8,
+    body_length: isize,
 ) -> i64 {
-    let Some(body) = (unsafe { read_native_bytes(body) }) else {
+    let Some(body) = (unsafe {
+        read_native_bytes(NativeBytes {
+            ptr: body,
+            len: body_length,
+        })
+    }) else {
         return 0;
     };
     submit_web_socket_write(session_id, body.len(), || {
-        Message::Binary(body.to_vec().into())
+        Message::Binary(Bytes::copy_from_slice(body))
     })
 }
 
@@ -2660,21 +2675,39 @@ pub extern "C" fn dart_http_server_runtime_free_string(value: *mut c_char) {
     }
 }
 
+/// Copies a body borrowed from Dart (typically a `TypedData.address` passed to
+/// a leaf call) into one owned `Bytes`: the single Dart-to-Rust copy.
+///
+/// # Safety
+///
+/// A non-null `body` must point to `length` readable bytes for this call.
+unsafe fn copy_dart_body(body: *const u8, length: isize) -> Option<Bytes> {
+    unsafe {
+        read_native_bytes(NativeBytes {
+            ptr: body,
+            len: length,
+        })
+    }
+    .map(Bytes::copy_from_slice)
+}
+
 #[unsafe(no_mangle)]
+/// Completes a buffered HTTP response. Dart calls this as a leaf function with
+/// the address of its response bytes, which are copied exactly once into the
+/// response body. It never calls back into Dart.
 pub extern "C" fn dart_http_server_runtime_send_response(
     request_id: i64,
     status: i32,
     content_type: *const c_char,
-    body: NativeBytes,
+    body: *const u8,
+    body_length: isize,
     header_count: isize,
     headers: *const NativePair,
 ) -> bool {
-    let content_type = unsafe { read_c_string(content_type) };
-    let body = unsafe { read_native_bytes(body) };
-    let Some(content_type) = content_type else {
+    let Some(content_type) = (unsafe { read_c_string(content_type) }) else {
         return false;
     };
-    let Some(body) = body else {
+    let Some(body) = (unsafe { copy_dart_body(body, body_length) }) else {
         return false;
     };
     let headers = unsafe { read_pairs_vec(headers, header_count) };
@@ -2684,7 +2717,7 @@ pub extern "C" fn dart_http_server_runtime_send_response(
         PendingResponseMessage::Http(TransportResponse {
             status: status as u16,
             content_type,
-            body: body.to_vec(),
+            body,
             headers,
         }),
         true,

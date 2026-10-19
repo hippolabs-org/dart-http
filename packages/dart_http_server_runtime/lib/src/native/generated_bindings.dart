@@ -117,16 +117,18 @@ external void dart_http_server_runtime_release_web_socket_session(int session_id
     ffi.Int64,
     ffi.Int32,
     ffi.Pointer<ffi.Char>,
-    NativeBytes,
+    ffi.Pointer<ffi.Uint8>,
+    ffi.IntPtr,
     ffi.IntPtr,
     ffi.Pointer<NativePair>,
   )
->()
+>(isLeaf: true)
 external bool dart_http_server_runtime_send_response(
   int request_id,
   int status,
   ffi.Pointer<ffi.Char> content_type,
-  NativeBytes body,
+  ffi.Pointer<ffi.Uint8> body,
+  int body_length,
   int header_count,
   ffi.Pointer<NativePair> headers,
 );
@@ -275,8 +277,12 @@ external bool dart_http_server_runtime_web_socket_close(
   ffi.Pointer<ffi.Char> reason,
 );
 
-@ffi.Native<ffi.Int64 Function(ffi.Int64, NativeBytes)>()
-external int dart_http_server_runtime_web_socket_send_binary(int session_id, NativeBytes body);
+@ffi.Native<ffi.Int64 Function(ffi.Int64, ffi.Pointer<ffi.Uint8>, ffi.IntPtr)>(isLeaf: true)
+external int dart_http_server_runtime_web_socket_send_binary(
+  int session_id,
+  ffi.Pointer<ffi.Uint8> body,
+  int body_length,
+);
 
 @ffi.Native<ffi.Int64 Function(ffi.Int64, ffi.Pointer<ffi.Char>)>()
 external int dart_http_server_runtime_web_socket_send_text(

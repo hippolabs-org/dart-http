@@ -1,5 +1,16 @@
 ## Unreleased
 
+- Buffered response bodies are copied from Dart into Rust exactly once:
+  `DartHttpNative.tryRespond` passes the `Uint8List`'s address to a leaf
+  `dart_http_server_runtime_send_response(…, body, body_length, …)` that
+  builds the response `Bytes` directly (previously `Uint8List.fromList`, a
+  zero-filled `calloc` copy and a Rust `to_vec`). Byte and text bodies are no
+  longer re-copied by the response encoder, and JSON bodies are encoded with
+  `JsonUtf8Encoder` straight to bytes instead of `jsonEncode` + `utf8.encode`
+  over a normalized copy of the value. `DartHttpNative.webSocketSendBinary`
+  uses the same single-copy leaf call. Behaviour change: a non-encodable JSON
+  response value now fails with `JsonUnsupportedObjectError` (wrapping the
+  previous `StateError`); it still produces a 500 response.
 - **Breaking (FFI facade):** transport events reach Dart through a native port
   instead of a `NativeCallable.listener`. `DartHttpNative.startServer` takes
   `eventPort` (a `SendPort.nativePort`) instead of `callback`, the

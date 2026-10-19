@@ -158,6 +158,10 @@ abstract final class DartHttpNative {
   }
 
   /// Attempts to send a response for a previously taken request.
+  ///
+  /// The runtime copies [body] into its response exactly once, during this
+  /// call (a leaf call reading the list in place). A [Uint8List] is not copied
+  /// in Dart; any other list is first gathered into one.
   static bool tryRespond(
     int requestId, {
     required int status,
@@ -167,28 +171,21 @@ abstract final class DartHttpNative {
   }) {
     final contentTypePtr = contentType.toNativeUtf8();
     final bytes = body is Uint8List ? body : Uint8List.fromList(body);
-    final bodyPtr = calloc<Uint8>(bytes.length);
-    final nativeBytesPtr = calloc<core_ffi.NativeBytes>();
     try {
-      bodyPtr.asTypedList(bytes.length).setAll(0, bytes);
-      nativeBytesPtr.ref
-        ..ptr = bodyPtr
-        ..len = bytes.length;
       return _withNativeHeaders(
         headers,
         (headerStorage, headerCount) => gen.dart_http_server_runtime_send_response(
           requestId,
           status,
           contentTypePtr.cast<Char>(),
-          nativeBytesPtr.ref,
+          bytes.address,
+          bytes.length,
           headerCount,
           headerStorage,
         ),
       );
     } finally {
       calloc.free(contentTypePtr);
-      calloc.free(nativeBytesPtr);
-      calloc.free(bodyPtr);
     }
   }
 
@@ -470,20 +467,15 @@ abstract final class DartHttpNative {
   }
 
   /// Sends a binary frame over an active WebSocket session.
+  ///
+  /// The runtime copies [body] once, during this call.
   static int webSocketSendBinary(int sessionId, List<int> body) {
     final bytes = body is Uint8List ? body : Uint8List.fromList(body);
-    final bodyPtr = calloc<Uint8>(bytes.length);
-    final nativeBytesPtr = calloc<core_ffi.NativeBytes>();
-    try {
-      bodyPtr.asTypedList(bytes.length).setAll(0, bytes);
-      nativeBytesPtr.ref
-        ..ptr = bodyPtr
-        ..len = bytes.length;
-      return gen.dart_http_server_runtime_web_socket_send_binary(sessionId, nativeBytesPtr.ref);
-    } finally {
-      calloc.free(nativeBytesPtr);
-      calloc.free(bodyPtr);
-    }
+    return gen.dart_http_server_runtime_web_socket_send_binary(
+      sessionId,
+      bytes.address,
+      bytes.length,
+    );
   }
 
   /// Sends borrowed native bytes without materializing the payload in Dart.
@@ -495,11 +487,15 @@ abstract final class DartHttpNative {
     required Pointer<Uint8> bodyPtr,
     required int bodyLength,
   }) {
-    return _withBorrowedNativeBody(
-      bodyPtr: bodyPtr,
-      bodyLength: bodyLength,
-      run: (body) => gen.dart_http_server_runtime_web_socket_send_binary(sessionId, body),
-    );
+    RangeError.checkNotNegative(bodyLength, 'bodyLength');
+    if (bodyLength > 0 && bodyPtr == nullptr) {
+      throw ArgumentError.value(
+        bodyPtr,
+        'bodyPtr',
+        'Pointer must not be null for a non-empty body.',
+      );
+    }
+    return gen.dart_http_server_runtime_web_socket_send_binary(sessionId, bodyPtr, bodyLength);
   }
 
   /// Closes an active WebSocket session.
