@@ -10,7 +10,7 @@ crate-type = ["staticlib", "cdylib"]
 
 [dependencies]
 async-stream = "0.3"
-axum = { version = "0.8", default-features = true, features = ["ws"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "ws"] }
 dart_http_core = { path = "crates/dart_http_core" }
 dart_http_server_core = { path = "crates/dart_http_server_core" }
 futures-util = "0.3"
