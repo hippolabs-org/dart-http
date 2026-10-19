@@ -1,3 +1,7 @@
+## Unreleased
+
+- Move `json_schema` to dev dependencies; the library never imports it.
+
 ## 0.3.28
 
 - Require the runtime with binary upload decoding and configurable CORS response-header exposure.
