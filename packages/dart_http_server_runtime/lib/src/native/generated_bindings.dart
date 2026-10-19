@@ -409,21 +409,6 @@ final class NativeMultipartForm extends ffi.Struct {
     ..ref.files = files;
 }
 
-final class NativeOwnedBytes extends ffi.Struct {
-  external ffi.Pointer<ffi.Uint8> ptr;
-
-  @ffi.IntPtr()
-  external int len;
-
-  static ffi.Pointer<NativeOwnedBytes> $allocate(
-    ffi.Allocator $allocator, {
-    required ffi.Pointer<ffi.Uint8> ptr,
-    required int len,
-  }) => $allocator<NativeOwnedBytes>()
-    ..ref.ptr = ptr
-    ..ref.len = len;
-}
-
 final class NativePair extends ffi.Struct {
   external NativeBytes key;
 

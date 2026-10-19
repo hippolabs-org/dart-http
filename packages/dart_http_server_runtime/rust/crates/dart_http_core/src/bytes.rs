@@ -13,27 +13,7 @@ pub struct NativeBytes {
     pub len: isize,
 }
 
-/// Owned byte buffer returned across the Dart FFI boundary.
-///
-/// Values created by [`crate::into_native_owned_bytes`] transfer ownership of a
-/// boxed byte slice to the caller. The same value must eventually be passed to
-/// [`crate::free_owned_bytes`] exactly once.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct NativeOwnedBytes {
-    /// Pointer to the first byte, or null for an empty allocation.
-    pub ptr: *mut u8,
-    /// Number of bytes in the allocation.
-    pub len: isize,
-}
-
 impl Default for NativeBytes {
-    fn default() -> Self {
-        Self::empty()
-    }
-}
-
-impl Default for NativeOwnedBytes {
     fn default() -> Self {
         Self::empty()
     }
@@ -49,27 +29,6 @@ impl NativeBytes {
     }
 
     /// Returns `true` when this value represents an empty slice.
-    pub const fn is_empty(self) -> bool {
-        self.len == 0
-    }
-
-    /// Returns `true` when this value has a negative length or a null pointer
-    /// with a non-zero length.
-    pub const fn is_invalid(self) -> bool {
-        self.len < 0 || (self.ptr.is_null() && self.len != 0)
-    }
-}
-
-impl NativeOwnedBytes {
-    /// Returns an empty owned byte handle.
-    pub const fn empty() -> Self {
-        Self {
-            ptr: std::ptr::null_mut(),
-            len: 0,
-        }
-    }
-
-    /// Returns `true` when this value represents no owned bytes.
     pub const fn is_empty(self) -> bool {
         self.len == 0
     }

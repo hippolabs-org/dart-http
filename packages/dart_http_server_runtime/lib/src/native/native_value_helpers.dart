@@ -16,14 +16,6 @@ Uint8List? maybeCopyNativeBytes(NativeBytes value) {
   return Uint8List.fromList(value.ptr.asTypedList(value.len));
 }
 
-Uint8List copyNativeOwnedBytes(NativeOwnedBytes value) {
-  if (value.len == 0 || value.ptr == nullptr) {
-    return Uint8List(0);
-  }
-
-  return Uint8List.fromList(value.ptr.asTypedList(value.len));
-}
-
 String decodeNativeUtf8(NativeBytes value, {bool allowMalformed = true}) {
   final bytes = maybeCopyNativeBytes(value);
   if (bytes == null || bytes.isEmpty) {

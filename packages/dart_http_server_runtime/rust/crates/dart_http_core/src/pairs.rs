@@ -108,21 +108,6 @@ pub unsafe fn read_pairs_vec(values: *const NativePair, count: isize) -> Vec<(St
     result
 }
 
-/// Reads a native pair array into an owned map.
-///
-/// Duplicate keys keep the last value encountered.
-///
-/// # Safety
-///
-/// Same requirements as [`read_pairs_vec`].
-pub unsafe fn read_pairs_map(values: *const NativePair, count: isize) -> HashMap<String, String> {
-    let mut result = HashMap::with_capacity(count.max(0) as usize);
-    for (key, value) in unsafe { read_pairs_vec(values, count) } {
-        result.insert(key, value);
-    }
-    result
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

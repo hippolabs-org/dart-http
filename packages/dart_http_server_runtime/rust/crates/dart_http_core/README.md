@@ -13,10 +13,5 @@ they do not own the memory they point at unless explicitly documented.
 
 Included primitives:
 
-- borrowed and owned byte buffers
-- borrowed UTF-8 string views
+- borrowed byte buffers and Rust-owned byte storage that exposes them
 - borrowed key/value pairs
-- borrowed typed slices for Rust-side FFI helpers
-- a small status/result envelope for future native APIs
-- a bounded native worker-thread pool for package-specific native jobs, with
-  queue and completion metrics
