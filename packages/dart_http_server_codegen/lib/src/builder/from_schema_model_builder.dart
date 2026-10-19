@@ -1184,7 +1184,7 @@ String _encodeValue(
   return switch (schema) {
     JsonStringSchema(:final dartType, :final format)
         when dartType == null && format == 'date-time' =>
-      nullable ? '$source?.toIso8601String()' : '$source.toIso8601String()',
+      nullable ? '$source?.toUtc().toIso8601String()' : '$source.toUtc().toIso8601String()',
     JsonStringSchema(:final dartType) when dartType != null => _encodeTypedStringValue(
       dartType,
       source,

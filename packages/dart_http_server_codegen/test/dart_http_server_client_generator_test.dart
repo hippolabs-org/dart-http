@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:dart_http_core/dart_http_core.dart';
@@ -250,7 +251,7 @@ void main() {
       expect(models, contains('final DateTime? banExpires;'));
       expect(models, contains("banExpires: json['ban_expires'] == null"));
       expect(models, contains("? null\n          : DateTime.parse(json['ban_expires'] as String)"));
-      expect(models, contains("'ban_expires': banExpires?.toIso8601String()"));
+      expect(models, contains("'ban_expires': banExpires?.toUtc().toIso8601String()"));
     });
 
     test('emits named string scalar client model fields', () {
@@ -985,6 +986,78 @@ void main() {
       expect(source, contains('decoder: UserDto.decode'));
       expect(source, contains('encoder: (value) => value.toJson()'));
     });
+
+    test('round-trips nullable date-time array items and encodes date-times as UTC', () async {
+      final spec = DartHttpClientLibrarySpec(
+        className: 'EventsClient',
+        schemas: const [
+          JsonSchema.object(
+            id: 'EventDto',
+            properties: {
+              'at': JsonSchema.string(format: 'date-time'),
+              'times': JsonSchema.array(
+                items: JsonSchema.string(nullable: true, format: 'date-time'),
+              ),
+            },
+            required: ['at', 'times'],
+            additionalProperties: false,
+          ),
+        ],
+        operations: [
+          DartHttpClientOperation(
+            method: HttpMethod.get,
+            path: '/events',
+            options: const RouteOptions(
+              operationId: 'getEvent',
+              success: ResponseSpec.json(schema: JsonSchema.ref('EventDto')),
+            ),
+            successType: 'EventDto',
+          ),
+        ],
+      );
+      const generator = DartHttpClientGenerator();
+      final models = generator.generateModelsPart(spec);
+      expect(models, contains('final List<DateTime?> times;'));
+      expect(models, contains('item == null ? null : DateTime.parse(item as String)'));
+      expect(models, contains('item?.toUtc().toIso8601String()'));
+      expect(models, contains('at.toUtc().toIso8601String()'));
+
+      final directory = await Directory.systemTemp.createTemp('dart_http_client_codegen_');
+      addTearDown(() => directory.delete(recursive: true));
+      File('${directory.path}/client.g.dart').writeAsStringSync(generator.generateLibrary(spec));
+      File('${directory.path}/client.bindings.g.dart')
+          .writeAsStringSync(generator.generateBindingsPart(spec));
+      File('${directory.path}/client.models.g.dart').writeAsStringSync(models);
+      File('${directory.path}/main.dart').writeAsStringSync(r'''
+import 'dart:convert';
+
+import 'client.g.dart';
+
+void main() {
+  final decoded = EventDto.decode(<String, Object?>{
+    'at': '2024-01-02T03:04:05.000Z',
+    'times': <Object?>[null, '2024-01-02T03:04:05.000Z'],
+  });
+  final local = EventDto(at: DateTime(2024, 1, 2, 3, 4, 5), times: <DateTime?>[null]);
+  print(jsonEncode(<Object?>[decoded.toJson(), local.toJson()]));
+}
+''');
+      final packageConfig = await Isolate.packageConfig;
+      final result = await Process.run(Platform.resolvedExecutable, [
+        if (packageConfig != null) '--packages=${packageConfig.toFilePath()}',
+        '${directory.path}/main.dart',
+      ]);
+      expect(result.exitCode, 0, reason: '${result.stdout}\n${result.stderr}');
+      final output = jsonDecode((result.stdout as String).trim()) as List<Object?>;
+      expect(output[0], {
+        'at': '2024-01-02T03:04:05.000Z',
+        'times': [null, '2024-01-02T03:04:05.000Z'],
+      });
+      final localJson = output[1]! as Map<String, Object?>;
+      expect(localJson['times'], [null]);
+      expect(localJson['at'], endsWith('Z'));
+      expect(DateTime.parse(localJson['at']! as String), DateTime(2024, 1, 2, 3, 4, 5).toUtc());
+    }, timeout: const Timeout(Duration(minutes: 2)));
   });
 
   group('DartHttpClientBase', () {
