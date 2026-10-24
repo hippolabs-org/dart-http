@@ -1,3 +1,12 @@
+## 0.4.1
+
+- Upgrade Rustls to 0.23.46, rustls-webpki to 0.103.16, Tokio to 1.54.1, and
+  jsonschema to 0.60.1, and refresh compatible Rust dependencies with a
+  checked-in lockfile.
+- Keep WebTransport on Quinn 0.11.12 and quinn-proto 0.11.19, including the
+  recent remote crash and memory-exhaustion fixes.
+- Require native artifacts 0.1.36. The native ABI remains 27.
+
 ## 0.4.0
 
 - Keep repeated request headers (joined with ", ", `Cookie` with "; ") and

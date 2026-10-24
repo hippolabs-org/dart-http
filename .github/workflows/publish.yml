@@ -22,7 +22,7 @@ jobs:
     with:
       package_scope: ${{ inputs.package_scope }}
       dry_run: ${{ inputs.dry_run }}
-      dart_version: "3.13.0"
+      dart_version: "3.13.7"
       devops_ref: 48675eed293989fce446b1ad72f5a3a336a0ceee
     secrets:
       pub_credentials: ${{ secrets.PUB_CREDENTIALS }}
