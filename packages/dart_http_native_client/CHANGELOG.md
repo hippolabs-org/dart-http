@@ -1,3 +1,11 @@
+## 0.3.1
+
+- Reject certificate chains through compromised eMudhra intermediate keys with
+  rustls-webpki 0.103.16 and refresh bundled certificate roots to 1.0.11.
+- Upgrade Rustls to 0.23.46 and Tokio to 1.54.1, and refresh compatible Rust
+  dependencies with a checked-in lockfile.
+- Require native artifacts 0.2.28. The native ABI remains 19.
+
 ## 0.3.0
 
 - Combine repeated response headers (", " for ordinary fields, "\n" for

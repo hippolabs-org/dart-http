@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
 
 env:
-  DART_VERSION: 3.13.0
+  DART_VERSION: 3.13.7
 
 jobs:
   test:
@@ -41,10 +41,12 @@ jobs:
           --manifest-path packages/${{ matrix.package }}/rust/Cargo.toml
       - run: >-
           cargo clippy
+          --locked
           --manifest-path packages/${{ matrix.package }}/rust/Cargo.toml
           --all-targets -- -D warnings
       - run: >-
           cargo test
+          --locked
           --manifest-path packages/${{ matrix.package }}/rust/Cargo.toml
 
   native-client-smoke:

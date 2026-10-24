@@ -4,5 +4,4 @@
 build/
 coverage/
 target/
-packages/**/rust/Cargo.lock
 .DS_Store

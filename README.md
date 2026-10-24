@@ -40,6 +40,14 @@ migrate repository ownership without an immediate API rename.
 ```sh
 dart pub get
 dart run melos run ci
-cargo test --manifest-path packages/dart_http_server_runtime/rust/Cargo.toml
-cargo test --manifest-path packages/dart_http_native_client/rust/Cargo.toml
+cargo test --locked --manifest-path packages/dart_http_server_runtime/rust/Cargo.toml
+cargo test --locked --manifest-path packages/dart_http_native_client/rust/Cargo.toml
 ```
+
+Keep each native runtime's `Cargo.lock` in version control so builds use the
+tested dependency versions, including transitive security fixes. Update Rust
+dependencies with `cargo update --manifest-path packages/<package>/rust/Cargo.toml`
+and run the checks above before committing the resulting lockfile.
+
+Bump the Rust crate's package version when native code or dependencies change;
+prebuilt release names and cache keys use that version.
