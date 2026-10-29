@@ -23,6 +23,7 @@ sealed class JsonSchema {
   const factory JsonSchema.object({String? id, Map<String, JsonSchema> properties, List<String> required}) = JsonObjectSchema;
   const factory JsonSchema.string() = JsonStringSchema;
   const factory JsonSchema.ref(String ref) = JsonReferenceSchema;
+  const factory JsonSchema.array({JsonSchema? items}) = JsonArraySchema;
 }
 final class JsonObjectSchema extends JsonSchema {
   const JsonObjectSchema({this.id, this.properties = const {}, this.required = const []});
@@ -31,6 +32,7 @@ final class JsonObjectSchema extends JsonSchema {
   final List<String> required;
 }
 final class JsonStringSchema extends JsonSchema { const JsonStringSchema(); }
+final class JsonArraySchema extends JsonSchema { const JsonArraySchema({this.items}); final JsonSchema? items; }
 final class JsonReferenceSchema extends JsonSchema { const JsonReferenceSchema(this.ref); final String ref; }
 class _Legacy { const _Legacy(); }
 typedef Legacy = _Legacy;
@@ -50,6 +52,8 @@ const bodySchema = JsonSchema.object(id: 'Body', properties: {'value': JsonSchem
 typedef LegacyBody = _$LegacyBody;
 @GenerateHttpModel(name: 'PublicWrapper')
 const wrapperSchema = JsonSchema.object(properties: {'legacy': JsonSchema.ref('Legacy')}, required: ['legacy']);
+@GenerateHttpModel(name: 'PublicListWrapper')
+const listWrapperSchema = JsonSchema.object(properties: {'items': JsonSchema.array(items: JsonSchema.ref('Legacy'))}, required: ['items']);
 ''',
       },
       generateFor: {'example|lib/model.dart'},
@@ -63,6 +67,8 @@ const wrapperSchema = JsonSchema.object(properties: {'legacy': JsonSchema.ref('L
             isNot(contains(r'class _$PublicBody')),
             contains('const factory PublicWrapper({required Legacy legacy}) = PublicWrapper._;'),
             contains('const PublicWrapper._({required this.legacy});'),
+            contains('const PublicListWrapper({required this.items});'),
+            isNot(contains('factory PublicListWrapper')),
           ]),
         ),
       },

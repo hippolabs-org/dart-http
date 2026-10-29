@@ -142,19 +142,18 @@ FromSchemaModelSpec buildFromSchemaModel(
 }
 
 bool _containsPrivateAlias(String type, Scope scope) {
-  for (final token in RegExp(
-    r'[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)?',
-  ).allMatches(type)) {
-    final names = token.group(0)!.split('.');
-    Element? declaration = scope.lookup(names.first).getter;
-    if (names.length == 2 && declaration is PrefixElement) {
-      declaration = declaration.scope.lookup(names.last).getter;
-    }
-    if (declaration is TypeAliasElement && _containsPrivateInterface(declaration.aliasedType)) {
-      return true;
-    }
+  // Only the outer alias is erased by inferred field formals. Nested aliases
+  // retain their public identity and do not need an additional factory.
+  final name = RegExp(r'^[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)?')
+      .firstMatch(type)
+      ?.group(0);
+  if (name == null) return false;
+  final names = name.split('.');
+  Element? declaration = scope.lookup(names.first).getter;
+  if (names.length == 2 && declaration is PrefixElement) {
+    declaration = declaration.scope.lookup(names.last).getter;
   }
-  return false;
+  return declaration is TypeAliasElement && _containsPrivateInterface(declaration.aliasedType);
 }
 
 bool _containsPrivateInterface(DartType type) =>
