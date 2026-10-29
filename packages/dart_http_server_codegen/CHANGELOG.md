@@ -2,6 +2,8 @@
 
 - Generate public classes directly from `@GenerateHttpModel` schema constants.
   Existing typedef annotations and generic model declarations remain supported.
+- Preserve const construction and public alias names when a field still uses a
+  legacy typedef of a private class, without suppressing public-API diagnostics.
 - **Breaking:** Generated clients reuse typed core operations by default instead
   of emitting an endpoint-specific public class for every method. Normal calls,
   `.start`, `.info` and binary `.stream` keep their signatures. Set
@@ -12,6 +14,8 @@
   retaining distinct inbound multipart and outbound upload models.
 - Emit required named parameters first and sorted directives. Exempt generated
   code only from the optional dot-shorthand style diagnostic.
+- Preserve public typedef identities in generated constructors when their backing
+  types are private.
 - Require `dart_http_core` 0.4.1.
 
 ## 0.5.0

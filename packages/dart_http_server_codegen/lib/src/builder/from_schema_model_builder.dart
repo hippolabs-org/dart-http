@@ -2,6 +2,8 @@ import 'dart:convert';
 
 import 'package:analyzer/dart/constant/value.dart';
 import 'package:analyzer/dart/element/element.dart';
+import 'package:analyzer/dart/element/scope.dart';
+import 'package:analyzer/dart/element/type.dart';
 import 'package:code_builder/code_builder.dart';
 import 'package:dart_style/dart_style.dart';
 import 'package:json_schema/json_schema.dart';
@@ -20,6 +22,7 @@ final class FromSchemaModelSpec {
     required this.responseStatus,
     required this.source,
     this.includeHttpHelpers = true,
+    this.useFactoryConstructor = false,
   });
 
   final String publicName;
@@ -32,6 +35,7 @@ final class FromSchemaModelSpec {
   final int responseStatus;
   final FromSchemaModelSource source;
   final bool includeHttpHelpers;
+  final bool useFactoryConstructor;
 }
 
 enum FromSchemaModelSource { json, multipart }
@@ -119,8 +123,43 @@ FromSchemaModelSpec buildFromSchemaModel(
     schemasById: _schemasById(registry),
     responseStatus: reader.peek('responseStatus')?.intValue ?? 200,
     source: source,
+    useFactoryConstructor:
+        publicDeclaration &&
+        schema is JsonObjectSchema &&
+        schema.properties.values.any(
+          (field) => _containsPrivateAlias(
+            _schemaDartType(
+              field,
+              nullable: false,
+              refModels: refModels,
+              typeParameters: typeParameters,
+              source: source,
+            ),
+            element.firstFragment.libraryFragment.scope,
+          ),
+        ),
   );
 }
+
+bool _containsPrivateAlias(String type, Scope scope) {
+  for (final token in RegExp(
+    r'[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)?',
+  ).allMatches(type)) {
+    final names = token.group(0)!.split('.');
+    Element? declaration = scope.lookup(names.first).getter;
+    if (names.length == 2 && declaration is PrefixElement) {
+      declaration = declaration.scope.lookup(names.last).getter;
+    }
+    if (declaration is TypeAliasElement && _containsPrivateInterface(declaration.aliasedType)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool _containsPrivateInterface(DartType type) =>
+    type is InterfaceType &&
+    (type.element.isPrivate || type.typeArguments.any(_containsPrivateInterface));
 
 JsonSchema jsonSchemaFromDartObject(DartObject object, {required Element element}) {
   final typeName = object.type?.element?.name;
@@ -283,10 +322,33 @@ Class _objectModel(FromSchemaModelSpec model) {
       ..name = model.backingClassName
       ..types.addAll(_typeParameterRefs(model.typeParameters))
       ..implements.addAll(isMultipart ? const [] : [refer('JsonEncodable')])
-      ..constructors.add(
+      ..constructors.addAll([
+        // Field formals lose public typedef identity in the SDK API lint. A
+        // typed const redirect preserves that identity and const construction.
+        if (model.useFactoryConstructor)
+          Constructor((constructor) {
+            constructor
+              ..constant = true
+              ..factory = true
+              ..redirect = refer('${_typeName(model.backingClassName, model.typeParameters)}._')
+              ..optionalParameters.addAll([
+                for (final field in [
+                  ...fields.where((field) => field.requiredParameter),
+                  ...fields.where((field) => !field.requiredParameter),
+                ])
+                  Parameter(
+                    (parameter) => parameter
+                      ..name = field.name
+                      ..type = refer(field.dartType)
+                      ..named = true
+                      ..required = field.requiredParameter,
+                  ),
+              ]);
+          }),
         Constructor((constructor) {
           constructor
             ..constant = true
+            ..name = model.useFactoryConstructor ? '_' : null
             ..optionalParameters.addAll([
               for (final field in [
                 ...fields.where((field) => field.requiredParameter),
@@ -301,7 +363,7 @@ Class _objectModel(FromSchemaModelSpec model) {
                 }),
             ]);
         }),
-      )
+      ])
       ..constructors.addAll(
         model.typeParameters.isEmpty && model.includeHttpHelpers
             ? const <Constructor>[]
