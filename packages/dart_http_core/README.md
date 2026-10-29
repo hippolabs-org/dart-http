@@ -24,6 +24,31 @@ same contract model.
   payloads, including reusable prefixes for native framed sends
 - `WebTransportContext` plus persistent unidirectional and bidirectional stream
   contracts with incremental binary payload leases
+- `GenerateHttpModel` for public schema-derived model declarations
+- Reusable typed client operations and immutable endpoint definitions, including
+  request handles, cancellation, timeout, binary/SSE streaming and upload progress
+
+## Generated models and client operations
+
+With `dart_http_server_codegen` 0.6.0 or newer, annotate const schema declarations
+using `@GenerateHttpModel(name: 'CreateUserBody')`. The generated class is public,
+so a body can be constructed using `.new(...)` from another library when its
+contextual type is known. Legacy `FromHttpSchema` typedef models remain supported.
+
+Generated clients reuse core operation classes for common argument signatures:
+`DartHttpJsonBodyOperation<Body, Response>`, `DartHttpJsonQueryOperation<Query, Response>`,
+binary and SSE variants, multipart uploads, and realtime connections. Each
+operation exposes only the capabilities appropriate to its signature. Ordinary
+JSON operations have `call`, `start`, and `info`; binary operations also have
+`stream`. Multipart uploads retain `onUploadProgress`.
+
+Endpoint definitions hold metadata and codecs once. Operations hold no mutable
+request state; each `start` returns an independent `DartHttpClientRequestHandle`.
+Opening a streamed response completes its handle's future; consuming or closing
+its body remains the caller's responsibility, as with direct `invokeStream`.
+
+See the [codegen guide](../dart_http_server_codegen/README.md) for public model
+declarations, migration and the legacy client generation option.
 
 ## Quick Start
 

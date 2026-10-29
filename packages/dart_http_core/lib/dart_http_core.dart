@@ -8,6 +8,7 @@ export 'package:native_exchange/native_exchange.dart' show ByteLease, DartByteLe
 
 export 'src/annotations.dart';
 export 'src/client/dart_http_client_operation.dart';
+export 'src/client/dart_http_shared_operation.dart';
 export 'src/client/dart_http_client_transport.dart';
 export 'src/client/dart_http_client.dart';
 export 'src/context.dart';

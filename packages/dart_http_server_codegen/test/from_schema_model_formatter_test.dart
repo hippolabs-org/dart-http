@@ -7,6 +7,27 @@ import 'package:test/test.dart';
 
 void main() {
   group('generateFromSchemaModels', () {
+    test('places required fields first while retaining generated type names', () {
+      const model = FromSchemaModelSpec(
+        publicName: 'ExampleBody',
+        backingClassName: r'_$ExampleBody',
+        schema: JsonSchema.object(
+          properties: {'optional': JsonSchema.string(), 'required': JsonSchema.string()},
+          required: ['required'],
+        ),
+        schemaId: 'ExampleBody',
+        refModels: <String, SchemaRefModelSpec>{},
+        typeParameters: <TypeParameterSpec>[],
+        schemasById: <String, JsonSchema>{},
+        responseStatus: 200,
+        source: FromSchemaModelSource.json,
+      );
+      final output = generateFromSchemaModels(const [model]);
+      expect(output.indexOf('required this.required'), lessThan(output.indexOf('this.optional')));
+      expect(output, contains('hippo_analysis_plugin/prefer_dot_shorthands'));
+      expect(output, contains('JsonSchema.object('));
+    });
+
     test('uses configured formatter page width', () {
       const model = FromSchemaModelSpec(
         publicName: 'PatientDeleteBody',

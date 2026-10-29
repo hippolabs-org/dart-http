@@ -6,6 +6,7 @@ import 'from_schema_model_builder.dart';
 
 const _fromHttpSchemaChecker = TypeChecker.typeNamedLiterally('FromHttpSchema');
 const _fromMultipartSchemaChecker = TypeChecker.typeNamedLiterally('FromMultipartSchema');
+const _generateHttpModelChecker = TypeChecker.typeNamedLiterally('GenerateHttpModel');
 
 /// Turns Dart HTTP schema annotations into request and response models.
 final class DartHttpServerBuilderGenerator extends Generator {
@@ -36,11 +37,14 @@ final class DartHttpServerBuilderGenerator extends Generator {
       throwOnUnresolved: false,
     );
     final httpModels = library.annotatedWith(_fromHttpSchemaChecker, throwOnUnresolved: false);
-    if (httpModels.isEmpty && multipartModels.isEmpty) {
+    final publicModels = library.annotatedWith(_generateHttpModelChecker, throwOnUnresolved: false);
+    if (httpModels.isEmpty && multipartModels.isEmpty && publicModels.isEmpty) {
       return null;
     }
 
     final models = [
+      for (final annotatedModel in publicModels)
+        buildFromSchemaModel(annotatedModel.element, annotatedModel.annotation),
       for (final annotatedModel in httpModels)
         buildFromSchemaModel(annotatedModel.element, annotatedModel.annotation),
       for (final annotatedModel in multipartModels)
@@ -50,6 +54,13 @@ final class DartHttpServerBuilderGenerator extends Generator {
           source: FromSchemaModelSource.multipart,
         ),
     ];
+
+    final names = <String>{};
+    for (final model in models) {
+      if (!names.add(model.publicName)) {
+        throw InvalidGenerationSourceError('Duplicate generated model name ${model.publicName}.');
+      }
+    }
 
     return generateFromSchemaModels(models, formatterOptions: _formatterOptions);
   }

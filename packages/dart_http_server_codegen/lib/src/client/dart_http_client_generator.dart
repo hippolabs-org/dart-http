@@ -6,6 +6,8 @@ import 'package:dart_http_core/dart_http_core.dart';
 import 'package:dart_style/dart_style.dart';
 import 'package:json_schema/json_schema.dart';
 
+import '../builder/from_schema_model_builder.dart';
+
 /// Build-time description of one generated client library.
 final class DartHttpClientLibrarySpec {
   const DartHttpClientLibrarySpec({
@@ -17,6 +19,7 @@ final class DartHttpClientLibrarySpec {
     this.schemaTypes = const <String, String>{},
     this.externalSchemaIds = const <String>{},
     this.additionalImports = const <String>[],
+    this.useSharedOperations = true,
   });
 
   final String className;
@@ -27,6 +30,10 @@ final class DartHttpClientLibrarySpec {
   final Map<String, String> schemaTypes;
   final Set<String> externalSchemaIds;
   final List<String> additionalImports;
+
+  /// Reuse core operation classes for common signatures. Set false for legacy
+  /// endpoint-specific public operation classes and constructors.
+  final bool useSharedOperations;
 
   factory DartHttpClientLibrarySpec.fromRouter({
     required String className,
@@ -138,6 +145,7 @@ final class DartHttpClientLibrarySpec {
       schemaTypes: schemaTypes,
       externalSchemaIds: externalSchemaIds,
       additionalImports: additionalImports,
+      useSharedOperations: options.useSharedOperations,
     );
   }
 }
@@ -148,6 +156,7 @@ final class DartHttpClientGenerationOptions {
     this.ignorePaths = const <String>{},
     this.ignoreOperations = const <String>{},
     this.methodNamePathPrefixes = const <String>{'/auth'},
+    this.useSharedOperations = true,
   });
 
   /// Full public route template prefixes to skip after router prefixes are applied.
@@ -166,6 +175,7 @@ final class DartHttpClientGenerationOptions {
   /// than a [RouteRegistration.prefix], such as Dart HTTP Auth's `/auth/...`
   /// routes.
   final Set<String> methodNamePathPrefixes;
+  final bool useSharedOperations;
 
   bool ignoresPath(String path) {
     return ignorePaths.any((ignored) => _matchesPathPrefix(path, ignored));
@@ -400,9 +410,33 @@ final class DartHttpClientGenerator {
 
   List<Spec> buildSpecs(DartHttpClientLibrarySpec spec) {
     return <Spec>[
-      ...spec.operations.map(_httpOperationClass),
-      ...spec.webSockets.map(_webSocketOperationClass),
-      ...spec.webTransports.map(_webTransportOperationClass),
+      for (final operation in spec.operations)
+        if (spec.useSharedOperations && _sharedOperationType(operation) != null)
+          _endpointField(operation)
+        else
+          _httpOperationClass(operation),
+      for (final operation in spec.webSockets)
+        if (spec.useSharedOperations && _sharedWebSocketType(operation) != null)
+          _connectionEndpointField(
+            name: operation.resolvedMethodName,
+            operationId: operation.operationId,
+            path: operation.path,
+            kind: 'webSocket',
+            queryType: operation.queryType,
+            querySchemaId: jsonSchemaRouteId(operation.query),
+          )
+        else
+          _webSocketOperationClass(operation),
+      for (final operation in spec.webTransports)
+        if (spec.useSharedOperations && _sharedWebTransportType(operation) != null)
+          _connectionEndpointField(
+            name: operation.resolvedMethodName,
+            operationId: operation.operationId,
+            path: operation.path,
+            kind: 'webTransport',
+          )
+        else
+          _webTransportOperationClass(operation),
       _clientClass(spec),
     ];
   }
@@ -420,7 +454,11 @@ final class DartHttpClientGenerator {
           _modelClass(
             _schemaTypeFromId(schema.id!, spec.schemaTypes)!,
             schema,
-            spec.schemaTypes,
+            {
+              for (final schema in spec.schemas)
+                ?schema.id: _schemaTypeFromId(schema.id!, spec.schemaTypes)!,
+              ...spec.schemaTypes,
+            },
             source: multipartBodySchemaIds.contains(schema.id)
                 ? _ClientModelSource.multipart
                 : _ClientModelSource.json,
@@ -495,23 +533,37 @@ final class DartHttpClientGenerator {
     Map<String, String> schemaTypes, {
     required _ClientModelSource source,
   }) {
+    if (source == _ClientModelSource.json) {
+      return schemaModelSpec(
+        FromSchemaModelSpec(
+          publicName: name,
+          backingClassName: name,
+          schema: schema,
+          schemaId: schema.id ?? name,
+          refModels: {
+            for (final entry in schemaTypes.entries)
+              entry.key: SchemaRefModelSpec(
+                schemaId: entry.key,
+                typeName: entry.value,
+                decodeFromObject: true,
+                isTransportValue: _isRawTransportType(entry.value),
+              ),
+          },
+          typeParameters: const [],
+          schemasById: const {},
+          responseStatus: 200,
+          source: FromSchemaModelSource.json,
+          includeHttpHelpers: false,
+        ),
+      ) as Class;
+    }
     return Class((builder) {
       builder
         ..modifier = ClassModifier.final$
         ..name = name
-        ..implements.addAll(source == _ClientModelSource.json ? [refer('JsonEncodable')] : [])
         ..constructors.add(_modelConstructor(schema, schemaTypes, source))
-        ..constructors.addAll(
-          source == _ClientModelSource.json
-              ? [_modelDecodeFactory(name), _modelFromJsonFactory(name, schema, schemaTypes)]
-              : [],
-        )
         ..fields.addAll(_modelFields(schema, schemaTypes, source))
-        ..methods.add(
-          source == _ClientModelSource.json
-              ? _modelToJsonMethod(schema, schemaTypes)
-              : _modelToMultipartFormDataMethod(schema, schemaTypes),
-        );
+        ..methods.add(_modelToMultipartFormDataMethod(schema, schemaTypes));
     });
   }
 
@@ -520,55 +572,17 @@ final class DartHttpClientGenerator {
     Map<String, String> schemaTypes,
     _ClientModelSource source,
   ) {
+    final fields = _modelFieldSpecs(schema, schemaTypes, source).toList();
     return Constructor((builder) {
       builder
         ..constant = true
         ..optionalParameters.addAll([
-          for (final field in _modelFieldSpecs(schema, schemaTypes, source))
+          for (final field in [
+            ...fields.where((field) => field.required),
+            ...fields.where((field) => !field.required),
+          ])
             _namedParameter(field.name, required: field.required, toThis: true),
         ]);
-    });
-  }
-
-  Constructor _modelFromJsonFactory(
-    String name,
-    JsonObjectSchema schema,
-    Map<String, String> schemaTypes,
-  ) {
-    final fields = _modelFieldSpecs(schema, schemaTypes, _ClientModelSource.json);
-    final assignments = fields.map((field) => '${field.name}: ${_decodeField(field)},').join('\n');
-    return Constructor((builder) {
-      builder
-        ..factory = true
-        ..name = 'fromJson'
-        ..requiredParameters.add(
-          Parameter((parameter) {
-            parameter
-              ..name = 'json'
-              ..type = refer('Map<String, Object?>');
-          }),
-        )
-        ..body = Code('''
-return $name(
-$assignments
-);
-''');
-    });
-  }
-
-  Constructor _modelDecodeFactory(String name) {
-    return Constructor((builder) {
-      builder
-        ..factory = true
-        ..name = 'decode'
-        ..requiredParameters.add(
-          Parameter((parameter) {
-            parameter
-              ..name = 'value'
-              ..type = refer('Object?');
-          }),
-        )
-        ..body = Code('return $name.fromJson(readJsonObject(value));');
     });
   }
 
@@ -586,25 +600,6 @@ $assignments
             ..name = field.name;
         }),
     ];
-  }
-
-  Method _modelToJsonMethod(JsonObjectSchema schema, Map<String, String> schemaTypes) {
-    final entries = _modelFieldSpecs(
-      schema,
-      schemaTypes,
-      _ClientModelSource.json,
-    ).map((field) => "'${field.wireName}': ${_encodeField(field)},").join('\n');
-    return Method((builder) {
-      builder
-        ..annotations.add(refer('override'))
-        ..returns = refer('Map<String, Object?>')
-        ..name = 'toJson'
-        ..body = Code('''
-return <String, Object?>{
-$entries
-};
-''');
-    });
   }
 
   Method _modelToMultipartFormDataMethod(JsonObjectSchema schema, Map<String, String> schemaTypes) {
@@ -657,25 +652,6 @@ $files
     ];
   }
 
-  String _decodeField(_ClientModelFieldSpec field) {
-    final nullable = !field.required || field.schema.nullable;
-    final access = nullable ? "json['${field.wireName}']" : "json['${field.wireName}']!";
-    final decoded = _decodeSchemaValue(field.schema, access, field.schemaTypes);
-    if (!nullable) {
-      return decoded;
-    }
-    return "$access == null ? null : $decoded";
-  }
-
-  String _encodeField(_ClientModelFieldSpec field) {
-    return _encodeSchemaValue(
-      field.schema,
-      field.name,
-      nullable: !field.required || field.schema.nullable,
-      schemaTypes: field.schemaTypes,
-    );
-  }
-
   Class _clientClass(DartHttpClientLibrarySpec spec) {
     return Class((builder) {
       builder
@@ -684,9 +660,21 @@ $files
         ..extend = refer('DartHttpClientBase')
         ..constructors.add(_clientConstructor())
         ..methods.addAll([
-          ...spec.operations.map(_httpOperationGetter),
-          ...spec.webSockets.map(_webSocketOperationGetter),
-          ...spec.webTransports.map(_webTransportOperationGetter),
+          for (final operation in spec.operations)
+            _operationGetter(
+              operation.resolvedMethodName,
+              sharedType: spec.useSharedOperations ? _sharedOperationType(operation) : null,
+            ),
+          for (final operation in spec.webSockets)
+            _operationGetter(
+              operation.resolvedMethodName,
+              sharedType: spec.useSharedOperations ? _sharedWebSocketType(operation) : null,
+            ),
+          for (final operation in spec.webTransports)
+            _operationGetter(
+              operation.resolvedMethodName,
+              sharedType: spec.useSharedOperations ? _sharedWebTransportType(operation) : null,
+            ),
         ]);
     });
   }
@@ -718,6 +706,101 @@ $files
         ]);
     });
   }
+
+  Reference? _sharedOperationType(DartHttpClientOperation operation) {
+    if (operation.paramsType != null ||
+        operation.headersType != null ||
+        (operation.bodyType != null && operation.queryType != null)) {
+      return null;
+    }
+    final binary = _isBinaryOperation(operation);
+    final sse = _isSseOperation(operation);
+    final multipart = _isMultipartOperation(operation);
+    if ((binary && operation.successType != 'Uint8List') ||
+        (sse && operation.successType != 'Object?') ||
+        (multipart && (binary || sse))) {
+      return null;
+    }
+    final shape = operation.bodyType != null
+        ? 'Body'
+        : operation.queryType != null
+        ? 'Query'
+        : '';
+    final mode = multipart
+        ? 'MultipartJson'
+        : binary
+        ? 'Binary'
+        : sse
+        ? 'Sse'
+        : 'Json';
+    return _type('DartHttp$mode${shape}Operation', [
+      if (operation.bodyType case final body?) refer(body),
+      if (operation.queryType case final query?) refer(query),
+      if (!binary && !sse) refer(operation.successType),
+    ]);
+  }
+
+  Reference? _sharedWebSocketType(DartHttpClientWebSocketOperation operation) {
+    if (operation.paramsType != null ||
+        operation.headersType != null ||
+        operation.queryType == null) {
+      return null;
+    }
+    return _type('DartHttpWebSocketQueryOperation', [refer(operation.queryType!)]);
+  }
+
+  Reference? _sharedWebTransportType(DartHttpClientWebTransportOperation operation) {
+    if (operation.paramsType != null ||
+        operation.queryType != null ||
+        operation.headersType != null) {
+      return null;
+    }
+    return refer('DartHttpWebTransportOperation');
+  }
+
+  Field _endpointField(DartHttpClientOperation operation) => Field((builder) {
+    builder
+      ..modifier = FieldModifier.final$
+      ..name = _endpointName(operation.resolvedMethodName)
+      ..assignment = refer('DartHttpClientEndpoint')
+          .newInstance(
+            [],
+            _invocationArguments(operation, definition: true),
+            _invocationTypes(operation),
+          )
+          .code;
+  });
+
+  Field _connectionEndpointField({
+    required String name,
+    required String operationId,
+    required String path,
+    required String kind,
+    String? queryType,
+    String? querySchemaId,
+  }) => Field((builder) {
+    builder
+      ..modifier = FieldModifier.final$
+      ..name = _endpointName(name)
+      ..assignment = refer('DartHttpClientConnectionEndpoint')
+          .newInstance(
+            [],
+            {
+              'info': _operationInfoExpression(operationId: operationId, kind: kind, path: path),
+              if (queryType != null)
+                'query': refer('DartHttpClientValueCodec').newInstance(
+                  [],
+                  {
+                    if (querySchemaId != null) 'schemaId': literalString(querySchemaId),
+                    'encoder': ?_nullableEncoderFor(queryType),
+                  },
+                  [refer('$queryType?')],
+                ),
+            },
+            [refer('Never'), refer(queryType == null ? 'Never' : '$queryType?'), refer('Never')],
+          )
+          .code;
+  });
 
   Class _webSocketOperationClass(DartHttpClientWebSocketOperation operation) {
     return Class((builder) {
@@ -791,35 +874,31 @@ $files
         ..type = MethodType.getter
         ..returns = refer('DartHttpClientOperationInfo')
         ..name = 'info'
-        ..body = refer('DartHttpClientOperationInfo')
-            .constInstance([], {
-              'operationId': literalString(operationId),
-              'kind': refer('DartHttpClientOperationKind').property(kind),
-              'pathTemplate': literalString(path),
-              if (method != null) 'method': refer('HttpMethod').property(method.name),
-            })
-            .returned
-            .statement,
+        ..body = _operationInfoExpression(
+          operationId: operationId,
+          kind: kind,
+          path: path,
+          method: method,
+        ).returned.statement,
     );
   }
 
-  Method _httpOperationGetter(DartHttpClientOperation operation) =>
-      _operationGetter(operation.resolvedMethodName);
-
-  Method _webSocketOperationGetter(DartHttpClientWebSocketOperation operation) =>
-      _operationGetter(operation.resolvedMethodName);
-
-  Method _webTransportOperationGetter(DartHttpClientWebTransportOperation operation) =>
-      _operationGetter(operation.resolvedMethodName);
-
-  Method _operationGetter(String name) {
+  Method _operationGetter(String name, {Reference? sharedType}) {
     final className = _operationClassName(name);
     return Method(
       (builder) => builder
         ..type = MethodType.getter
-        ..returns = refer(className)
+        ..returns = sharedType ?? refer(className)
         ..name = name
-        ..body = refer(className).newInstance([refer('this')]).returned.statement,
+        ..body =
+            (sharedType == null
+                    ? refer(className).newInstance([refer('this')])
+                    : sharedType.newInstance([], {
+                        'client': refer('this'),
+                        'endpoint': refer(_endpointName(name)),
+                      }))
+                .returned
+                .statement,
     );
   }
 
@@ -906,10 +985,10 @@ $forwarded,
     return <Parameter>[
       if (operation.paramsType case final type?)
         _namedParameter('params', type: refer(type), required: true),
-      if (operation.queryType case final type?) _namedParameter('query', type: refer('$type?')),
-      if (operation.headersType case final type?) _namedParameter('headers', type: refer('$type?')),
       if (operation.bodyType case final type?)
         _namedParameter('body', type: refer(type), required: true),
+      if (operation.queryType case final type?) _namedParameter('query', type: refer('$type?')),
+      if (operation.headersType case final type?) _namedParameter('headers', type: refer('$type?')),
       _namedParameter('abortTrigger', type: refer('Future<void>?')),
       _namedParameter('timeout', type: refer('Duration?')),
       if (_isMultipartOperation(operation))
@@ -1087,15 +1166,28 @@ $forwarded,
     ];
   }
 
-  Map<String, Expression> _invocationArguments(DartHttpClientOperation operation) {
+  Map<String, Expression> _invocationArguments(
+    DartHttpClientOperation operation, {
+    bool definition = false,
+  }) {
     final options = operation.options;
     final successSchemaId = jsonSchemaRouteId(options.responses.success.schema);
     final arguments = <String, Expression>{
-      'method': refer('HttpMethod').property(operation.method.name),
-      'pathTemplate': literalString(operation.path),
-      'abortTrigger': refer('abortTrigger'),
-      'timeout': refer('timeout'),
-      if (_isMultipartOperation(operation)) 'onMultipartUploadProgress': refer('onUploadProgress'),
+      if (definition)
+        'info': _operationInfoExpression(
+          operationId: operation.options.operationId!,
+          kind: 'http',
+          path: operation.path,
+          method: operation.method,
+        )
+      else ...{
+        'method': refer('HttpMethod').property(operation.method.name),
+        'pathTemplate': literalString(operation.path),
+        'abortTrigger': refer('abortTrigger'),
+        'timeout': refer('timeout'),
+        if (_isMultipartOperation(operation))
+          'onMultipartUploadProgress': refer('onUploadProgress'),
+      },
       'success': refer('DartHttpClientResponseSpec').newInstance(
         const <Expression>[],
         <String, Expression>{
@@ -1124,6 +1216,7 @@ $forwarded,
         schemaId: jsonSchemaRouteId(schema),
         value: refer('params'),
         encode: _encoderFor(operation.paramsType!),
+        definition: definition,
       );
     }
     if (options.query case final schema?) {
@@ -1132,6 +1225,7 @@ $forwarded,
         schemaId: jsonSchemaRouteId(schema),
         value: refer('query'),
         encode: _nullableEncoderFor(operation.queryType!),
+        definition: definition,
       );
     }
     if (options.headers case final schema?) {
@@ -1140,6 +1234,7 @@ $forwarded,
         schemaId: jsonSchemaRouteId(schema),
         value: refer('headers'),
         encode: _nullableEncoderFor(operation.headersType!),
+        definition: definition,
       );
     }
     if (options.body case final body?) {
@@ -1147,16 +1242,17 @@ $forwarded,
       final bodyEncoder = _isMultipartFormDataContentType(body.contentType)
           ? const CodeExpression(Code('(value) => value.toMultipartFormData()'))
           : _encoderFor(operation.bodyType!);
-      arguments['body'] = refer('DartHttpClientRequestBody').newInstance(
-        const <Expression>[],
-        <String, Expression>{
-          'contentType': literalString(body.contentType),
-          if (bodySchemaId case final schemaId?) 'schemaId': literalString(schemaId),
-          'value': refer('body'),
-          'encoder': ?bodyEncoder,
-        },
-        <Reference>[refer(operation.bodyType!)],
-      );
+      arguments['body'] =
+          refer(definition ? 'DartHttpClientBodyCodec' : 'DartHttpClientRequestBody').newInstance(
+            const <Expression>[],
+            <String, Expression>{
+              'contentType': literalString(body.contentType),
+              if (bodySchemaId case final schemaId?) 'schemaId': literalString(schemaId),
+              if (!definition) 'value': refer('body'),
+              'encoder': ?bodyEncoder,
+            },
+            <Reference>[refer(operation.bodyType!)],
+          );
     }
 
     return arguments;
@@ -1532,12 +1628,13 @@ Expression _requestValueExpression({
   required String? schemaId,
   required Expression value,
   Expression? encode,
+  bool definition = false,
 }) {
-  return refer('DartHttpClientRequestValue').newInstance(
+  return refer(definition ? 'DartHttpClientValueCodec' : 'DartHttpClientRequestValue').newInstance(
     const <Expression>[],
     <String, Expression>{
       if (schemaId case final schemaId?) 'schemaId': literalString(schemaId),
-      'value': value,
+      if (!definition) 'value': value,
       'encoder': ?encode,
     },
     <Reference>[refer(type)],
@@ -2003,7 +2100,11 @@ TypeReference _type(String symbol, [Iterable<Reference> types = const []]) {
 }
 
 String _format(Library library, {required DartHttpClientFormatterOptions formatterOptions}) {
-  return formatterOptions.createFormatter().format('${library.accept(DartEmitter())}');
+  // Keep explicit generated type names without suppressing semantic diagnostics.
+  const generatedStyle = '// ignore_for_file: hippo_analysis_plugin/prefer_dot_shorthands\n';
+  return formatterOptions.createFormatter().format(
+    '$generatedStyle${library.accept(DartEmitter(orderDirectives: true))}',
+  );
 }
 
 String _lowerCamel(String value) {
@@ -2030,3 +2131,17 @@ String _operationClassName(String methodName) {
   }
   return '${methodName[0].toUpperCase()}${methodName.substring(1)}Operation';
 }
+
+String _endpointName(String methodName) => '_${methodName}Endpoint';
+
+Expression _operationInfoExpression({
+  required String operationId,
+  required String kind,
+  required String path,
+  HttpMethod? method,
+}) => refer('DartHttpClientOperationInfo').constInstance([], {
+  'operationId': literalString(operationId),
+  'kind': refer('DartHttpClientOperationKind').property(kind),
+  'pathTemplate': literalString(path),
+  if (method != null) 'method': refer('HttpMethod').property(method.name),
+});

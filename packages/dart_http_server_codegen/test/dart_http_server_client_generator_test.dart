@@ -11,6 +11,31 @@ import 'package:test/test.dart';
 
 void main() {
   group('DartHttpClientGenerator', () {
+    test('legacy mode retains endpoint-specific public classes and constructors', () {
+      final source = const DartHttpClientGenerator().generate(
+        const DartHttpClientLibrarySpec(
+          className: 'LegacyClient',
+          useSharedOperations: false,
+          operations: [
+            DartHttpClientOperation(
+              method: HttpMethod.get,
+              path: '/value',
+              options: RouteOptions(operationId: 'getValue', success: ResponseSpec.json()),
+              successType: 'Object?',
+            ),
+          ],
+        ),
+      );
+      expect(source, contains('final class GetValueOperation'));
+      expect(source, contains('const GetValueOperation(this._client);'));
+      expect(source, contains('GetValueOperation get getValue'));
+      expect(
+        source,
+        contains('DartHttpClientRequestHandle<DartHttpClientResponseObject<Object?>> start('),
+      );
+      expect(source, isNot(contains('DartHttpClientEndpoint<')));
+    });
+
     test('emits a client class from route metadata', () {
       final source = const DartHttpClientGenerator().generate(
         DartHttpClientLibrarySpec(
@@ -127,13 +152,12 @@ void main() {
       );
 
       expect(source, contains("import 'dart:typed_data';"));
-      expect(source, contains('Future<DartHttpClientResponseObject<Uint8List>> call({'));
-      expect(source, contains('Future<DartHttpClientStreamedResponseObject> stream({'));
+      expect(source, contains('DartHttpBinaryOperation get getTone'));
+      expect(source, isNot(contains('final class GetToneOperation')));
+      expect(source, contains('DartHttpClientEndpoint<Uint8List, Never, Never, Never, Never>'));
       expect(source, contains('DartHttpClientResponseSpec<Uint8List>'));
       expect(source, isNot(contains('Uint8List.decode')));
-      expect(source, contains('Duration? timeout'));
-      expect(source, contains('invokeStream<Never, Never, Never, Never>'));
-      expect(source, contains('abortTrigger: abortTrigger'));
+      expect(source, contains('DartHttpClientEndpoint<'));
     });
 
     test('emits streamed bindings for SSE response contracts', () {
@@ -151,12 +175,10 @@ void main() {
         ),
       );
 
-      expect(source, contains('Future<DartHttpClientStreamedResponseObject> call({'));
-      expect(source, contains('invokeStream<Never, Never, Never, Never>'));
+      expect(source, contains('DartHttpSseOperation get subscribeEvents'));
+      expect(source, contains('DartHttpClientEndpoint<'));
       expect(source, contains("contentType: 'text/event-stream; charset=utf-8'"));
       expect(source, contains('responseMode: DartHttpClientResponseMode.serverSentEvents'));
-      expect(source, contains('Duration? timeout'));
-      expect(source, contains('abortTrigger: abortTrigger'));
     });
 
     test('infers Uint8List for generated clients from binary response specs', () {
@@ -181,8 +203,8 @@ void main() {
         schemas: const [
           JsonSchema.object(
             id: 'UserDto',
-            properties: {'id': JsonSchema.string(), 'name': JsonSchema.string()},
-            required: ['id', 'name'],
+            properties: {'name': JsonSchema.string(), 'id': JsonSchema.string()},
+            required: ['id'],
             additionalProperties: false,
           ),
         ],
@@ -192,11 +214,13 @@ void main() {
             path: '/users',
             options: const RouteOptions(
               operationId: 'createUser',
+              query: JsonSchema.ref('CreateUserQuery'),
               body: RequestBody.json(schema: JsonSchema.ref('CreateUserBody')),
               success: ResponseSpec.json(schema: JsonSchema.ref('UserDto')),
             ),
             successType: 'UserDto',
             bodyType: 'CreateUserBody',
+            queryType: 'CreateUserQuery',
           ),
         ],
       );
@@ -213,8 +237,10 @@ void main() {
       expect(bindings, contains("part of 'client.g.dart';"));
       expect(bindings, contains('final class UsersClient'));
       expect(bindings, contains('Future<DartHttpClientResponseObject<UserDto>> call({'));
+      expect(bindings, contains('required CreateUserBody body,\n    CreateUserQuery? query,'));
       expect(models, contains("part of 'client.g.dart';"));
       expect(models, contains('final class UserDto implements JsonEncodable'));
+      expect(models, contains('const UserDto({required this.id, this.name});'));
       expect(models, contains('factory UserDto.decode(Object? value)'));
       expect(models, contains('factory UserDto.fromJson(Map<String, Object?> json)'));
     });
@@ -249,9 +275,12 @@ void main() {
       final models = const DartHttpClientGenerator().generateModelsPart(spec);
 
       expect(models, contains('final DateTime? banExpires;'));
-      expect(models, contains("banExpires: json['ban_expires'] == null"));
-      expect(models, contains("? null\n          : DateTime.parse(json['ban_expires'] as String)"));
-      expect(models, contains("'ban_expires': banExpires?.toUtc().toIso8601String()"));
+      expect(models, contains("banExpires: json[\"ban_expires\"] == null"));
+      expect(
+        models,
+        contains("? null\n          : DateTime.parse(json[\"ban_expires\"] as String)"),
+      );
+      expect(models, contains('"ban_expires": banExpires?.toUtc().toIso8601String()'));
     });
 
     test('emits named string scalar client model fields', () {
@@ -296,11 +325,11 @@ void main() {
       expect(models, contains('final WorkspaceWorkspaceFolderId? folderId;'));
       expect(
         models,
-        contains("workspaceId: WorkspaceWorkspaceId(json['workspace_id']! as String)"),
+        contains("workspaceId: WorkspaceWorkspaceId(json[\"workspace_id\"]! as String)"),
       );
-      expect(models, contains("WorkspaceWorkspaceFolderId(json['folder_id'] as String)"));
-      expect(models, contains("'workspace_id': workspaceId.value"));
-      expect(models, contains("'folder_id': folderId?.value"));
+      expect(models, contains("WorkspaceWorkspaceFolderId(json[\"folder_id\"] as String)"));
+      expect(models, contains('"workspace_id": workspaceId.value'));
+      expect(models, contains('"folder_id": folderId?.value'));
     });
 
     test('emits model string scalar client model fields', () {
@@ -334,8 +363,8 @@ void main() {
       final models = const DartHttpClientGenerator().generateModelsPart(spec);
 
       expect(models, contains('final WorkspaceName workspaceName;'));
-      expect(models, contains("workspaceName: WorkspaceName.decode(json['workspace_name']!)"));
-      expect(models, contains("'workspace_name': workspaceName.toJson()"));
+      expect(models, contains("workspaceName: WorkspaceName.decode(json[\"workspace_name\"])"));
+      expect(models, contains('"workspace_name": workspaceName.toJson()'));
     });
 
     test('emits multipart client body models and encoders', () {
@@ -374,14 +403,8 @@ void main() {
       final models = generator.generateModelsPart(spec);
 
       expect(bindings, contains('encoder: (value) => value.toMultipartFormData()'));
-      expect(
-        bindings,
-        contains(
-          'void Function(DartHttpMultipartUploadProgress progress)? '
-          'onUploadProgress',
-        ),
-      );
-      expect(bindings, contains('onMultipartUploadProgress: onUploadProgress'));
+      expect(bindings, contains('DartHttpMultipartJsonBodyOperation<UploadBody, Object?>'));
+      expect(bindings, isNot(contains('final class UploadFileOperation')));
       expect(models, contains('final class UploadBody'));
       expect(models, isNot(contains('implements JsonEncodable')));
       expect(models, contains('final MultipartUploadFile file;'));
@@ -510,13 +533,7 @@ void main() {
         formatterOptions: const DartHttpClientFormatterOptions(pageWidth: 100),
       );
 
-      expect(
-        models,
-        contains(
-          "displayUsername: json['display_username'] == null ? null : "
-          "json['display_username'] as String,",
-        ),
-      );
+      expect(models, contains('displayUsername: json["display_username"] as String?'));
     });
 
     test('emits split client files into an existing or new directory', () async {
@@ -594,10 +611,7 @@ void main() {
 
       expect(
         await File('${output.path}/generated/client.models.g.dart').readAsString(),
-        contains(
-          "displayUsername: json['display_username'] == null ? null : "
-          "json['display_username'] as String,",
-        ),
+        contains('displayUsername: json["display_username"] as String?'),
       );
     });
 
@@ -654,8 +668,8 @@ void main() {
       );
       final source = const DartHttpClientGenerator().generate(spec);
 
-      expect(source, contains('final class GetHelloOperation'));
-      expect(source, contains('final class CreateUserOperation'));
+      expect(source, contains('DartHttpJsonOperation<String> get getHello'));
+      expect(source, contains('DartHttpJsonBodyOperation<CreateUserBody, UserDto> get createUser'));
       expect(source, contains('final class ConnectEventsOperation'));
       expect(source, contains('Future<DartHttpClientWebSocket> connect({'));
       expect(source, contains('required RoomPath params'));
@@ -663,7 +677,7 @@ void main() {
       expect(source, contains("pathTemplate: '/events/<id>'"));
       expect(source, contains("schemaId: 'RoomPath'"));
       expect(source, contains("schemaId: 'UserQuery'"));
-      expect(source, contains('final class ConnectDatagramsOperation'));
+      expect(source, contains('DartHttpWebTransportOperation get connectDatagrams'));
       expect(source, contains('authDeleteUser'));
       expect(source, contains("pathTemplate: '/auth/delete-user'"));
       expect(source, isNot(contains('Future<DartHttpClientResponseObject<Object?>> deleteUser')));
@@ -725,8 +739,8 @@ void main() {
       expect(source, contains('final class PhoneCallDto implements JsonEncodable'));
       expect(source, contains('final class UserDto implements JsonEncodable'));
       expect(source, contains('final UserDto owner;'));
-      expect(source, contains('owner: UserDto.decode(json[\'owner\']!),'));
-      expect(source, contains("'owner': owner.toJson()"));
+      expect(source, contains('owner: UserDto.decode(json["owner"]),'));
+      expect(source, contains('"owner": owner.toJson()'));
       expect(source, contains('decoder: PhoneCallDto.decode'));
       expect(source, contains('encoder: (value) => value.toJson()'));
       expect(source, isNot(contains("schemaId: 'PhoneCallDto'")));
@@ -807,8 +821,8 @@ void main() {
       expect(source, contains('final class PhoneCallDto implements JsonEncodable'));
       expect(source, isNot(contains('final class UserDto implements')));
       expect(source, contains('final UserDto owner;'));
-      expect(source, contains('owner: UserDto.decode(json[\'owner\']!),'));
-      expect(source, contains('Future<DartHttpClientResponseObject<UserDto>>'));
+      expect(source, contains('owner: UserDto.decode(json["owner"]),'));
+      expect(source, contains('DartHttpJsonOperation<UserDto>'));
       expect(source, contains('decoder: UserDto.decode'));
       expect(source, contains("schemaId: 'UserDto'"));
     });
@@ -838,7 +852,7 @@ void main() {
       );
       final source = const DartHttpClientGenerator().generate(spec);
 
-      expect(source, contains('DartHttpClientResponseObject<List<UserDto>>'));
+      expect(source, contains('DartHttpJsonOperation<List<UserDto>>'));
       expect(source, contains('decoder: (value) => (value as List)'));
       expect(source, contains('.map((item) => UserDto.decode(item))'));
       expect(source, isNot(contains('List<UserDto>.decode')));
@@ -945,9 +959,9 @@ void main() {
       );
       final source = const DartHttpClientGenerator().generate(spec);
 
-      expect(source, contains('final class GetPublicOperation'));
-      expect(source, contains('final class GetSameOperation'));
-      expect(source, contains('final class GetIgnoredOtherOperation'));
+      expect(source, contains('get getPublic'));
+      expect(source, contains('get getSame'));
+      expect(source, contains('get getIgnoredOther'));
       expect(source, isNot(contains('getOpenApiOnly')));
       expect(source, isNot(contains('getInternalHealth')));
       expect(source, isNot(contains('getIgnoredPath')));

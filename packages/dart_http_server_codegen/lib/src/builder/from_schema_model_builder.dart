@@ -19,6 +19,7 @@ final class FromSchemaModelSpec {
     required this.schemasById,
     required this.responseStatus,
     required this.source,
+    this.includeHttpHelpers = true,
   });
 
   final String publicName;
@@ -30,6 +31,7 @@ final class FromSchemaModelSpec {
   final Map<String, JsonSchema> schemasById;
   final int responseStatus;
   final FromSchemaModelSource source;
+  final bool includeHttpHelpers;
 }
 
 enum FromSchemaModelSource { json, multipart }
@@ -54,17 +56,31 @@ FromSchemaModelSpec buildFromSchemaModel(
   ConstantReader reader, {
   FromSchemaModelSource source = FromSchemaModelSource.json,
 }) {
-  if (element is! TypeAliasElement) {
+  final publicDeclaration = element is TopLevelVariableElement;
+  if (element is! TypeAliasElement && !publicDeclaration) {
     throw InvalidGenerationSourceError(
-      '@${_annotationName(source)} can only be used on type aliases.',
+      'HTTP model annotations require a type alias or a const schema variable.',
       element: element,
     );
   }
 
-  final sourceSchema = jsonSchemaFromDartObject(
-    reader.read('schema').objectValue,
-    element: element,
-  );
+  final DartObject schemaObject;
+  if (element is TopLevelVariableElement) {
+    final value = element.computeConstantValue();
+    if (!element.isConst || value == null || value.isNull) {
+      throw InvalidGenerationSourceError(
+        '@GenerateHttpModel requires a const JsonSchema variable.',
+        element: element,
+      );
+    }
+    schemaObject = value;
+    source = reader.read('source').objectValue.getField('index')?.toIntValue() == 1
+        ? FromSchemaModelSource.multipart
+        : FromSchemaModelSource.json;
+  } else {
+    schemaObject = reader.read('schema').objectValue;
+  }
+  final sourceSchema = jsonSchemaFromDartObject(schemaObject, element: element);
 
   final registryReader = reader.read('registry');
   JsonSchemaRegistry? registry;
@@ -83,11 +99,19 @@ FromSchemaModelSpec buildFromSchemaModel(
     registry: registry,
     element: element,
   );
-  final typeParameters = _typeParameterSpecs(element);
-  final publicName = element.displayName;
+  final typeParameters = element is TypeAliasElement
+      ? _typeParameterSpecs(element)
+      : const <TypeParameterSpec>[];
+  final publicName = publicDeclaration ? reader.read('name').stringValue : element.displayName;
+  if (publicDeclaration && !RegExp(r'^[A-Z][a-zA-Z0-9_]*$').hasMatch(publicName)) {
+    throw InvalidGenerationSourceError(
+      '@GenerateHttpModel name must be a public Dart type name starting with an uppercase letter.',
+      element: element,
+    );
+  }
   return FromSchemaModelSpec(
     publicName: publicName,
-    backingClassName: '_\$$publicName',
+    backingClassName: publicDeclaration ? publicName : '_\$$publicName',
     schema: schema,
     schemaId: _schemaIdForModel(sourceSchema, schema, publicName),
     refModels: refModels,
@@ -96,13 +120,6 @@ FromSchemaModelSpec buildFromSchemaModel(
     responseStatus: reader.peek('responseStatus')?.intValue ?? 200,
     source: source,
   );
-}
-
-String _annotationName(FromSchemaModelSource source) {
-  return switch (source) {
-    FromSchemaModelSource.json => 'FromSchema',
-    FromSchemaModelSource.multipart => 'FromMultipartSchema',
-  };
 }
 
 JsonSchema jsonSchemaFromDartObject(DartObject object, {required Element element}) {
@@ -235,14 +252,18 @@ String generateFromSchemaModels(
   List<FromSchemaModelSpec> models, {
   FromSchemaFormatterOptions formatterOptions = const FromSchemaFormatterOptions(),
 }) {
-  final library = Library((builder) => builder.body.addAll(models.map(_modelSpec)));
-  const ignoreForFile = '// ignore_for_file: unused_element, unused_field\n';
+  final library = Library((builder) => builder.body.addAll(models.map(schemaModelSpec)));
+  // Generated model expressions intentionally retain their explicit type names.
+  const ignoreForFile =
+      '// ignore_for_file: unused_element, unused_field, '
+      'hippo_analysis_plugin/prefer_dot_shorthands\n';
   return formatterOptions.createFormatter().format(
     '$ignoreForFile${library.accept(DartEmitter())}',
   );
 }
 
-Spec _modelSpec(FromSchemaModelSpec model) {
+/// Emits the common schema model representation for contracts and client DTOs.
+Spec schemaModelSpec(FromSchemaModelSpec model) {
   return switch (model.schema) {
     JsonObjectSchema() => _objectModel(model),
     JsonStringSchema(:final enumValues) when enumValues.isNotEmpty => _stringEnumModel(model),
@@ -267,7 +288,10 @@ Class _objectModel(FromSchemaModelSpec model) {
           constructor
             ..constant = true
             ..optionalParameters.addAll([
-              for (final field in fields)
+              for (final field in [
+                ...fields.where((field) => field.requiredParameter),
+                ...fields.where((field) => !field.requiredParameter),
+              ])
                 Parameter((parameter) {
                   parameter
                     ..name = field.name
@@ -279,7 +303,7 @@ Class _objectModel(FromSchemaModelSpec model) {
         }),
       )
       ..constructors.addAll(
-        model.typeParameters.isEmpty
+        model.typeParameters.isEmpty && model.includeHttpHelpers
             ? const <Constructor>[]
             : [
                 _objectDecodeFactory(_typeName(model.backingClassName, model.typeParameters)),
@@ -287,11 +311,13 @@ Class _objectModel(FromSchemaModelSpec model) {
               ],
       )
       ..fields.addAll([
-        _schemaIdField(model.schemaId),
-        _schemaField(model.schema, schemaId: model.schemaId),
-        _schemaRefField(),
-        _requestBodyField(source: model.source, includeDecoder: model.typeParameters.isEmpty),
-        if (!isMultipart) _responseField(model.responseStatus),
+        if (model.includeHttpHelpers) ...[
+          _schemaIdField(model.schemaId),
+          _schemaField(model.schema, schemaId: model.schemaId),
+          _schemaRefField(),
+          _requestBodyField(source: model.source, includeDecoder: model.typeParameters.isEmpty),
+          if (!isMultipart) _responseField(model.responseStatus),
+        ],
         for (final field in fields)
           Field((builder) {
             builder
@@ -302,7 +328,7 @@ Class _objectModel(FromSchemaModelSpec model) {
       ])
       ..methods.addAll([
         if (!isMultipart) _objectToJsonMethod(fields, model.refModels),
-        if (model.typeParameters.isEmpty)
+        if (model.typeParameters.isEmpty && model.includeHttpHelpers)
           if (isMultipart)
             _objectFromMultipartMethod(model, fields)
           else ...[
@@ -815,6 +841,10 @@ String _schemaDartType(
   required List<TypeParameterSpec> typeParameters,
   required FromSchemaModelSource source,
 }) {
+  final bound = schema is JsonObjectSchema ? refModels[schema.id] : null;
+  if (bound?.decodeFromObject ?? false) {
+    return nullable && !bound!.typeName.endsWith('?') ? '${bound.typeName}?' : bound!.typeName;
+  }
   final type = switch (schema) {
     JsonStringSchema(:final dartType, :final format) => _stringSchemaDartType(
       dartType,
@@ -956,6 +986,16 @@ String _decodeValue(
   List<TypeParameterSpec> typeParameters = const <TypeParameterSpec>[],
   String path = '',
 }) {
+  if (schema is JsonObjectSchema && (refModels[schema.id]?.decodeFromObject ?? false)) {
+    return _decodeReferenceValue(
+      schema.id!,
+      source,
+      nullable: nullable,
+      refModels: refModels,
+      typeParameters: typeParameters,
+      path: path,
+    );
+  }
   return switch (schema) {
     JsonStringSchema(:final dartType, :final format) => _decodeStringValue(
       dartType,
@@ -1046,6 +1086,16 @@ String _decodeReferenceValue(
 }) {
   final refModel = _refModelForReference(ref, refModels);
   if (refModel != null) {
+    if (refModel.isTransportValue) {
+      final type = nullable && !refModel.typeName.endsWith('?')
+          ? '${refModel.typeName}?'
+          : refModel.typeName;
+      return '$source as $type';
+    }
+    if (refModel.decodeFromObject) {
+      final decoded = '${refModel.typeName}.decode($source)';
+      return nullable ? '$source == null ? null : $decoded' : decoded;
+    }
     final value = 'Map<String, Object?>.from($source! as Map)';
     if (nullable) {
       return '$source == null ? null : ${refModel.typeName}.fromJson($value)';
@@ -1181,6 +1231,9 @@ String _encodeValue(
   required bool nullable,
   required Map<String, SchemaRefModelSpec> refModels,
 }) {
+  if (schema is JsonObjectSchema && (refModels[schema.id]?.decodeFromObject ?? false)) {
+    return _encodeReferenceValue(schema.id!, source, nullable: nullable, refModels: refModels);
+  }
   return switch (schema) {
     JsonStringSchema(:final dartType, :final format)
         when dartType == null && format == 'date-time' =>
@@ -1305,6 +1358,7 @@ String _encodeReferenceValue(
   required bool nullable,
   required Map<String, SchemaRefModelSpec> refModels,
 }) {
+  if (_refModelForReference(ref, refModels)?.isTransportValue ?? false) return source;
   final typeName = _refModelForReference(ref, refModels)?.typeName ?? _typeNameForSchemaRef(ref);
   if (typeName == null) {
     return source;
@@ -1890,10 +1944,17 @@ final class _StringEnumValueSpec {
 }
 
 final class SchemaRefModelSpec {
-  const SchemaRefModelSpec({required this.schemaId, required this.typeName});
+  const SchemaRefModelSpec({
+    required this.schemaId,
+    required this.typeName,
+    this.decodeFromObject = false,
+    this.isTransportValue = false,
+  });
 
   final String schemaId;
   final String typeName;
+  final bool decodeFromObject;
+  final bool isTransportValue;
 }
 
 final class TypeParameterSpec {

@@ -1,3 +1,11 @@
+## 0.4.1
+
+- Add `GenerateHttpModel` for public schema-derived classes without private
+  backing typedefs, with JSON and multipart source support.
+- Add immutable endpoint definitions and shared typed JSON, binary, SSE,
+  multipart, WebSocket and WebTransport operations. Preserve callable request
+  signatures, start handles, metadata, cancellation, timeouts and streaming.
+
 ## 0.4.0
 
 - Add `RequestInput.queryAllMap` and `RequestInput.queryParamValues` to read

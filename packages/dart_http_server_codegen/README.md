@@ -1,7 +1,7 @@
 # dart_http_server_codegen
 
 Build-time JSON Schema model generation and client-generation APIs for Dart
-Edge HTTP.
+HTTP.
 
 This package provides a `build_runner` builder for schema-inferred Dart model
 types plus lower-level client generator APIs for tooling that already has
@@ -9,10 +9,10 @@ normalized HTTP route metadata.
 
 ## Core Concepts
 
-- `FromSchema` generates a Dart model class from a const `JsonSchema` and is
+- `FromHttpSchema` generates a Dart model class from a const `JsonSchema` and is
   exported by `dart_http_core` and the app-facing `dart_http_server`
 - `JsonSchemaRegistry` references can be supplied to validate `$ref` usage
-- `FromSchema.responseStatus` controls the generated JSON `ResponseSpec`
+- `FromHttpSchema.responseStatus` controls the generated JSON `ResponseSpec`
   status, defaulting to `200`
 - `DartHttpClientGenerator` emits Dart client classes from normalized route
   metadata
@@ -20,11 +20,75 @@ normalized HTTP route metadata.
 - `dart_http_client` provides concrete `package:http` and
   `web_socket_channel` transports for generated clients
 
-`dart_http_server_codegen` does not export `FromSchema`. Import
+`dart_http_server_codegen` does not export `FromHttpSchema`. Import
 annotations and runtime contracts from `dart_http_core` or the app-facing
 `dart_http_server` package.
 
-## Schema Model Generation
+## Public model generation
+
+Use `dart_http_core` 0.4.1 or newer and this generator 0.6.0 or newer. Annotate
+const schema declarations directly:
+
+```dart
+import 'package:dart_http_core/dart_http_core.dart';
+import 'package:json_schema/json_schema.dart';
+
+part 'users.g.dart';
+
+@GenerateHttpModel(name: 'CreateUserBody', responseStatus: 201)
+const createUserBodySchema = JsonSchema.object(
+  id: 'CreateUserInput',
+  properties: {'name': JsonSchema.string()},
+  required: ['name'],
+);
+
+CreateUserBody initialBody() => .new(name: 'Alice');
+```
+
+Run `dart run build_runner build`. The part declares the public `CreateUserBody`
+class directly, including its constructor, `decode`, `fromJson`, `toJson`,
+`schemaId`, `schema`, `schemaRef`, `requestBody` and `response` helpers. Scalar
+query models also keep `decodeQuery`. Set `source: HttpModelSource.multipart`
+for inbound multipart models. `registry` and `refs` work as for legacy models.
+
+Public names must be unique in the library. A schema constant has no Dart type
+parameters; existing generic typedef models remain supported in legacy form.
+When migrating references to generated types, generate public declarations
+before removing temporary unannotated aliases, then regenerate and analyze.
+
+## Shared client operations
+
+Clients use predefined operation classes from `dart_http_core` for common JSON,
+binary, multipart and SSE signatures, plus query-based WebSocket and simple
+WebTransport connections. Generated code retains endpoint metadata and codecs;
+it no longer repeats execution and handle logic for every matching endpoint.
+Uncommon combinations retain endpoint-specific adapters.
+
+Normal call sites stay the same:
+
+```dart
+final response = await client.createUser(body: .new(name: 'Alice'));
+final handle = client.createUser.start(body: .new(name: 'Alice'));
+final metadata = client.createUser.info;
+handle.cancel();
+final streamed = await client.download.stream(query: downloadQuery);
+```
+
+Binary operations expose `.stream`; multipart operations expose upload progress.
+Required body arguments remain required and missing capabilities remain absent.
+
+**Migration:** endpoint-specific operation classes and constructors are public
+APIs and change under the new default. Consumers that explicitly name or
+instantiate them can retain the previous output using:
+
+```dart
+const DartHttpClientGenerationOptions(useSharedOperations: false)
+```
+
+Pass these options to `DartHttpClientLibrarySpec.fromRouter`. For a directly
+constructed spec, set `useSharedOperations: false` on the spec itself.
+
+## Legacy schema model generation
 
 Add this package and `build_runner` as development dependencies. The
 annotations are imported from the app-facing server package.
@@ -35,7 +99,7 @@ dependencies:
 
 dev_dependencies:
   build_runner: ^2.16.2
-  dart_http_server_codegen: ^0.5.0
+  dart_http_server_codegen: ^0.6.0
 ```
 
 Define const schemas and type aliases:
@@ -59,7 +123,7 @@ const userSchemas = JsonSchemaRegistry(
   schemas: <JsonSchema>[createUserInputSchema],
 );
 
-@FromSchema(createUserInputSchema, registry: userSchemas)
+@FromHttpSchema(createUserInputSchema, registry: userSchemas)
 typedef CreateUserInput = _$CreateUserInput;
 ```
 
