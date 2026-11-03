@@ -1,6 +1,6 @@
 # Schema aware query parameter conversion
 
-Status: native runtime implementation complete; package publication pending.
+Status: released in `dart_http_server_runtime` 0.4.2 with native artifacts 0.1.37.
 
 Convert URL query values according to the registered route schema before native
 validation. Keep the existing model `decodeQuery` method and route callback API.
@@ -121,12 +121,13 @@ cargo test --locked --manifest-path packages/dart_http_native_client/rust/Cargo.
 
 ## Publication and Callo adoption
 
-Publish a runtime package release with matching `0.1.37` native artifacts before
-updating consumers. Review app-facing server dependency bounds so consumers
-select the corrected runtime. Keep codegen and the `decodeQuery` API unchanged.
+Runtime package `0.4.2` and its matching `0.1.37` native artifacts are published.
+Consumers must resolve runtime `0.4.2` or newer; existing lockfiles may otherwise
+retain the old implementation. Codegen and the `decodeQuery` API are unchanged.
 
 Then update Callo's hosted runtime dependency, restore `MessagingQuery.offset`
 to an integer JSON value and an integer schema with bounds `0..100000`, and
 retain its real HTTP regression test. Existing published apps send the same URL
-values and remain wire-compatible. Callo server `0.5.12` keeps its working string
-workaround until that dependency update and server deployment are complete.
+values and remain wire-compatible. The currently deployed Callo server `0.5.12`
+keeps its working string workaround until a separate server release is deployed;
+updating Callo's source does not require an immediate image build or deployment.
