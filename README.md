@@ -15,6 +15,9 @@ Native Exchange is resolved from `pub.hippolabs.org`.
 Realtime transports follow the shared ordered, buffered, backpressured delivery
 contract documented in [`docs/realtime-stream-contract.md`](docs/realtime-stream-contract.md).
 
+Schema-aware query validation is described in
+[`docs/query-parameter-decoding-concept.md`](docs/query-parameter-decoding-concept.md).
+
 ## Packages
 
 | Package | Description |

@@ -30,6 +30,35 @@ final class AppServices {
 }
 ```
 
+## Query schema validation
+
+Reference an installed query schema in `RouteOptions.query`. Native validation
+converts URL strings to the declared integer, number, or boolean type before
+checking that schema. Numeric bounds, enums, required properties, and unknown
+property rules continue to apply. Strings such as the ID `00042` stay strings.
+
+Existing generated model decoders stay the same:
+
+```dart
+RouteOptions(
+  query: ListQuery.schemaRef,
+  queryDecoder: ListQuery.decodeQuery,
+);
+```
+
+The conversion is used only for native validation. `queryDecoder`, `queryMap`,
+and `queryAllMap` still receive raw strings; `decodeQuery` constructs the typed
+Dart model. Missing properties stay absent so model decoders can apply their
+defaults. Repeated scalar keys use the last value for validation, matching
+`queryMap`, while `queryAllMap` preserves every value.
+
+Query type information is compiled once per route, including local component
+references, aliases, and unambiguous nullable scalar types. Invalid scalar values
+remain subject to the original schema and return `422`. Ambiguous unions and
+structured values receive no inferred encoding and retain string validation.
+The same conversion applies to WebSocket handshake query validation. JSON body,
+path parameter, and header validation are unchanged.
+
 ## OpenAPI Security
 
 Declare named security schemes and global requirements on `OpenApiDocument`:

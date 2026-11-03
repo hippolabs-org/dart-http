@@ -1,3 +1,14 @@
+## 0.4.2
+
+- Convert integer, number, and boolean URL query values according to the
+  registered query schema before native validation, including HTTP requests and
+  WebSocket handshakes. Resolve scalar schema references and nullable scalar
+  types once when compiling routes. Original schema constraints still apply.
+- Keep raw query pairs, last-value-wins behavior, and existing `queryDecoder` /
+  generated `decodeQuery` callbacks unchanged. JSON bodies, path parameters,
+  and headers retain their existing validation behavior.
+- Require native artifacts 0.1.37. The native ABI remains 27.
+
 ## 0.4.1
 
 - Upgrade Rustls to 0.23.46, rustls-webpki to 0.103.16, Tokio to 1.54.1, and

@@ -7,6 +7,7 @@
 #![allow(clippy::result_large_err)]
 
 mod native_values;
+mod query_schema;
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString, c_char};
@@ -37,6 +38,7 @@ use native_values::{
     owned_pairs_from_map, read_native_bytes, read_pairs_vec,
 };
 use once_cell::sync::Lazy;
+use query_schema::QuerySchema;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::net::TcpListener;
@@ -1311,6 +1313,7 @@ struct CompiledRoute {
     path_segments: Vec<CompiledRouteSegment>,
     params_schema_id: Option<String>,
     query_schema_id: Option<String>,
+    query_schema: Option<Arc<QuerySchema>>,
     headers_schema_id: Option<String>,
     request_body: Option<RequestBodyValidation>,
     max_pending_messages: usize,
@@ -1376,6 +1379,7 @@ struct NativeRouteMatch {
     path_params: HashMap<String, String>,
     params_schema_id: Option<String>,
     query_schema_id: Option<String>,
+    query_schema: Option<Arc<QuerySchema>>,
     headers_schema_id: Option<String>,
     request_body: Option<RequestBodyValidation>,
     max_pending_messages: usize,
@@ -2974,10 +2978,10 @@ async fn validate_request(
     ) {
         return error_response;
     }
-    if let Err(error_response) = validate_string_map(
+    if let Err(error_response) = validate_query_map(
         &query_map(&query),
         route_match.query_schema_id.as_deref(),
-        "Query parameters",
+        route_match.query_schema.as_deref(),
         &runtime_state,
     ) {
         return error_response;
@@ -3620,10 +3624,10 @@ async fn handle_web_transport_incoming_session(
         &runtime_state,
     )
     .is_err()
-        || validate_string_map(
+        || validate_query_map(
             &query_map(&query),
             route_match.query_schema_id.as_deref(),
-            "Query parameters",
+            route_match.query_schema.as_deref(),
             &runtime_state,
         )
         .is_err()
@@ -4644,11 +4648,12 @@ fn collect_web_transport_headers(headers: HashMap<String, String>) -> HashMap<St
 fn compile_manifest(routes_json: &str) -> Result<CompiledManifest, String> {
     let manifest: RouteManifest =
         serde_json::from_str(routes_json).map_err(|error| error.to_string())?;
+    let query_registry = schema_registry_document(manifest.schemas.clone());
     let schemas = compile_schemas(manifest.schemas)?;
     let routes = manifest
         .routes
         .into_iter()
-        .map(|route| compile_route(route, &schemas))
+        .map(|route| compile_route(route, &schemas, &query_registry))
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(CompiledManifest { routes, schemas })
@@ -4819,6 +4824,7 @@ fn strip_schema_ids(value: Value) -> Value {
 fn compile_route(
     route: RouteManifestEntry,
     schemas: &HashMap<String, jsonschema::Validator>,
+    query_registry: &Value,
 ) -> Result<CompiledRoute, String> {
     if route.max_pending_messages == 0 {
         return Err(format!(
@@ -4834,6 +4840,12 @@ fn compile_route(
     }
     ensure_schema_exists(schemas, route.params_schema_id.as_deref())?;
     ensure_schema_exists(schemas, route.query_schema_id.as_deref())?;
+    let query_schema = route.query_schema_id.as_ref().map(|id| {
+        Arc::new(QuerySchema::compile(
+            &query_registry["components"]["schemas"][id],
+            query_registry,
+        ))
+    });
     ensure_schema_exists(schemas, route.headers_schema_id.as_deref())?;
     ensure_schema_exists(
         schemas,
@@ -4865,6 +4877,7 @@ fn compile_route(
         path_segments: compile_route_segments(route.path_segments),
         params_schema_id: route.params_schema_id,
         query_schema_id: route.query_schema_id,
+        query_schema,
         headers_schema_id: route.headers_schema_id,
         request_body,
         max_pending_messages: route.max_pending_messages,
@@ -5326,6 +5339,7 @@ fn match_route(
             path_params,
             params_schema_id: route.params_schema_id.clone(),
             query_schema_id: route.query_schema_id.clone(),
+            query_schema: route.query_schema.clone(),
             headers_schema_id: route.headers_schema_id.clone(),
             request_body: route.request_body.clone(),
             max_pending_messages: route.max_pending_messages,
@@ -5466,6 +5480,21 @@ impl ValidatedBody {
             json: None,
         }
     }
+}
+
+fn validate_query_map(
+    values: &HashMap<String, String>,
+    schema_id: Option<&str>,
+    query_schema: Option<&QuerySchema>,
+    runtime_state: &ServerRuntimeState,
+) -> Result<(), Response<Body>> {
+    let Some(schema_id) = schema_id else {
+        return Ok(());
+    };
+    let instance = query_schema
+        .expect("Query schemas are compiled with their route")
+        .convert(values);
+    validate_schema_value(schema_id, &instance, "Query parameters", runtime_state)
 }
 
 fn validate_string_map(
