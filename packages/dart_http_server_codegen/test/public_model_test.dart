@@ -12,6 +12,60 @@ import 'package:json_schema/json_schema.dart';
 import 'package:test/test.dart';
 
 void main() {
+  test('generated models retain JSON Schema 0.2 nulls and discriminators at runtime', () async {
+    const schema = JsonSchema.object(
+      id: 'Envelope',
+      properties: <String, JsonSchema>{
+        'empty': JsonSchema.nullType(),
+        'result': JsonSchema.oneOf(
+          <JsonSchema>[
+            JsonSchema.object(
+              id: 'Message',
+              properties: <String, JsonSchema>{
+                'kind': JsonSchema.string(enumValues: <String>['message']),
+              },
+            ),
+            JsonSchema.nullType(),
+          ],
+          discriminator: JsonDiscriminator(
+            propertyName: 'kind',
+            mapping: <String, String>{'message': 'Message'},
+          ),
+        ),
+      },
+    );
+    final source = generateFromSchemaModels(const <FromSchemaModelSpec>[
+      FromSchemaModelSpec(
+        publicName: 'Envelope',
+        backingClassName: 'Envelope',
+        schema: schema,
+        schemaId: 'Envelope',
+        refModels: <String, SchemaRefModelSpec>{},
+        typeParameters: <TypeParameterSpec>[],
+        schemasById: <String, JsonSchema>{},
+        responseStatus: 200,
+        source: FromSchemaModelSource.json,
+      ),
+    ]);
+    final directory = await Directory.systemTemp.createTemp('http_schema_0_2_');
+    addTearDown(() => directory.delete(recursive: true));
+    await File('${directory.path}/main.dart').writeAsString('''
+import 'dart:convert';
+import 'package:dart_http_core/dart_http_core.dart';
+import 'package:json_schema/json_schema.dart';
+$source
+void main() {
+  print(jsonEncode(Envelope.schema.toJson()));
+}
+''');
+    final result = await Process.run(Platform.resolvedExecutable, <String>[
+      '--packages=${(await Isolate.packageConfig)!.toFilePath()}',
+      '${directory.path}/main.dart',
+    ]);
+    expect(result.exitCode, 0, reason: '${result.stdout}\n${result.stderr}');
+    expect(jsonDecode(result.stdout as String), schema.toJson());
+  });
+
   test('generates a public model from a schema variable alongside a legacy alias', () async {
     await testBuilder(
       dartHttpServerBuilder(BuilderOptions.empty),

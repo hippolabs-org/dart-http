@@ -1,3 +1,9 @@
+## 0.6.1
+
+- Require `json_schema` 0.2 and preserve null schemas and discriminators in
+  generated HTTP model schema constants.
+- Read inherited schema fields so composite branches survive code generation.
+
 ## 0.6.0
 
 - Generate public classes directly from `@GenerateHttpModel` schema constants.

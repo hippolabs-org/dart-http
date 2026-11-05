@@ -1,3 +1,7 @@
+## 0.4.2
+
+- Require JSON Schema 0.2 and align schema generator dependencies.
+
 ## 0.4.1
 
 - Add `GenerateHttpModel` for public schema-derived classes without private

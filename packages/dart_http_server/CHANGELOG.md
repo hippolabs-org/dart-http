@@ -1,3 +1,7 @@
+## 0.4.1
+
+- Require JSON Schema 0.2 and align schema generator dependencies.
+
 ## 0.4.0
 
 - **Breaking:** Require `dart_http_server_runtime` 0.4.0 (re-exported): native
