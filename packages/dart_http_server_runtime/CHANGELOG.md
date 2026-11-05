@@ -1,3 +1,7 @@
+## 0.4.3
+
+- Require JSON Schema 0.2 and align schema generator dependencies.
+
 ## 0.4.2
 
 - Convert integer, number, and boolean URL query values according to the

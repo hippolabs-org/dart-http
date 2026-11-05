@@ -634,7 +634,7 @@ typedef PublishStatus = _$PublishStatus;
       );
     });
 
-    test('uses custom Dart type decoders for anyOf schema fields', () async {
+    test('preserves null branches and discriminators with custom Dart type decoders', () async {
       final builder = dartHttpServerBuilder(BuilderOptions.empty);
 
       await testBuilder(
@@ -671,7 +671,17 @@ sealed class JsonSchema {
     String? id,
     bool nullable,
     DartSchemaType? dartType,
+    JsonDiscriminator? discriminator,
   }) = JsonAnyOfSchema;
+
+  const factory JsonSchema.nullType() = JsonNullSchema;
+  const factory JsonSchema.oneOf(
+    List<JsonSchema> schemas, {
+    String? id,
+    bool nullable,
+    DartSchemaType? dartType,
+    JsonDiscriminator? discriminator,
+  }) = JsonOneOfSchema;
 
   final String? id;
   final bool nullable;
@@ -705,10 +715,26 @@ final class JsonAnyOfSchema extends JsonSchema {
     super.id,
     super.nullable,
     this.dartType,
+    this.discriminator,
   }) : super._();
 
   final List<JsonSchema> schemas;
   final DartSchemaType? dartType;
+  final JsonDiscriminator? discriminator;
+}
+
+final class JsonNullSchema extends JsonSchema {
+  const JsonNullSchema() : super._(nullable: true);
+}
+
+final class JsonOneOfSchema extends JsonAnyOfSchema {
+  const JsonOneOfSchema(super.schemas, {super.id, super.nullable, super.dartType, super.discriminator});
+}
+
+final class JsonDiscriminator {
+  const JsonDiscriminator({required this.propertyName, this.mapping = const <String, String>{}});
+  final String propertyName;
+  final Map<String, String> mapping;
 }
 
 enum DartSchemaConversion { infer, value, model }
@@ -792,6 +818,7 @@ const roleInputSchema = JsonSchema.anyOf(
     JsonSchema.array(items: JsonSchema.string()),
   ],
   dartType: DartSchemaType.model('RoleInput'),
+  discriminator: JsonDiscriminator(propertyName: 'kind', mapping: {'roles': 'RoleInput'}),
 );
 
 const setRoleBodySchema = JsonSchema.object(
@@ -799,6 +826,10 @@ const setRoleBodySchema = JsonSchema.object(
   properties: <String, JsonSchema>{
     'userId': JsonSchema.string(),
     'role': roleInputSchema,
+    'variant': JsonSchema.oneOf(
+      [JsonSchema.string(), JsonSchema.nullType()],
+      discriminator: JsonDiscriminator(propertyName: 'type', mapping: {'text': 'TextValue'}),
+    ),
   },
   required: <String>['userId', 'role'],
 );
@@ -816,6 +847,12 @@ typedef SetRoleBody = _$SetRoleBody;
               contains('"role": role.toJson()'),
               contains('static const JsonSchema schema = JsonSchema.object('),
               contains('JsonSchema.anyOf'),
+              contains('JsonSchema.oneOf'),
+              contains('JsonSchema.nullType()'),
+              contains("propertyName: 'kind'"),
+              contains("propertyName: 'type'"),
+              contains("'roles': 'RoleInput'"),
+              contains("'text': 'TextValue'"),
               contains("dartType: DartSchemaType.model('RoleInput')"),
             ]),
           ),
